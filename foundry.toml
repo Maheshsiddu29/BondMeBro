@@ -1,0 +1,30 @@
+[profile.default]
+src = "src"
+test = "test"
+libs = ["lib"]
+solc_version = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 800
+ffi = true
+fs_permissions = [{ access = "read-write", path = "./" }]
+
+[profile.ci]
+# CI runs harder than local dev: deeper fuzzing, more invariant sequences.
+fuzz = { runs = 5000 }
+invariant = { runs = 512, depth = 100, fail_on_revert = false }
+verbosity = 3
+
+[profile.default.fuzz]
+runs = 256
+
+[profile.default.invariant]
+runs = 64
+depth = 32
+fail_on_revert = false
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"

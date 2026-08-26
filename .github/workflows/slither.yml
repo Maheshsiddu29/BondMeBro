@@ -1,0 +1,53 @@
+name: Slither
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  # Weekly run catches new detectors shipped by Slither after the last commit.
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write # required to upload SARIF
+
+jobs:
+  slither:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Run Slither
+        uses: crytic/slither-action@v0.4.0
+        id: slither
+        continue-on-error: true # let SARIF upload run even when findings exist
+        with:
+          target: "."
+          slither-config: "slither.config.json"
+          sarif: results.sarif
+          fail-on: medium # informational/low findings don't block the build
+          slither-args: --exclude-dependencies --filter-paths "lib/"
+
+      # Findings land in the repo's Security tab and annotate the PR diff inline.
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}
+
+      - name: Fail if Slither failed
+        if: steps.slither.outcome == 'failure'
+        run: |
+          echo "Slither reported medium or higher severity findings."
+          echo "Review them, then either fix the code or add a justified"
+          echo "// slither-disable-next-line <detector> immediately above the line."
+          exit 1

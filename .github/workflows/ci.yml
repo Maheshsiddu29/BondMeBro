@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel superseded runs on the same branch — saves minutes on rapid pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  lint:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # Fails if anyone committed unformatted code. Run `forge fmt` locally to fix.
+      - name: Check formatting
+        run: forge fmt --check
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Build
+        run: forge build --sizes
+
+      # Cache the compiled output so test/coverage jobs don't recompile from scratch.
+      - name: Cache build
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out
+            cache
+          key: build-${{ github.sha }}
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Restore build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            out
+            cache
+          key: build-${{ github.sha }}
+
+      - name: Run tests
+        run: forge test -vvv
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Run coverage
+        run: |
+          forge coverage --no-match-coverage "lib|test|script" --report summary \
+            | tee coverage.txt
+
+      # Surface the table directly in the PR page — reviewers shouldn't dig through logs.
+      - name: Publish coverage summary
+        run: |
+          echo '### Coverage' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat coverage.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  gas:
+    name: Gas snapshot
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # Fails if gas costs moved without the committed snapshot being updated.
+      # This is what turns "we optimised the hook" into a reviewable diff.
+      - name: Check gas snapshot
+        run: forge snapshot --check --tolerance 1

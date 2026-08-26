@@ -1,0 +1,14 @@
+{
+  "filter_paths": "lib/",
+  "exclude_dependencies": true,
+  "exclude_informational": false,
+  "exclude_low": false,
+  "solc_remaps": [
+    "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
+    "@uniswap/v4-periphery/=lib/v4-periphery/",
+    "uniswap-hooks/=lib/uniswap-hooks/",
+    "forge-std/=lib/v4-periphery/lib/v4-core/lib/forge-std/src/",
+    "@openzeppelin/contracts/=lib/v4-periphery/lib/v4-core/lib/openzeppelin-contracts/contracts/",
+    "solmate/=lib/v4-periphery/lib/v4-core/lib/solmate/"
+  ]
+}
