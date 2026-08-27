@@ -3,7 +3,7 @@ out/
 cache/
 broadcast/
 !broadcast/*/31337/
-
+lib/
 # Slither / crytic
 crytic-export/
 *.sarif
