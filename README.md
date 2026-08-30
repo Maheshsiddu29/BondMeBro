@@ -243,13 +243,18 @@ The Solidity hook is the backend; it does not require a database or a mandatory
 keeper service. An indexer or cron job can be added later as an operational
 convenience because all important state changes are emitted as events.
 
+For the complete copy-paste command sheet, including the Sepolia rehearsal, see
+[`DEPLOYMENT.md`](./DEPLOYMENT.md).
+
 ### 1. Deploy the hook
 
 Copy `.env.example` to `.env`, set `RPC_URL`, `PRIVATE_KEY`, and the target
-`POOL_MANAGER`, then run:
+`POOL_MANAGER`, then export the values and run:
 
 ```bash
-source .venv/bin/activate  # only if using the Slither environment
+set -a
+source .env
+set +a
 forge script script/DeployBondMeBro.s.sol:DeployBondMeBro \\
   --rpc-url "$RPC_URL" \\
   --private-key "$PRIVATE_KEY" \\
