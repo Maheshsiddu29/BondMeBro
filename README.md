@@ -290,7 +290,25 @@ ETH allowed for the mint. Pool setup remains network-specific because canonical
 PositionManager, Permit2, WETH, token approval, and slippage addresses differ by
 network.
 
-### 3. Operate settlement
+### 3. Execute a swap
+
+For a testnet smoke test, set `UNIVERSAL_ROUTER`, `PERMIT2`, `TRADER`,
+`ZERO_FOR_ONE`, `SWAP_AMOUNT_IN`, and a non-zero `SWAP_AMOUNT_OUT_MINIMUM` for
+production use. The script passes the trader through 32-byte hook data and executes
+`SWAP_EXACT_IN_SINGLE`, `SETTLE`, and `TAKE` through the Universal Router:
+
+```bash
+forge script script/SwapBondMeBro.s.sol:SwapBondMeBro \\
+  --rpc-url "$RPC_URL" \\
+  --private-key "$PRIVATE_KEY" \\
+  --broadcast
+```
+
+This is the transaction that can open a bond after the pool has liquidity. Use the
+canonical Universal Router address for the selected network; do not use a test
+router in production.
+
+### 4. Operate settlement
 
 Set `BOND_HOOK`, `CURRENCY0`, `CURRENCY1`, `POOL_FEE`, and `TICK_SPACING` in the
 environment. A public keeper or cron job can settle a quiet pool with:
@@ -305,7 +323,7 @@ forge script script/SettleBondMeBro.s.sol:SettleBondMeBro \\
 `MAX_COUNT` is optional and is capped by the contract at 32. Active pools do not
 need this script because later swaps piggyback matured settlement.
 
-### 4. Distribute the insurance pot
+### 5. Distribute the insurance pot
 
 After settlement, set `POT_CURRENCY` to either pool currency and run:
 
