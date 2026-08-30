@@ -14,8 +14,8 @@ import {BondMeBro} from "../src/BondMeBro.sol";
 ///         pot into the selected pool through `PoolManager.donate`.
 ///
 /// @dev The hook enforces PoolManager's signed-int128 donation limit and drains a very large
-///      pot over multiple calls. An empty pot is reported as a successful no-op. If there is
-///      no in-range liquidity, a non-empty donation reverts and the pot remains intact.
+///      pot over multiple calls. If there is no in-range liquidity, the transaction reverts
+///      and the pot remains intact.
 ///
 /// Required environment variables:
 /// - RPC_URL and PRIVATE_KEY (provided to forge script)
@@ -29,14 +29,6 @@ contract DonateBondPot is Script {
         BondMeBro hook = BondMeBro(payable(hookAddress));
         PoolKey memory key = _poolKey(hookAddress);
         Currency currency = Currency.wrap(vm.envAddress("POT_CURRENCY"));
-        PoolId id = key.toId();
-        uint256 pot = hook.insurancePot(id, currency);
-
-        if (pot == 0) {
-            console2.log("nothing to donate; pot is empty");
-            console2.logBytes32(PoolId.unwrap(id));
-            return;
-        }
 
         vm.startBroadcast();
         hook.donatePot(key, currency);
@@ -44,7 +36,7 @@ contract DonateBondPot is Script {
 
         console2.log("donated currency ", Currency.unwrap(currency));
         console2.log("pool id");
-        console2.logBytes32(PoolId.unwrap(id));
+        console2.logBytes32(PoolId.unwrap(key.toId()));
     }
 
     function _poolKey(address hookAddress) internal view returns (PoolKey memory key) {

@@ -7,7 +7,6 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 import {BondMeBro} from "../src/BondMeBro.sol";
 
@@ -24,7 +23,6 @@ import {BondMeBro} from "../src/BondMeBro.sol";
 /// - POOL_FEE, TICK_SPACING, SQRT_PRICE_X96
 contract InitializeBondMeBroPool is Script {
     using PoolIdLibrary for PoolKey;
-    using StateLibrary for IPoolManager;
 
     function run() external returns (PoolId id, int24 initialTick) {
         address hookAddress = vm.envAddress("BOND_HOOK");
@@ -36,22 +34,13 @@ contract InitializeBondMeBroPool is Script {
             "InitializeBondMeBroPool: manager mismatch"
         );
         PoolKey memory key = _poolKey(hookAddress);
+        uint160 sqrtPriceX96 = uint160(vm.envUint("SQRT_PRICE_X96"));
+
+        vm.startBroadcast();
+        initialTick = poolManager.initialize(key, sqrtPriceX96);
+        vm.stopBroadcast();
+
         id = key.toId();
-
-        // Make the setup script safe to re-run. PoolManager intentionally reverts when a
-        // pool already exists; for operations tooling that is a successful no-op, not a
-        // deployment failure.
-        (uint160 existingSqrtPriceX96, int24 existingTick,,) = poolManager.getSlot0(id);
-        if (existingSqrtPriceX96 != 0) {
-            initialTick = existingTick;
-            console2.log("pool already initialized");
-        } else {
-            uint160 sqrtPriceX96 = uint160(vm.envUint("SQRT_PRICE_X96"));
-            vm.startBroadcast();
-            initialTick = poolManager.initialize(key, sqrtPriceX96);
-            vm.stopBroadcast();
-        }
-
         console2.log("pool id");
         console2.logBytes32(PoolId.unwrap(id));
         console2.log("initial tick ", initialTick);
