@@ -16,5 +16,6 @@ crytic-export/
 # OS / editor
 .DS_Store
 .idea/
+.venv/
 .vscode/
 node_modules/
