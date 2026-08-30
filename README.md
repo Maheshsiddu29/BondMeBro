@@ -273,9 +273,22 @@ forge script script/InitializeBondMeBroPool.s.sol:InitializeBondMeBroPool \\
 ```
 
 Then use the network's canonical PositionManager to add enough broad or otherwise
-intentional liquidity for the expected price range. Pool creation and liquidity
-provisioning are separate from hook deployment because the exact PositionManager,
-Permit2, WETH, token approval, and slippage settings are network-specific.
+intentional liquidity for the expected price range. The included script sets the
+necessary ERC-20 and Permit2 approvals and uses the non-deprecated mint action with
+explicit amount limits:
+
+```bash
+forge script script/MintBondMeBroPosition.s.sol:MintBondMeBroPosition \\
+  --rpc-url "$RPC_URL" \\
+  --private-key "$PRIVATE_KEY" \\
+  --broadcast
+```
+
+Set `POSITION_MANAGER`, `PERMIT2`, `LIQUIDITY_OWNER`, tick bounds, liquidity, and
+amount limits first. For a native `currency0`, set `NATIVE_VALUE` to the amount of
+ETH allowed for the mint. Pool setup remains network-specific because canonical
+PositionManager, Permit2, WETH, token approval, and slippage addresses differ by
+network.
 
 ### 3. Operate settlement
 
