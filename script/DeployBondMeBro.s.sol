@@ -35,6 +35,7 @@ contract DeployBondMeBro is Script {
 
     function run() external returns (BondMeBro hook) {
         IPoolManager poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
+        require(address(poolManager).code.length != 0, "DeployBondMeBro: invalid POOL_MANAGER");
 
         // Sane defaults with env overrides, e.g. BOND_BPS=500 forge script ...
         BondMeBro.Config memory cfg = BondMeBro.Config({

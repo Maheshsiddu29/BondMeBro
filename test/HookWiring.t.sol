@@ -72,6 +72,16 @@ contract HookWiringTest is Test, Deployers {
         Hooks.validateHookPermissions(IHooks(address(hook)), hook.getHookPermissions());
     }
 
+    function test_constructorRejectsZeroPoolManager() public {
+        BondMeBro.Config memory cfg = config();
+        (, bytes32 salt) = HookMiner.find(
+            address(this), FLAGS, type(BondMeBro).creationCode, abi.encode(IPoolManager(address(0)), cfg)
+        );
+
+        vm.expectRevert(BondMeBro.InvalidPoolManager.selector);
+        new BondMeBro{salt: salt}(IPoolManager(address(0)), cfg);
+    }
+
     /// @notice A small swap (impact below minImpactTicks) must not be bonded at all.
     function test_smallSwap_opensNoBond() public {
         swapRouter.swap(

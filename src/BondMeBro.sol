@@ -170,9 +170,11 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     error PaymentTransferFailed();
     error SettlementReentrancy();
     error InvalidCurrency();
+    error InvalidPoolManager();
     // NotPoolManager() is inherited from BaseHook and reused for unlockCallback.
 
     constructor(IPoolManager _poolManager, Config memory cfg) BaseHook(_poolManager) {
+        if (address(_poolManager).code.length == 0) revert InvalidPoolManager();
         if (
             cfg.bondBps == 0 || cfg.bondBps > BPS || cfg.settlerFeeBps > BPS || cfg.observationBlocks == 0
                 || cfg.minImpactTicks <= cfg.refundTolTicks || cfg.maxAbsTickDelta == 0 || cfg.maxSettlesPerSwap == 0
