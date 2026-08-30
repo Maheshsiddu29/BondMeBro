@@ -8,6 +8,8 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 
+import {BondMeBro} from "../src/BondMeBro.sol";
+
 /// @title InitializeBondMeBroPool
 /// @notice Initializes a Uniswap v4 pool with BondMeBro installed as its hook.
 ///
@@ -25,6 +27,12 @@ contract InitializeBondMeBroPool is Script {
     function run() external returns (PoolId id, int24 initialTick) {
         address hookAddress = vm.envAddress("BOND_HOOK");
         IPoolManager poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
+        require(address(poolManager).code.length != 0, "InitializeBondMeBroPool: invalid POOL_MANAGER");
+        require(hookAddress.code.length != 0, "InitializeBondMeBroPool: invalid BOND_HOOK");
+        require(
+            address(BondMeBro(payable(hookAddress)).poolManager()) == address(poolManager),
+            "InitializeBondMeBroPool: manager mismatch"
+        );
         PoolKey memory key = _poolKey(hookAddress);
         uint160 sqrtPriceX96 = uint160(vm.envUint("SQRT_PRICE_X96"));
 

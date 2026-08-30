@@ -35,6 +35,10 @@ contract MintBondMeBroPosition is Script {
         address permit2 = vm.envAddress("PERMIT2");
         address hookAddress = vm.envAddress("BOND_HOOK");
         address owner = vm.envAddress("LIQUIDITY_OWNER");
+        require(address(positionManager).code.length != 0, "MintBondMeBroPosition: invalid POSITION_MANAGER");
+        require(permit2.code.length != 0, "MintBondMeBroPosition: invalid PERMIT2");
+        require(hookAddress.code.length != 0, "MintBondMeBroPosition: invalid BOND_HOOK");
+        require(owner != address(0), "MintBondMeBroPosition: invalid LIQUIDITY_OWNER");
         PoolKey memory key = _poolKey(hookAddress);
 
         uint256 nativeValue = vm.envOr("NATIVE_VALUE", uint256(0));
