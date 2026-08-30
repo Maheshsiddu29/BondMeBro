@@ -262,12 +262,20 @@ immutable policy knob after mining without deploying a new hook address.
 
 ### 2. Create the pool and add liquidity
 
-Use a Uniswap v4-compatible `PoolManager`/PositionManager flow with the returned
-hook address. The pool key must contain sorted currencies, the chosen fee and tick
-spacing, and `hooks = BOND_HOOK`. Add enough broad or otherwise intentional
-liquidity for the expected price range. Pool creation and liquidity provisioning
-are separate from hook deployment because the exact PositionManager, Permit2, WETH,
-and token addresses are network-specific.
+The pool key must contain sorted currencies, the chosen fee and tick spacing, and
+`hooks = BOND_HOOK`. Initialize the pool with the included script:
+
+```bash
+forge script script/InitializeBondMeBroPool.s.sol:InitializeBondMeBroPool \\
+  --rpc-url "$RPC_URL" \\
+  --private-key "$PRIVATE_KEY" \\
+  --broadcast
+```
+
+Then use the network's canonical PositionManager to add enough broad or otherwise
+intentional liquidity for the expected price range. Pool creation and liquidity
+provisioning are separate from hook deployment because the exact PositionManager,
+Permit2, WETH, token approval, and slippage settings are network-specific.
 
 ### 3. Operate settlement
 
