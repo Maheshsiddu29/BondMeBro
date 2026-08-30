@@ -7,7 +7,7 @@ the hook checks what happened to the price. If it bounced back, the trade was
 harmless and the deposit is returned in full. If the price stayed where the trade
 pushed it, liquidity providers were hurt — and part of the deposit goes to them.
 
-Contract: `ToxicityBondHook` · Built for UHI10 (Atrium Academy)
+Contract: `BondMeBro` · Built for UHI10 (Atrium Academy)
 
 ---
 
@@ -61,8 +61,8 @@ flowchart TD
 
 ### The three moments that matter
 
-**1. Before the swap** — the hook checks how much the price is about to move. If
-it's small, nothing happens and the swap proceeds as normal. If it's large, the
+**1. Before the swap** — the hook looks at the size of the swap. If it's small,
+nothing happens and the swap proceeds as normal. If it's large enough to bond, the
 hook takes a bond directly out of the swap. No separate deposit transaction, no
 router in front of the pool.
 
@@ -74,6 +74,34 @@ settlement will later be judged against.
 price then, and works out what fraction of the original impact is still there.
 That fraction decides the refund.
 
+### What the trader actually pays
+
+> **Status: designed, not yet implemented.** The custody path lands in T3. See
+> [ADR-0001](docs/adr/0001-in-hook-custody.md) for the full delta trace.
+
+Read this bit twice — it is the easiest thing to get wrong about BondMeBro.
+
+**The bond is not charged on top of the swap. It is carved out of it.**
+
+The amount you enter is your **gross total spend**. The hook takes the bond out of
+that amount first, and the pool only swaps what's left:
+
+```
+you spend:      100 USDC          ← unchanged, this is what leaves your wallet
+bond:            −5 USDC          ← held by the hook, refundable
+pool swaps:      95 USDC          ← this is what actually hits the curve
+you receive:    ~95 USDC worth    ← proportionally less output
+```
+
+So a bonded swap returns **less output than the same swap on an ordinary pool**,
+even though your total outflow is identical. If the price reverts and the bond is
+refunded in full, your net cost is the same as a normal swap plus the time your
+bond sat idle. If the price sticks, you paid the slash.
+
+Any frontend built on this must show gross spend and expected output as two
+separate numbers. Showing only "100 USDC in" invites the trader to expect 100
+USDC of fill.
+
 ---
 
 ## Architecture
@@ -84,7 +112,7 @@ flowchart LR
         PM[PoolManager]
     end
 
-    subgraph Hook["BondMeBro — ToxicityBondHook"]
+    subgraph Hook["BondMeBro"]
         BS[beforeSwap<br/>size check + take bond]
         AS[afterSwap<br/>open bond record]
         SB[settleBond<br/>refund or slash]

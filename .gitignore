@@ -19,3 +19,19 @@ crytic-export/
 .idea/
 .vscode/
 node_modules/
+
+# Stray tool artifacts that landed in Documents/
+.Rhistory
+.Rdata
+.Rproj.user/
+
+# Agent tooling
+.agents/
+.claude/
+skills-lock.json
+tasks/
+AGENTS.md
+
+# Working docs
+Documents/
+docs/

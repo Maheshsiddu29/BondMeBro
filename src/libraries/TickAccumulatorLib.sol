@@ -1,100 +1,130 @@
 // SPDX-License-Identifier: MIT
+
 pragma solidity 0.8.26;
 
 /// @title TickAccumulatorLib
-/// @notice A time-weighted average tick over `[bondOpen, settle]`, using a single running
-///         accumulator per pool — no observations ring buffer and no binary search.
-///
-/// @dev WHY THIS SHAPE. Uniswap v4 removed the built-in oracle that v3 pools carried, so
-///      there is no pool-internal history to read; a hook must accumulate it itself. The
-///      obvious approach — a v3-style 65535-slot observations array plus binary search — is
-///      what you need if you want the cumulative at an *arbitrary past block*, e.g. to
-///      average over a delayed sub-window `[open + warmup, open + N]`. BondMeBro does not
-///      need that, because it only ever averages over one interval whose start it can record
-///      at the time: the moment the bond opened. Two readings of one accumulator suffice.
-///
-///      WHAT IT BUYS. Spot settlement makes push-settle-unwind atomic and, because the
-///      persistence curve is linear, pushing price back k% of the way recovers k% of the
-///      bond at a cost of roughly a k-sized round trip. A TWA removes the atomicity: the
-///      attacker must hold the distorted price across a real fraction of the window, bleeding
-///      to arbitrageurs every block, for a payoff that is only proportional to the fraction
-///      of the window they sustained.
-///
-///      KNOWN BIAS. The window starts at `tickAfter`, which under the persistence rule is the
-///      maximum-harm anchor, so including the immediate post-trade period drags the average
-///      toward slashing. The bias is bounded, one-directional, shrinks as N grows, and can be
-///      offset with `refundToleranceTicks`. Correcting it properly requires the warmup window
-///      and therefore the ring buffer — that is production scope, not MVP.
-///
-///      QUIET POOLS ARE NOT A SPECIAL CASE. If nobody swaps during the window, extrapolation
-///      holds the last tick for the whole interval, so the TWA equals `tickAfter` and the bond
-///      slashes fully. That is the correct answer under the thesis, not an error condition:
-///      the price moved and no arbitrageur found it worth reverting. Do NOT add an
-///      "invalid reference -> auto-refund" branch; it would be a free, grindable exit that is
-///      cheapest in exactly the thin pools this mechanism targets.
+
+/// @notice Maintains a time-weighted tick accumulator for each pool so BondMeBro can measure the average pool tick between bond opening and maturity without using an external oracle, observation ring buffer, or binary search.
+
+/// @dev Uniswap v4 does not provide the built-in historical oracle observations that v3 pools exposed, so BondMeBro must maintain the information it needs inside the hook. A full v3-style observations array is useful when a protocol needs to query the cumulative tick at arbitrary historical times. BondMeBro's MVP only needs a known start point recorded when a bond opens and a fixed maturity endpoint, so two accumulator readings are enough: one at bond opening and one at maturity.
+
+/// The accumulator does NOT make late settlement depend on the settlement block. T5 must freeze or reconstruct the accumulator value at the bond's fixed maturity checkpoint. A trader may call settlement later, but swaps after maturity must not change the result.
+
+/// Using a time-weighted average makes settlement harder to manipulate than using only the spot tick at settlement. With spot settlement, an attacker could temporarily push the price toward a refund-friendly level, settle, and immediately unwind. With a TWA, the attacker must keep that price displacement alive for a meaningful part of the observation window, increasing the cost and exposure to arbitrage.
+
+/// The observation window starts from the post-swap tick used when the bond opens. This can slightly bias the average toward the swap's immediate price impact because that first post-trade state is included in the window. The MVP accepts this behaviour and uses `refundToleranceTicks` to provide tolerance. A delayed warmup/sub-window design would require historical observations or another checkpoint mechanism and is outside this library's current scope.
+
+/// Quiet pools are handled by extrapolation, not by automatic refunds. If no swap occurs after the bond opens, the last observed tick is treated as remaining active for the elapsed blocks. This means a quiet pool still produces a valid time-weighted observation instead of being treated as missing data.
+
 library TickAccumulatorLib {
-    /// @notice Thrown when a TWA is requested over a zero-length window.
-    /// @dev Unreachable via settleBond, which enforces maturity first, but the library is
-    ///      public surface and must not divide by zero for any caller.
+    /// @notice Thrown when a time-weighted average is requested over a zero-length interval.
+
+    /// @dev Settlement should normally prevent this by requiring maturity before evaluating a bond, but the library still checks it directly so division by zero can never occur.
     error ZeroWindow();
 
-    /// @notice One accumulator per pool. Packs into a single storage slot
-    ///         (24 + 32 + 56 = 112 bits).
+    /// @notice Running tick accumulator for one pool. The fields fit in one storage slot: 24 + 32 + 56 = 112 bits.
+
     struct Accumulator {
-        /// @dev Tick that has been live since `lastUpdate`.
+        /// @dev Tick that has been active since `lastUpdate`.
         int24 lastTick;
-        /// @dev Block number of the most recent update.
+
+        /// @dev Block number when the accumulator was last updated.
         uint32 lastUpdate;
-        /// @dev Running sum of tick * blocks. int56 matches v3's tickCumulative width and
-        ///      cannot realistically overflow: |tick| <= 887272, so it takes ~4e10 blocks
-        ///      at the extreme tick to approach int56's range.
+
+        /// @dev Running sum of `tick * elapsedBlocks`. `int56` matches the width traditionally used for tick cumulative accounting and has ample range for the Uniswap tick bounds; even at the maximum absolute tick it would take roughly 4e10 blocks to approach the signed range limit.
         int56 tickCumulative;
     }
 
-    /// @notice Credits the elapsed interval and rolls the accumulator forward to `newTick`.
-    /// @dev MUST be called on every swap in the pool, not only bonded ones — a gap in the
-    ///      accumulator silently biases every bond whose window spans it. Correctness detail:
-    ///      the elapsed interval is credited at `acc.lastTick`, the tick that was actually
-    ///      live during it, NOT at `newTick`. Crediting the new tick would attribute the swap's
-    ///      own impact backwards over time it had not yet occurred.
+    /// @notice Adds the elapsed blocks at the previous tick, then moves the accumulator to `newTick`.
+
+    /// @dev This function must be called for every swap in the pool, including swaps that do not post a bond. Otherwise the accumulator would miss part of the pool's price path and every bond whose observation window crosses that gap could receive a biased settlement result.
+
+    /// The elapsed interval is always credited using `acc.lastTick`, because that is the tick that was actually active during those blocks. `newTick` only becomes active from the current update onward. Using `newTick` for the elapsed interval would incorrectly apply the new swap's price movement backward in time.
+
+    /// Flow:
+    /// 1. Measure blocks elapsed since `lastUpdate`.
+    /// 2. Add `lastTick * elapsedBlocks` to `tickCumulative`.
+    /// 3. Store `newTick` as the tick active from this block onward.
+    /// 4. Store the current block as `lastUpdate`.
+
     /// @param acc Storage pointer to the pool's accumulator.
-    /// @param newTick Tick after the swap.
-    /// @return cumulative The accumulator value as of the current block.
-    function update(Accumulator storage acc, int24 newTick) internal returns (int56 cumulative) {
+    /// @param newTick Tick that becomes active after the current swap.
+    /// @return cumulative Accumulator value as of the current block.
+    function update(
+        Accumulator storage acc,
+        int24 newTick
+    )
+        internal
+        returns (int56 cumulative)
+    {
         uint32 nowBlock = uint32(block.number);
 
+        // First observation: there is no earlier known tick interval to credit.
         if (acc.lastUpdate == 0) {
-            // First touch: nothing has elapsed under a known tick yet.
             acc.lastTick = newTick;
             acc.lastUpdate = nowBlock;
+
             return acc.tickCumulative;
         }
 
         uint32 elapsed = nowBlock - acc.lastUpdate;
-        cumulative = acc.tickCumulative + int56(acc.lastTick) * int56(uint56(elapsed));
+
+        cumulative =
+            acc.tickCumulative +
+            int56(acc.lastTick) * int56(uint56(elapsed));
 
         acc.tickCumulative = cumulative;
         acc.lastTick = newTick;
         acc.lastUpdate = nowBlock;
     }
 
-    /// @notice Accumulator value as of the current block, without writing.
-    /// @dev Extrapolates the open trailing interval at `lastTick`. This is what makes a quiet
-    ///      pool resolve correctly instead of reading as missing data.
-    function observe(Accumulator memory acc) internal view returns (int56) {
-        uint32 elapsed = uint32(block.number) - acc.lastUpdate;
-        return acc.tickCumulative + int56(acc.lastTick) * int56(uint56(elapsed));
+    /// @notice Returns the accumulator value at the current block without changing storage.
+
+    /// @dev The time since the last stored update is extrapolated using `lastTick`, because that is the most recently known tick. This is what allows quiet pools to produce a valid observation even when no swap occurs during the observation window.
+
+    /// This function observes the current block only. If settlement happens after a bond's maturity, T5 must use the accumulator value frozen or reconstructed at the maturity checkpoint rather than calling this function and using the later settlement block directly.
+    function observe(
+        Accumulator memory acc
+    )
+        internal
+        view
+        returns (int56)
+    {
+        uint32 elapsed =
+            uint32(block.number) - acc.lastUpdate;
+
+        return
+            acc.tickCumulative +
+            int56(acc.lastTick) * int56(uint56(elapsed));
     }
 
-    /// @notice Time-weighted average tick between two accumulator readings.
-    /// @dev Integer division truncates toward zero, so the TWA can be off by at most one tick
-    ///      and the direction of that error depends on sign. One tick is far below any sane
-    ///      `refundToleranceTicks`, so this is not corrected.
+    /// @notice Calculates the time-weighted average tick between two accumulator readings.
+
+    /// @dev The two cumulative readings should represent the bond's opening checkpoint and its fixed maturity checkpoint. Integer division truncates toward zero, so the returned average may differ from the exact mathematical average by less than one tick.
+
+    /// Formula:
+    /// `averageTick = (cumulativeAtEnd - cumulativeAtOpen) / elapsedBlocks`
+
     /// @param cumulativeAtOpen Accumulator value recorded when the bond opened.
-    /// @param cumulativeNow Accumulator value at settlement.
-    /// @param elapsedBlocks Blocks between the two readings. Must be non-zero.
-    function twaTick(int56 cumulativeAtOpen, int56 cumulativeNow, uint32 elapsedBlocks) internal pure returns (int24) {
+    /// @param cumulativeNow Accumulator value at the end of the observation window. For BondMeBro settlement this should be the fixed maturity checkpoint, not an arbitrarily late settlement reading.
+    /// @param elapsedBlocks Number of blocks between the two readings. Must be greater than zero.
+    /// @return averageTick Time-weighted average tick over the interval.
+    function twaTick(
+        int56 cumulativeAtOpen,
+        int56 cumulativeNow,
+        uint32 elapsedBlocks
+    )
+        internal
+        pure
+        returns (int24 averageTick)
+    {
         if (elapsedBlocks == 0) revert ZeroWindow();
-        return int24((int256(cumulativeNow) - int256(cumulativeAtOpen)) / int256(uint256(elapsedBlocks)));
+
+        averageTick = int24(
+            (
+                int256(cumulativeNow) -
+                int256(cumulativeAtOpen)
+            ) / int256(uint256(elapsedBlocks))
+        );
     }
 }

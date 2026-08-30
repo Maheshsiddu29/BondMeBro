@@ -96,9 +96,11 @@ jobs:
         with:
           version: stable
 
+      # Pattern is ANCHORED — unanchored "lib" also matches src/libraries/ and silently
+      # drops every library from the report. Keep in sync with the Makefile.
       - name: Run coverage
         run: |
-          forge coverage --no-match-coverage "lib|test|script" --report summary \
+          forge coverage --no-match-coverage "^(lib|test|script)/" --report summary \
             | tee coverage.txt
 
       # Surface the table directly in the PR page — reviewers shouldn't dig through logs.

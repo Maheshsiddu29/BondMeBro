@@ -1,57 +1,98 @@
 // SPDX-License-Identifier: MIT
+
 pragma solidity 0.8.26;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
-
-import {BondMeBro} from "../src/BondMeBro.sol";
+import {BondMeBro, HOOK_FLAGS} from "../src/BondMeBro.sol";
 
 /// @title DeployBondMeBro
-/// @notice Mines a CREATE2 salt for the hook's permission bits and deploys it.
-///
-/// @dev THE ONE THING THAT BREAKS EVERY v4 DEPLOY SCRIPT.
-///      In `forge test` the deployer is `address(this)`. In `forge script` it is NOT the
-///      broadcasting EOA — Foundry routes `new C{salt: s}(...)` through the deterministic
-///      CREATE2 factory at 0x4e59b44847b379578588920cA78FbF26c0B4956C. A salt mined against
-///      your own EOA produces a different address and `initialize` reverts with
-///      HookAddressNotValid. `CREATE2_DEPLOYER` below is what HookMiner must be given.
+
+/// @notice Mines a CREATE2 salt for BondMeBro's required hook permission bits and deploys the hook.
+
+/// @dev Uniswap v4 hook addresses encode their permissions in the low address bits, so BondMeBro cannot be deployed to an arbitrary address. `HookMiner` searches for a salt that produces an address matching `HOOK_FLAGS`.
+
+/// When running with `forge script`, deterministic deployment uses Foundry's CREATE2 deployer at `0x4e59...B4956C`. The salt must therefore be mined using that deployer address rather than the broadcasting EOA. Mining against the wrong deployer produces a different hook address whose permission bits may be rejected by PoolManager.
+
 contract DeployBondMeBro is Script {
-    /// @notice Canonical deterministic-deployment proxy, same address on every chain.
-    address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+    /// @notice Foundry CREATE2 deployer used for deterministic script deployments.
+    address internal constant CREATE2_DEPLOYER =
+        0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
-    /// @notice The permission bits that must be encoded in the hook's address.
-    /// @dev Must stay in lockstep with `getHookPermissions()`. Change one, re-mine the salt.
-    uint160 internal constant FLAGS =
-        uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG);
+    /// @notice Mines and deploys a BondMeBro hook with the correct permission bits.
 
+    /// @dev `HOOK_FLAGS` comes directly from `BondMeBro.sol` so the deployment script, hook permissions, and tests share one source of truth. Constructor arguments are part of the CREATE2 init-code hash, so changing the PoolManager or owner requires mining a new salt.
+
+    /// Flow:
+    /// 1. Read PoolManager and owner from the environment.
+    /// 2. Encode the constructor arguments.
+    /// 3. Mine a salt for the required hook permission bits.
+    /// 4. Broadcast the deployment.
+    /// 5. Verify the deployed address and hook permissions.
+
+    /// @return hook Newly deployed BondMeBro hook.
     function run() external returns (BondMeBro hook) {
-        IPoolManager poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
+        IPoolManager poolManager =
+            IPoolManager(vm.envAddress("POOL_MANAGER"));
+
+        address hookOwner =
+            vm.envAddress("HOOK_OWNER");
 
         console2.log("chainid     ", block.chainid);
         console2.log("poolManager ", address(poolManager));
+        console2.log("owner       ", hookOwner);
 
-        // Mining is pure computation — deliberately OUTSIDE the broadcast so it costs no gas
-        // and sends no transaction. It brute-forces salts until the resulting CREATE2 address
-        // has the right low bits.
-        bytes memory constructorArgs = abi.encode(poolManager);
+        // Salt mining is local computation and happens before broadcasting.
+        //
+        // Constructor arguments are included in the CREATE2 init-code hash, so a
+        // different PoolManager or owner produces a different address and requires
+        // mining a new salt.
+        bytes memory constructorArgs =
+            abi.encode(
+                poolManager,
+                hookOwner
+            );
+
         (address predicted, bytes32 salt) =
-            HookMiner.find(CREATE2_DEPLOYER, FLAGS, type(BondMeBro).creationCode, constructorArgs);
+            HookMiner.find(
+                CREATE2_DEPLOYER,
+                HOOK_FLAGS,
+                type(BondMeBro).creationCode,
+                constructorArgs
+            );
 
         console2.log("predicted   ", predicted);
         console2.log("salt        ", vm.toString(salt));
 
         vm.startBroadcast();
-        hook = new BondMeBro{salt: salt}(poolManager);
+
+        hook =
+            new BondMeBro{salt: salt}(
+                poolManager,
+                hookOwner
+            );
+
         vm.stopBroadcast();
 
-        // Belt and braces: if these disagree, something about the deployer assumption is wrong
-        // and you want to know now, not when initialize() reverts.
-        require(address(hook) == predicted, "DeployBondMeBro: address mismatch");
-        Hooks.validateHookPermissions(hook, hook.getHookPermissions());
+        // The deployed address must match the address produced during salt mining.
+        require(
+            address(hook) == predicted,
+            "DeployBondMeBro: address mismatch"
+        );
+
+        // Confirm that the deployed address bits match the permissions returned by
+        // the hook itself.
+        Hooks.validateHookPermissions(
+            hook,
+            hook.getHookPermissions()
+        );
 
         console2.log("deployed    ", address(hook));
-        console2.log("addr bits   ", uint256(uint160(address(hook))) & 0x3FFF);
+        console2.log(
+            "addr bits   ",
+            uint256(uint160(address(hook))) & 0x3FFF
+        );
     }
 }

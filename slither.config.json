@@ -9,6 +9,8 @@
     "uniswap-hooks/=lib/uniswap-hooks/",
     "forge-std/=lib/v4-periphery/lib/v4-core/lib/forge-std/src/",
     "@openzeppelin/contracts/=lib/v4-periphery/lib/v4-core/lib/openzeppelin-contracts/contracts/",
-    "solmate/=lib/v4-periphery/lib/v4-core/lib/solmate/"
+    "solmate/=lib/v4-periphery/lib/v4-core/lib/solmate/",
+    "permit2/=lib/v4-periphery/lib/permit2/",
+    "ds-test/=lib/v4-periphery/lib/v4-core/lib/forge-std/lib/ds-test/src/"
   ]
 }
