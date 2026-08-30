@@ -9,6 +9,20 @@ full `forge script` command in one place and uses the environment variables from
 > suitable for the Sepolia rehearsal only. Use a hardware wallet or multisig for
 > a mainnet deployment.
 
+## Existing Sepolia rehearsal
+
+The backend smoke test is already deployed on Sepolia. If you are continuing that
+run, **do not run the hook deployment command again**. Use these public values in
+`.env` and continue with pool operations:
+
+```dotenv
+BOND_HOOK=0x71D5F70343Db7f61B946B733e64A98c842e150C4
+POOL_ID=0xcce8ba85b14222c22b00054927131033bd1bbd96689632f988c184c1996b7f34
+```
+
+Run section 2 only when deploying a new hook on a new network, or after deliberately
+changing the immutable policy configuration.
+
 ## 1. Prepare the checkout
 
 Run these commands from the repository root:
