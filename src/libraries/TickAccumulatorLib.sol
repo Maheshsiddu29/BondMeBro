@@ -18,7 +18,6 @@ pragma solidity 0.8.26;
 
 library TickAccumulatorLib {
     /// @notice Thrown when a time-weighted average is requested over a zero-length interval.
-
     /// @dev Settlement should normally prevent this by requiring maturity before evaluating a bond, but the library still checks it directly so division by zero can never occur.
     error ZeroWindow();
 
@@ -50,13 +49,7 @@ library TickAccumulatorLib {
     /// @param acc Storage pointer to the pool's accumulator.
     /// @param newTick Tick that becomes active after the current swap.
     /// @return cumulative Accumulator value as of the current block.
-    function update(
-        Accumulator storage acc,
-        int24 newTick
-    )
-        internal
-        returns (int56 cumulative)
-    {
+    function update(Accumulator storage acc, int24 newTick) internal returns (int56 cumulative) {
         uint32 nowBlock = uint32(block.number);
 
         // First observation: there is no earlier known tick interval to credit.
@@ -69,9 +62,7 @@ library TickAccumulatorLib {
 
         uint32 elapsed = nowBlock - acc.lastUpdate;
 
-        cumulative =
-            acc.tickCumulative +
-            int56(acc.lastTick) * int56(uint56(elapsed));
+        cumulative = acc.tickCumulative + int56(acc.lastTick) * int56(uint56(elapsed));
 
         acc.tickCumulative = cumulative;
         acc.lastTick = newTick;
@@ -83,19 +74,10 @@ library TickAccumulatorLib {
     /// @dev The time since the last stored update is extrapolated using `lastTick`, because that is the most recently known tick. This is what allows quiet pools to produce a valid observation even when no swap occurs during the observation window.
 
     /// This function observes the current block only. If settlement happens after a bond's maturity, T5 must use the accumulator value frozen or reconstructed at the maturity checkpoint rather than calling this function and using the later settlement block directly.
-    function observe(
-        Accumulator memory acc
-    )
-        internal
-        view
-        returns (int56)
-    {
-        uint32 elapsed =
-            uint32(block.number) - acc.lastUpdate;
+    function observe(Accumulator memory acc) internal view returns (int56) {
+        uint32 elapsed = uint32(block.number) - acc.lastUpdate;
 
-        return
-            acc.tickCumulative +
-            int56(acc.lastTick) * int56(uint56(elapsed));
+        return acc.tickCumulative + int56(acc.lastTick) * int56(uint56(elapsed));
     }
 
     /// @notice Calculates the time-weighted average tick between two accumulator readings.
@@ -109,22 +91,13 @@ library TickAccumulatorLib {
     /// @param cumulativeNow Accumulator value at the end of the observation window. For BondMeBro settlement this should be the fixed maturity checkpoint, not an arbitrarily late settlement reading.
     /// @param elapsedBlocks Number of blocks between the two readings. Must be greater than zero.
     /// @return averageTick Time-weighted average tick over the interval.
-    function twaTick(
-        int56 cumulativeAtOpen,
-        int56 cumulativeNow,
-        uint32 elapsedBlocks
-    )
+    function twaTick(int56 cumulativeAtOpen, int56 cumulativeNow, uint32 elapsedBlocks)
         internal
         pure
         returns (int24 averageTick)
     {
         if (elapsedBlocks == 0) revert ZeroWindow();
 
-        averageTick = int24(
-            (
-                int256(cumulativeNow) -
-                int256(cumulativeAtOpen)
-            ) / int256(uint256(elapsedBlocks))
-        );
+        averageTick = int24((int256(cumulativeNow) - int256(cumulativeAtOpen)) / int256(uint256(elapsedBlocks)));
     }
 }

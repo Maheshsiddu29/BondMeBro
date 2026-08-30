@@ -90,52 +90,24 @@ contract BondCustodyHandler is Test {
     /// @param amountSeed Fuzz value used to choose the swap amount.
     /// @param zeroForOne Swap direction.
     /// @param tightCeiling Whether to deliberately make the bond ceiling too small.
-    function swapExactInput(
-        uint256 amountSeed,
-        bool zeroForOne,
-        bool tightCeiling
-    )
-        external
-    {
-        (Currency inputCurrency,) =
-            _currencies(zeroForOne);
+    function swapExactInput(uint256 amountSeed, bool zeroForOne, bool tightCeiling) external {
+        (Currency inputCurrency,) = _currencies(zeroForOne);
 
-        uint256 minBondedAmount =
-            _threshold(zeroForOne);
+        uint256 minBondedAmount = _threshold(zeroForOne);
 
-        (,, uint16 bondBps) =
-            hook.poolConfig(key_.toId());
+        (,, uint16 bondBps) = hook.poolConfig(key_.toId());
 
-        uint256 grossInput =
-            _sizeStraddlingThreshold(
-                amountSeed,
-                minBondedAmount
-            );
+        uint256 grossInput = _sizeStraddlingThreshold(amountSeed, minBondedAmount);
 
         // Independently calculate the bond expected from an exact-input swap.
-        uint256 expectedBond =
-            grossInput < minBondedAmount
-                ? 0
-                : (grossInput * bondBps) / BPS;
+        uint256 expectedBond = grossInput < minBondedAmount ? 0 : (grossInput * bondBps) / BPS;
 
-        uint128 ceiling =
-            _ceiling(
-                expectedBond,
-                tightCeiling
-            );
+        uint128 ceiling = _ceiling(expectedBond, tightCeiling);
 
         // A zero maxBondAmount cannot produce valid hookData.
         if (ceiling == 0) return;
 
-        _execute(
-            -int256(grossInput),
-            zeroForOne,
-            inputCurrency,
-            expectedBond,
-            ceiling,
-            expectedBond > 0,
-            true
-        );
+        _execute(-int256(grossInput), zeroForOne, inputCurrency, expectedBond, ceiling, expectedBond > 0, true);
     }
 
     /// @notice Executes a fuzzed exact-output swap.
@@ -147,40 +119,18 @@ contract BondCustodyHandler is Test {
     /// @param amountSeed Fuzz value used to choose the requested output amount.
     /// @param zeroForOne Swap direction.
     /// @param tightCeiling Whether to use a deliberately restrictive bond ceiling.
-    function swapExactOutput(
-        uint256 amountSeed,
-        bool zeroForOne,
-        bool tightCeiling
-    )
-        external
-    {
-        (Currency inputCurrency,) =
-            _currencies(zeroForOne);
+    function swapExactOutput(uint256 amountSeed, bool zeroForOne, bool tightCeiling) external {
+        (Currency inputCurrency,) = _currencies(zeroForOne);
 
-        uint256 amountOut =
-            _sizeStraddlingThreshold(
-                amountSeed,
-                _threshold(zeroForOne)
-            );
+        uint256 amountOut = _sizeStraddlingThreshold(amountSeed, _threshold(zeroForOne));
 
         // The real exact-output bond is unknown until execution.
         //
         // A value of 1 is intentionally restrictive; otherwise use the maximum
         // uint128 ceiling so normal bonded swaps can succeed.
-        uint128 ceiling =
-            tightCeiling
-                ? 1
-                : type(uint128).max;
+        uint128 ceiling = tightCeiling ? 1 : type(uint128).max;
 
-        _execute(
-            int256(amountOut),
-            zeroForOne,
-            inputCurrency,
-            0,
-            ceiling,
-            false,
-            false
-        );
+        _execute(int256(amountOut), zeroForOne, inputCurrency, 0, ceiling, false, false);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -188,86 +138,39 @@ contract BondCustodyHandler is Test {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Returns the input and output currencies for the selected swap direction.
-    function _currencies(
-        bool zeroForOne
-    )
-        internal
-        view
-        returns (
-            Currency inputCurrency,
-            Currency outputCurrency
-        )
-    {
-        return
-            zeroForOne
-                ? (currency0, currency1)
-                : (currency1, currency0);
+    function _currencies(bool zeroForOne) internal view returns (Currency inputCurrency, Currency outputCurrency) {
+        return zeroForOne ? (currency0, currency1) : (currency1, currency0);
     }
 
     /// @dev Returns the bonding threshold denominated in the input currency for the selected direction.
-    function _threshold(
-        bool zeroForOne
-    )
-        internal
-        view
-        returns (uint256)
-    {
-        (
-            uint128 min0,
-            uint96 min1,
-        ) = hook.poolConfig(key_.toId());
+    function _threshold(bool zeroForOne) internal view returns (uint256) {
+        (uint128 min0, uint96 min1,) = hook.poolConfig(key_.toId());
 
-        return
-            zeroForOne
-                ? uint256(min0)
-                : uint256(min1);
+        return zeroForOne ? uint256(min0) : uint256(min1);
     }
 
     /// @dev Chooses swap sizes from both sides of the bonding threshold. Roughly half of the seeds produce an amount below the threshold and half produce an amount at or above it.
 
     /// A single large uniform range would heavily favour one side when the threshold occupies only a small part of that range, causing the invariant campaign to miss the unbonded or bonded path. Splitting the range first gives both paths regular coverage.
 
-    function _sizeStraddlingThreshold(
-        uint256 seed,
-        uint256 threshold
-    )
-        internal
-        pure
-        returns (uint256)
-    {
+    function _sizeStraddlingThreshold(uint256 seed, uint256 threshold) internal pure returns (uint256) {
         // If the threshold is outside the useful fuzzing window, choose any
         // swappable amount inside the configured range.
-        if (
-            threshold <= FLOOR ||
-            threshold >= CEIL
-        ) {
-            return
-                FLOOR +
-                (seed % (CEIL - FLOOR));
+        if (threshold <= FLOOR || threshold >= CEIL) {
+            return FLOOR + (seed % (CEIL - FLOOR));
         }
 
         if (seed & 1 == 0) {
             // Strictly below threshold => unbonded.
-            return
-                FLOOR +
-                (seed % (threshold - FLOOR));
+            return FLOOR + (seed % (threshold - FLOOR));
         }
 
         // At or above threshold => bonded.
-        return
-            threshold +
-            (seed % (CEIL - threshold));
+        return threshold + (seed % (CEIL - threshold));
     }
 
     /// @dev Returns a permissive bond ceiling for normal swaps or one wei below the expected bond when testing the rejection path.
-    function _ceiling(
-        uint256 expectedBond,
-        bool tight
-    )
-        internal
-        pure
-        returns (uint128)
-    {
+    function _ceiling(uint256 expectedBond, bool tight) internal pure returns (uint128) {
         if (!tight) {
             return type(uint128).max;
         }
@@ -293,50 +196,32 @@ contract BondCustodyHandler is Test {
         uint128 ceiling,
         bool expectBondedExactInput,
         bool isExactInput
-    )
-        internal
-    {
-        uint256 hookBefore =
-            inputCurrency.balanceOf(address(hook));
+    ) internal {
+        uint256 hookBefore = inputCurrency.balanceOf(address(hook));
 
-        uint256 managerBefore =
-            inputCurrency.balanceOf(address(manager));
+        uint256 managerBefore = inputCurrency.balanceOf(address(manager));
 
         try swapRouter.swap(
             key_,
             SwapParams({
                 zeroForOne: zeroForOne,
                 amountSpecified: amountSpecified,
-                sqrtPriceLimitX96: zeroForOne
-                    ? TickMath.MIN_SQRT_PRICE + 1
-                    : TickMath.MAX_SQRT_PRICE - 1
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
-            HookDataCodec.encode(
-                REFUND_RECIPIENT,
-                ceiling
-            )
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            HookDataCodec.encode(REFUND_RECIPIENT, ceiling)
         ) {
             // Real collateral received by the hook.
-            uint256 bondTaken =
-                inputCurrency.balanceOf(address(hook)) -
-                hookBefore;
+            uint256 bondTaken = inputCurrency.balanceOf(address(hook)) - hookBefore;
 
             // Real input retained by PoolManager.
-            uint256 poolInput =
-                inputCurrency.balanceOf(address(manager)) -
-                managerBefore;
+            uint256 poolInput = inputCurrency.balanceOf(address(manager)) - managerBefore;
 
-            measuredBondTotal[inputCurrency] +=
-                bondTaken;
+            measuredBondTotal[inputCurrency] += bondTaken;
 
             if (isExactInput) {
                 // Exact-input expected collateral was calculated before execution.
-                expectedBondTotal[inputCurrency] +=
-                    expectedBondIfExactInput;
+                expectedBondTotal[inputCurrency] += expectedBondIfExactInput;
 
                 if (expectBondedExactInput) {
                     exactInputBonded++;
@@ -353,27 +238,15 @@ contract BondCustodyHandler is Test {
             //
             // This independently reconstructs the same gross-input economic rate
             // from what the pool actually consumed.
-            (,, uint16 bondBps) =
-                hook.poolConfig(key_.toId());
+            (,, uint16 bondBps) = hook.poolConfig(key_.toId());
 
-            uint256 candidateBond =
-                FullMath.mulDiv(
-                    poolInput,
-                    bondBps,
-                    BPS - uint256(bondBps)
-                );
+            uint256 candidateBond = FullMath.mulDiv(poolInput, bondBps, BPS - uint256(bondBps));
 
-            uint256 candidateGross =
-                poolInput +
-                candidateBond;
+            uint256 candidateGross = poolInput + candidateBond;
 
-            uint256 expectedBond =
-                candidateGross < _threshold(zeroForOne)
-                    ? 0
-                    : candidateBond;
+            uint256 expectedBond = candidateGross < _threshold(zeroForOne) ? 0 : candidateBond;
 
-            expectedBondTotal[inputCurrency] +=
-                expectedBond;
+            expectedBondTotal[inputCurrency] += expectedBond;
 
             if (expectedBond > 0) {
                 exactOutputBonded++;

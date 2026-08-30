@@ -47,28 +47,18 @@ library PersistenceMathLib {
     /// @param settlementRef Time-weighted reference tick at the bond's fixed maturity. Despite the parameter name, T5 must not substitute an arbitrarily late settlement-time tick here.
     /// @param refundTol Tick tolerance treated as noise. An original impact at or below this value is not slashable.
     /// @return persistenceBps Fraction of the original displacement that survived, in basis points from 0 to 10_000.
-    function computeBps(
-        int24 tickBefore,
-        int24 tickAfter,
-        int24 settlementRef,
-        uint24 refundTol
-    )
+    function computeBps(int24 tickBefore, int24 tickAfter, int24 settlementRef, uint24 refundTol)
         internal
         pure
         returns (uint16 persistenceBps)
     {
         // Widen before subtraction because an int24 difference can exceed the int24 range.
-        int256 impactSigned =
-            int256(tickAfter) -
-            int256(tickBefore);
+        int256 impactSigned = int256(tickAfter) - int256(tickBefore);
 
         // No original displacement means there is nothing to measure.
         if (impactSigned == 0) return 0;
 
-        uint256 impactAbs =
-            impactSigned > 0
-                ? uint256(impactSigned)
-                : uint256(-impactSigned);
+        uint256 impactAbs = impactSigned > 0 ? uint256(impactSigned) : uint256(-impactSigned);
 
         // Ignore swaps whose original displacement is entirely inside the tolerance region.
         //
@@ -78,26 +68,13 @@ library PersistenceMathLib {
         }
 
         // Direction of the swap's original tick movement.
-        int256 direction =
-            impactSigned > 0
-                ? int256(1)
-                : int256(-1);
+        int256 direction = impactSigned > 0 ? int256(1) : int256(-1);
 
         // Distance from tickBefore that still remains in the swap's original direction.
-        int256 remaining =
-            direction *
-            (
-                int256(settlementRef) -
-                int256(tickBefore)
-            );
+        int256 remaining = direction * (int256(settlementRef) - int256(tickBefore));
 
         // Apply the tolerance before converting persistence into basis points.
-        int256 numerator =
-            (
-                remaining -
-                int256(uint256(refundTol))
-            ) *
-            int256(BPS);
+        int256 numerator = (remaining - int256(uint256(refundTol))) * int256(BPS);
 
         // The price reverted to the tolerance region or crossed back beyond it.
         if (numerator <= 0) {
@@ -105,19 +82,12 @@ library PersistenceMathLib {
         }
 
         // Safe because `impactAbs > refundTol` was checked above.
-        uint256 denominator =
-            impactAbs -
-            uint256(refundTol);
+        uint256 denominator = impactAbs - uint256(refundTol);
 
-        uint256 raw =
-            uint256(numerator) /
-            denominator;
+        uint256 raw = uint256(numerator) / denominator;
 
         // Persistence beyond the original impact cannot slash more than 100% of the bond.
-        return
-            raw >= BPS
-                ? uint16(BPS)
-                : uint16(raw);
+        return raw >= BPS ? uint16(BPS) : uint16(raw);
     }
 
     /// @notice Splits a bond into the amount returned to the trader and the amount allocated to the slash side of settlement.
@@ -130,27 +100,13 @@ library PersistenceMathLib {
     /// @param persistenceBps Persistence result returned by `computeBps`.
     /// @return slashAmount Portion of the bond assigned to the slash side.
     /// @return refundAmount Portion of the bond returned to the trader.
-    function split(
-        uint128 bondAmount,
-        uint16 persistenceBps
-    )
+    function split(uint128 bondAmount, uint16 persistenceBps)
         internal
         pure
-        returns (
-            uint128 slashAmount,
-            uint128 refundAmount
-        )
+        returns (uint128 slashAmount, uint128 refundAmount)
     {
-        slashAmount =
-            uint128(
-                (
-                    uint256(bondAmount) *
-                    uint256(persistenceBps)
-                ) / BPS
-            );
+        slashAmount = uint128((uint256(bondAmount) * uint256(persistenceBps)) / BPS);
 
-        refundAmount =
-            bondAmount -
-            slashAmount;
+        refundAmount = bondAmount - slashAmount;
     }
 }

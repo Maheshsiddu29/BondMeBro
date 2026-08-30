@@ -18,8 +18,7 @@ import {BondMeBro, HOOK_FLAGS} from "../src/BondMeBro.sol";
 
 contract DeployBondMeBro is Script {
     /// @notice Foundry CREATE2 deployer used for deterministic script deployments.
-    address internal constant CREATE2_DEPLOYER =
-        0x4e59b44847b379578588920cA78FbF26c0B4956C;
+    address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
     /// @notice Mines and deploys a BondMeBro hook with the correct permission bits.
 
@@ -34,11 +33,9 @@ contract DeployBondMeBro is Script {
 
     /// @return hook Newly deployed BondMeBro hook.
     function run() external returns (BondMeBro hook) {
-        IPoolManager poolManager =
-            IPoolManager(vm.envAddress("POOL_MANAGER"));
+        IPoolManager poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
 
-        address hookOwner =
-            vm.envAddress("HOOK_OWNER");
+        address hookOwner = vm.envAddress("HOOK_OWNER");
 
         console2.log("chainid     ", block.chainid);
         console2.log("poolManager ", address(poolManager));
@@ -49,50 +46,28 @@ contract DeployBondMeBro is Script {
         // Constructor arguments are included in the CREATE2 init-code hash, so a
         // different PoolManager or owner produces a different address and requires
         // mining a new salt.
-        bytes memory constructorArgs =
-            abi.encode(
-                poolManager,
-                hookOwner
-            );
+        bytes memory constructorArgs = abi.encode(poolManager, hookOwner);
 
         (address predicted, bytes32 salt) =
-            HookMiner.find(
-                CREATE2_DEPLOYER,
-                HOOK_FLAGS,
-                type(BondMeBro).creationCode,
-                constructorArgs
-            );
+            HookMiner.find(CREATE2_DEPLOYER, HOOK_FLAGS, type(BondMeBro).creationCode, constructorArgs);
 
         console2.log("predicted   ", predicted);
         console2.log("salt        ", vm.toString(salt));
 
         vm.startBroadcast();
 
-        hook =
-            new BondMeBro{salt: salt}(
-                poolManager,
-                hookOwner
-            );
+        hook = new BondMeBro{salt: salt}(poolManager, hookOwner);
 
         vm.stopBroadcast();
 
         // The deployed address must match the address produced during salt mining.
-        require(
-            address(hook) == predicted,
-            "DeployBondMeBro: address mismatch"
-        );
+        require(address(hook) == predicted, "DeployBondMeBro: address mismatch");
 
         // Confirm that the deployed address bits match the permissions returned by
         // the hook itself.
-        Hooks.validateHookPermissions(
-            hook,
-            hook.getHookPermissions()
-        );
+        Hooks.validateHookPermissions(hook, hook.getHookPermissions());
 
         console2.log("deployed    ", address(hook));
-        console2.log(
-            "addr bits   ",
-            uint256(uint160(address(hook))) & 0x3FFF
-        );
+        console2.log("addr bits   ", uint256(uint160(address(hook))) & 0x3FFF);
     }
 }

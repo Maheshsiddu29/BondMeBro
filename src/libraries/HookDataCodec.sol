@@ -53,10 +53,7 @@ library HookDataCodec {
     /// @dev Both shorter and longer payloads are rejected. Extra bytes are not silently ignored because they may represent fields that this version of BondMeBro does not understand.
     /// @param expected Required payload length.
     /// @param actual Received payload length.
-    error InvalidHookDataLength(
-        uint256 expected,
-        uint256 actual
-    );
+    error InvalidHookDataLength(uint256 expected, uint256 actual);
 
     /// @notice Thrown when `refundRecipient` is the zero address.
     /// @dev A bond must always have a valid intended refund recipient before custody is accepted.
@@ -73,14 +70,7 @@ library HookDataCodec {
     /// @param refundRecipient Address intended to receive the bond refund once settlement/refunds are implemented.
     /// @param maxBondAmount Maximum BondMeBro collateral the trader is willing to post, in raw units of the swap's input currency.
     /// @return data Packed 37-byte version 1 payload.
-    function encode(
-        address refundRecipient,
-        uint128 maxBondAmount
-    )
-        internal
-        pure
-        returns (bytes memory data)
-    {
+    function encode(address refundRecipient, uint128 maxBondAmount) internal pure returns (bytes memory data) {
         if (refundRecipient == address(0)) {
             revert ZeroRefundRecipient();
         }
@@ -89,11 +79,7 @@ library HookDataCodec {
             revert ZeroMaxBondAmount();
         }
 
-        data = abi.encodePacked(
-            VERSION,
-            refundRecipient,
-            maxBondAmount
-        );
+        data = abi.encodePacked(VERSION, refundRecipient, maxBondAmount);
     }
 
     /// @notice Decodes and validates a version 1 hookData payload.
@@ -109,16 +95,7 @@ library HookDataCodec {
     /// @param data Raw hookData supplied with the swap.
     /// @return refundRecipient Validated non-zero intended refund recipient.
     /// @return maxBondAmount Validated non-zero bond ceiling, in raw units of the swap's input currency.
-    function decode(
-        bytes calldata data
-    )
-        internal
-        pure
-        returns (
-            address refundRecipient,
-            uint128 maxBondAmount
-        )
-    {
+    function decode(bytes calldata data) internal pure returns (address refundRecipient, uint128 maxBondAmount) {
         if (data.length == 0) {
             revert MissingHookData();
         }
@@ -132,32 +109,13 @@ library HookDataCodec {
 
         // Version 1 must be exactly 37 bytes.
         if (data.length != ENCODED_LENGTH) {
-            revert InvalidHookDataLength(
-                ENCODED_LENGTH,
-                data.length
-            );
+            revert InvalidHookDataLength(ENCODED_LENGTH, data.length);
         }
 
         // Length is now known to be correct, so both slices are in bounds.
-        refundRecipient =
-            address(
-                bytes20(
-                    data[
-                        OFFSET_RECIPIENT:
-                        OFFSET_MAX_BOND
-                    ]
-                )
-            );
+        refundRecipient = address(bytes20(data[OFFSET_RECIPIENT:OFFSET_MAX_BOND]));
 
-        maxBondAmount =
-            uint128(
-                bytes16(
-                    data[
-                        OFFSET_MAX_BOND:
-                        ENCODED_LENGTH
-                    ]
-                )
-            );
+        maxBondAmount = uint128(bytes16(data[OFFSET_MAX_BOND:ENCODED_LENGTH]));
 
         if (refundRecipient == address(0)) {
             revert ZeroRefundRecipient();
