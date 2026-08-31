@@ -1,31 +1,23 @@
 # BondMeBro deployment commands
 
-This is the copy-paste deployment runbook for the Solidity backend. It keeps the
-full `forge script` command in one place and uses the environment variables from
-`.env.example`.
+This is the copy-paste runbook for the Solidity backend. It covers hook deployment,
+pool setup, per-pool configuration, both single-hop swap types, settlement, and pot
+distribution.
 
-> **Security:** `.env` is ignored by Git. Never commit it or paste `PRIVATE_KEY`
-> or `RPC_URL` into an issue, pull request, or chat. The raw-key command below is
-> suitable for the Sepolia rehearsal only. Use a hardware wallet or multisig for
-> a mainnet deployment.
+> **Security:** `.env` is ignored by Git. Never commit it or paste `PRIVATE_KEY` or
+> `RPC_URL` into an issue, pull request, or chat. The raw-key commands are suitable
+> for a Sepolia rehearsal only. Use a hardware wallet or multisig for mainnet.
 
-## Existing Sepolia rehearsal
+## Existing Sepolia deployment
 
-The backend smoke test is already deployed on Sepolia. If you are continuing that
-run, **do not run the hook deployment command again**. Use these public values in
-`.env` and continue with pool operations:
-
-```dotenv
-BOND_HOOK=0x71D5F70343Db7f61B946B733e64A98c842e150C4
-POOL_ID=0xcce8ba85b14222c22b00054927131033bd1bbd96689632f988c184c1996b7f34
-```
-
-Run section 2 only when deploying a new hook on a new network, or after deliberately
-changing the immutable policy configuration.
+The previously tested Sepolia hook was built before the fixed 37-byte hook payload,
+per-currency thresholds, and exact-input `beforeSwap` delta were added. It is a
+legacy deployment and must not be used with these scripts. Deploy the current hook
+once, then use the new `BOND_HOOK` printed by the deployment script.
 
 ## 1. Prepare the checkout
 
-Run these commands from the repository root:
+From the repository root:
 
 ```bash
 cd /path/to/FairFlow
@@ -36,23 +28,23 @@ git submodule update --init --recursive
 cp .env.example .env
 ```
 
-Edit `.env` and set at least these values before deploying the hook:
+Edit `.env` and set at least:
 
 ```dotenv
 RPC_URL=<Sepolia RPC URL>
 PRIVATE_KEY=<testnet deployer key>
 POOL_MANAGER=0xE03A1074c86CFeDd5C142C4F04F1a1536e203543
+OWNER=<pool-configuration owner address>
 ```
 
-The policy values in `.env.example` are constructor arguments. Changing any of
-them produces a different CREATE2 hook address, so choose them before deployment.
-For another network, replace `POOL_MANAGER` with that network's official Uniswap
-v4 address.
+Choose `BOND_BPS`, `MIN_BONDED_AMOUNT0`, and `MIN_BONDED_AMOUNT1` before deploying.
+`BOND_BPS` is capped at 100 basis points. Both thresholds and the rate must be
+non-zero to enable bonding, or all three must be zero to deploy with disabled defaults.
 
-## 2. Full hook deployment command
+## 2. Full current hook deployment command
 
-The `set -a`/`set +a` pair is important: it exports the values loaded from `.env`
-so Foundry's `vm.env*` calls can read them.
+Export the dotenv values before invoking Foundry. This makes the values available to
+`vm.env*` inside the script.
 
 ```bash
 cd /path/to/FairFlow
@@ -68,13 +60,12 @@ forge script script/DeployBondMeBro.s.sol:DeployBondMeBro \
   --broadcast
 ```
 
-The script mines a CREATE2 salt, prints `predicted`, `salt`, and then prints the
-final address as `deployed`. Save that address and put it in `.env` as
-`BOND_HOOK`. Do not use the old hook address after changing any constructor
-configuration.
+The script prints `predicted`, `salt`, and `deployed`. Copy the `deployed` value to
+`BOND_HOOK` in `.env`. Because the hook address encodes all enabled permissions, any
+change to the Solidity code, constructor values, or permission flags requires a new
+CREATE2 salt and a new hook address.
 
-To do a simulation without sending a transaction, run the same command without
-`--broadcast` first:
+For a dry run, omit `--broadcast`:
 
 ```bash
 forge script script/DeployBondMeBro.s.sol:DeployBondMeBro \
@@ -82,16 +73,12 @@ forge script script/DeployBondMeBro.s.sol:DeployBondMeBro \
   --private-key "$PRIVATE_KEY"
 ```
 
-## 3. Complete Sepolia pool rehearsal
+## 3. Initialize the pool and add liquidity
 
-After setting `BOND_HOOK` and the network-specific values in `.env`, reload the
-environment in the same shell:
+Set `BOND_HOOK`, sorted `CURRENCY0`/`CURRENCY1`, `POOL_FEE`, `TICK_SPACING`, and the
+intended `SQRT_PRICE_X96` in `.env`, then run:
 
 ```bash
-set -a
-source .env
-set +a
-
 forge script script/InitializeBondMeBroPool.s.sol:InitializeBondMeBroPool \
   --rpc-url "$RPC_URL" \
   --private-key "$PRIVATE_KEY" \
@@ -101,36 +88,64 @@ forge script script/MintBondMeBroPosition.s.sol:MintBondMeBroPosition \
   --rpc-url "$RPC_URL" \
   --private-key "$PRIVATE_KEY" \
   --broadcast
+```
 
+The initialization script is safe to rerun for an already initialized pool. Use the
+canonical network-specific PositionManager and Permit2 addresses. Set bounded
+`AMOUNT0_MAX` and `AMOUNT1_MAX`; the all-maximum values in `.env.example` are for
+local demos only.
+
+If the deployment used disabled defaults, set these values for the configuration
+script:
+
+```dotenv
+POOL_MIN_BONDED_AMOUNT0=<minimum currency0 input in raw units>
+POOL_MIN_BONDED_AMOUNT1=<minimum currency1 input in raw units>
+POOL_BOND_BPS=25
+```
+
+Then run the owner-only update:
+
+```bash
+forge script script/ConfigureBondMeBroPool.s.sol:ConfigureBondMeBroPool \
+  --rpc-url "$RPC_URL" \
+  --private-key "$PRIVATE_KEY" \
+  --broadcast
+```
+
+## 4. Execute an exact-input swap
+
+Set `UNIVERSAL_ROUTER`, `PERMIT2`, `TRADER`, `ZERO_FOR_ONE`, `SWAP_AMOUNT_IN`,
+`SWAP_AMOUNT_OUT_MINIMUM`, and `MAX_BOND_AMOUNT`:
+
+```bash
 forge script script/SwapBondMeBro.s.sol:SwapBondMeBro \
   --rpc-url "$RPC_URL" \
   --private-key "$PRIVATE_KEY" \
   --broadcast
 ```
 
-For the ETH/WETH Sepolia smoke-test pool, the public values used by the completed
-rehearsal were:
+The script sends a fixed 37-byte payload containing the refund recipient and maximum
+bond. Use a non-zero `SWAP_AMOUNT_OUT_MINIMUM` outside a smoke test.
 
-```dotenv
-POOL_MANAGER=0xE03A1074c86CFeDd5C142C4F04F1a1536e203543
-POSITION_MANAGER=0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4
-PERMIT2=0x000000000022D473030F116dDEE9F6B43aC78BA3
-CURRENCY0=0x0000000000000000000000000000000000000000
-CURRENCY1=0xfff9976782d46CC05630D1f6eBAb18b2324d6B14
-POOL_FEE=3000
-TICK_SPACING=60
-SQRT_PRICE_X96=79228162514264337593543950336
+## 5. Execute an exact-output swap
+
+Set `SWAP_AMOUNT_OUT` and `SWAP_AMOUNT_IN_MAXIMUM`. The maximum must include the
+pool's required input plus the possible bond:
+
+```bash
+forge script script/SwapBondMeBroExactOutput.s.sol:SwapBondMeBroExactOutput \
+  --rpc-url "$RPC_URL" \
+  --private-key "$PRIVATE_KEY" \
+  --broadcast
 ```
 
-Use the official Sepolia Universal Router address for `UNIVERSAL_ROUTER`; do not
-copy a router address from another network. Set a non-zero
-`SWAP_AMOUNT_OUT_MINIMUM` outside a smoke test. The `MintBondMeBroPosition` script
-also needs bounded `AMOUNT0_MAX` and `AMOUNT1_MAX` values for production.
+For a native input currency, the script supplies `SWAP_AMOUNT_IN_MAXIMUM` as the
+transaction value. The Universal Router still enforces the maximum-input check.
 
-## 4. Wait and settle
+## 6. Wait and settle matured bonds
 
-A bond is eligible only after `OBSERVATION_BLOCKS`. The permissionless settlement
-command is:
+A bond becomes eligible after `OBSERVATION_BLOCKS`. Anyone can call:
 
 ```bash
 forge script script/SettleBondMeBro.s.sol:SettleBondMeBro \
@@ -139,14 +154,12 @@ forge script script/SettleBondMeBro.s.sol:SettleBondMeBro \
   --broadcast
 ```
 
-`MAX_COUNT` defaults to 32 and the contract enforces the same upper bound. Active
-pools can settle matured bonds automatically on a later swap; this command keeps a
-quiet pool live.
+`MAX_COUNT` defaults to 32. Later swaps also settle a capped matured FIFO prefix, so
+a keeper is not a protocol dependency.
 
-## 5. Donate the insurance pot
+## 7. Distribute the insurance pot
 
-Set `POT_CURRENCY` to the currency shown in the `BondSettled` event or to the
-currency with a non-zero `insurancePot`, then run:
+Set `POT_CURRENCY` to one of the pool currencies and call:
 
 ```bash
 forge script script/DonateBondPot.s.sol:DonateBondPot \
@@ -155,23 +168,30 @@ forge script script/DonateBondPot.s.sol:DonateBondPot \
   --broadcast
 ```
 
-An empty pot is a safe no-op. A non-empty donation requires in-range liquidity.
-Large pots are drained in manager-sized chunks across repeated calls.
+An empty pot is a safe no-op. A non-empty donation requires in-range liquidity and
+may need repeated calls for a very large pot.
 
-## 6. Verify the deployment
+## 8. Verify the deployed hook
+
+Run the read-only verification script (do not add `--broadcast`):
 
 ```bash
-cast code "$BOND_HOOK" --rpc-url "$RPC_URL" | cut -c1-20
-cast call "$BOND_HOOK" \
-  "poolManager()(address)" \
+forge script script/VerifyBondMeBro.s.sol:VerifyBondMeBro \
   --rpc-url "$RPC_URL"
 ```
 
-The returned `poolManager()` must equal the configured `POOL_MANAGER`. Record the
-chain ID, hook address, PoolManager, pool ID, currencies, router, policy values,
-and every transaction hash in the deployment manifest before treating a network
-as launched.
+You can also inspect the bytecode and immutable values directly:
 
-The current Sepolia rehearsal is a smoke test, not a mainnet launch. Mainnet still
-requires a parameter review, bounded slippage settings, an independent security
-audit, and hardware-wallet or multisig deployment.
+```bash
+cast code "$BOND_HOOK" --rpc-url "$RPC_URL" | cut -c1-20
+cast call "$BOND_HOOK" "poolManager()(address)" --rpc-url "$RPC_URL"
+cast call "$BOND_HOOK" "owner()(address)" --rpc-url "$RPC_URL"
+```
+
+Confirm the returned manager and owner, the hook address permission bits, the pool ID,
+the active pool configuration, position liquidity, and all transaction hashes before
+launching a network.
+
+This remains a production-oriented MVP backend, not a security audit. Mainnet still
+requires independent audit, economic-parameter review, network-address verification,
+bounded slippage, and hardware-wallet or multisig deployment.

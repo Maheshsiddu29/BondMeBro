@@ -7,7 +7,9 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {
+    BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta
+} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
@@ -17,19 +19,22 @@ import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockC
 
 import {TickAccumulatorLib} from "./libraries/TickAccumulatorLib.sol";
 import {PersistenceMathLib} from "./libraries/PersistenceMathLib.sol";
+import {HookDataCodec} from "./libraries/HookDataCodec.sol";
 
 /// @title BondMeBro — outcome-linked LP insurance for Uniswap v4.
-/// @notice Swaps whose price impact exceeds `minImpactTicks` post a refundable bond, taken
-///         out of the swap itself (the hook shaves the swap's unspecified side). After
-///         `observationBlocks`, the bond settles against the pool's own time-weighted
-///         average tick: impact that reverted refunds in full; impact that persisted is
-///         slashed into the LP insurance pot.
+/// @notice Swaps whose total input exceeds the active pool's per-currency threshold post a
+///         refundable bond. Exact-input bonds are taken before the pool executes and the
+///         pool receives only the net amount; exact-output bonds are solved after the pool
+///         reports its real input. After `observationBlocks`, the bond settles against the
+///         pool's own time-weighted average tick: impact that reverted refunds in full;
+///         impact that persisted is slashed into the LP insurance pot.
 ///
 /// @dev OWNERSHIP. The hook only sees the direct caller of `PoolManager.swap` — usually a
-///      router, not the trader. `owner` therefore comes from 32-byte `hookData` when
-///      present (the v4 router convention for passing the end user through), falling back
-///      to the swap caller. Refunds go to `owner`; pick hookData deliberately in routers
-///      you actually trust with user funds.
+///      router, not the trader. A bonded swap must carry the fixed 37-byte versioned
+///      `HookDataCodec` payload containing the refund recipient and maximum accepted bond.
+///      Empty data remains valid only for unbonded exact-input swaps, where it is used as a
+///      fallback for piggyback settlement rewards. Refunds go to the encoded recipient; a
+///      router must never substitute `tx.origin` for this explicit value.
 ///
 /// @dev SETTLEMENT TRIGGER (Problem 2). Two paths, no required keeper:
 ///      1. Piggyback — every swap first settles the matured prefix of the queue,
@@ -78,10 +83,8 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     // ------------------------------------------------------------------
 
     struct Config {
-        /// @dev Bond size in bps of the swap's unspecified-side amount. e.g. 500 = 5%.
+        /// @dev Default bond rate in basis points. Pool configurations cap this at 100 (1%).
         uint16 bondBps;
-        /// @dev |tickAfter - tickBefore| at or above which a bond attaches.
-        uint24 minImpactTicks;
         /// @dev Persistence noise floor (PersistenceMathLib.refundTol).
         uint24 refundTolTicks;
         /// @dev N — blocks a bond seasons before it can settle.
@@ -92,15 +95,34 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         uint16 settlerFeeBps;
         /// @dev Max piggyback settlements per swap.
         uint8 maxSettlesPerSwap;
+        /// @dev Default minimum total input when currency0 is the swap input.
+        uint96 minBondedAmount0;
+        /// @dev Default minimum total input when currency1 is the swap input.
+        uint96 minBondedAmount1;
+        /// @dev Explicit owner. CREATE2 deployment is performed by a proxy, so msg.sender is
+        ///      not a reliable way to assign the EOA that may configure pools.
+        address owner;
     }
 
+    /// @notice Default bond rate retained as an immutable deployment manifest value.
     uint16 public immutable bondBps;
-    uint24 public immutable minImpactTicks;
     uint24 public immutable refundTolTicks;
     uint32 public immutable observationBlocks;
     uint24 public immutable maxAbsTickDelta;
     uint16 public immutable settlerFeeBps;
     uint8 public immutable maxSettlesPerSwap;
+    uint96 public immutable defaultMinBondedAmount0;
+    uint96 public immutable defaultMinBondedAmount1;
+    address public immutable owner;
+
+    /// @notice Per-pool custody configuration. The three fields occupy one storage slot.
+    struct PoolConfig {
+        uint96 minBondedAmount0;
+        uint96 minBondedAmount1;
+        uint16 bondBps;
+    }
+
+    mapping(PoolId => PoolConfig) internal _poolConfigs;
 
     /// @notice A posted bond. Enqueued FIFO per pool, so matured bonds are always a prefix.
     struct Bond {
@@ -135,6 +157,17 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     mapping(PoolId => int24) internal _pendingTick;
     mapping(PoolId => bool) internal _pendingSet;
 
+    /// @dev Exact-input custody is decided before the pool swap, but the bond record needs the
+    ///      post-swap tick and accumulator reading. This temporary record bridges the two
+    ///      callbacks; a reverted swap reverts it together with token custody.
+    struct PendingBond {
+        address owner;
+        Currency currency;
+        uint128 amount;
+    }
+
+    mapping(PoolId => PendingBond) internal _pendingBonds;
+
     // ------------------------------------------------------------------
     // Events & errors
     // ------------------------------------------------------------------
@@ -163,8 +196,17 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     event PotDonated(PoolId indexed poolId, Currency indexed currency, uint256 amount, address caller);
     event PaymentDeferred(address indexed recipient, Currency indexed currency, uint256 amount);
     event PaymentsClaimed(address indexed recipient, Currency indexed currency, uint256 amount);
+    event PoolConfigUpdated(
+        PoolId indexed poolId, uint96 minBondedAmount0, uint96 minBondedAmount1, uint16 bondBps, address indexed caller
+    );
 
     error InvalidConfig();
+    error InvalidPoolConfig();
+    error NotOwner();
+    error PoolNotInitialized();
+    error BondTooLarge();
+    error BondTooSmall();
+    error BondSlippage();
     error NothingToDonate();
     error NothingToClaim();
     error PaymentTransferFailed();
@@ -176,23 +218,25 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     constructor(IPoolManager _poolManager, Config memory cfg) BaseHook(_poolManager) {
         if (address(_poolManager).code.length == 0) revert InvalidPoolManager();
         if (
-            cfg.bondBps == 0 || cfg.bondBps > BPS || cfg.settlerFeeBps > BPS || cfg.observationBlocks == 0
-                || cfg.minImpactTicks <= cfg.refundTolTicks || cfg.maxAbsTickDelta == 0 || cfg.maxSettlesPerSwap == 0
-                || cfg.maxSettlesPerSwap > MAX_SETTLE_BATCH
+            cfg.settlerFeeBps > BPS || cfg.observationBlocks == 0 || cfg.maxAbsTickDelta == 0
+                || cfg.maxSettlesPerSwap == 0 || cfg.maxSettlesPerSwap > MAX_SETTLE_BATCH || cfg.owner == address(0)
         ) revert InvalidConfig();
+        _validatePoolConfig(cfg.minBondedAmount0, cfg.minBondedAmount1, cfg.bondBps);
 
         bondBps = cfg.bondBps;
-        minImpactTicks = cfg.minImpactTicks;
         refundTolTicks = cfg.refundTolTicks;
         observationBlocks = cfg.observationBlocks;
         maxAbsTickDelta = cfg.maxAbsTickDelta;
         settlerFeeBps = cfg.settlerFeeBps;
         maxSettlesPerSwap = cfg.maxSettlesPerSwap;
+        defaultMinBondedAmount0 = cfg.minBondedAmount0;
+        defaultMinBondedAmount1 = cfg.minBondedAmount1;
+        owner = cfg.owner;
     }
 
-    /// @dev AFTER_INITIALIZE | BEFORE_SWAP | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA.
-    ///      The return-delta bit is new vs milestone 1: taking the bond out of the swap
-    ///      requires it — which changes the mined address.
+    /// @dev AFTER_INITIALIZE | BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA |
+    ///      AFTER_SWAP_RETURNS_DELTA. Exact-input bonds adjust the swap before the pool
+    ///      executes; exact-output bonds are solved after the pool reports its real input.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
@@ -205,7 +249,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
+            beforeSwapReturnDelta: true,
             afterSwapReturnDelta: true,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -213,16 +257,51 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     }
 
     function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick) internal override returns (bytes4) {
+        PoolId id = key.toId();
         // Seed from the pool's declared starting tick so the first swap is also clamped.
-        _accumulators[key.toId()].initialize(tick);
+        _accumulators[id].initialize(tick);
+        _poolConfigs[id] = PoolConfig({
+            minBondedAmount0: defaultMinBondedAmount0,
+            minBondedAmount1: defaultMinBondedAmount1,
+            bondBps: bondBps
+        });
+        emit PoolConfigUpdated(id, defaultMinBondedAmount0, defaultMinBondedAmount1, bondBps, msg.sender);
         return BaseHook.afterInitialize.selector;
+    }
+
+    /// @notice Updates the amount thresholds and bond rate for one initialized pool.
+    /// @dev All three values are enabled together or disabled together. A zero threshold in
+    ///      one direction would otherwise make every swap in that direction qualify. The
+    ///      1% cap is deliberately independent of the immutable global settlement settings.
+    function setPoolConfig(PoolKey calldata key, uint96 minBondedAmount0, uint96 minBondedAmount1, uint16 poolBondBps)
+        external
+    {
+        if (msg.sender != owner) revert NotOwner();
+        PoolId id = key.toId();
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+        if (sqrtPriceX96 == 0) revert PoolNotInitialized();
+        _validatePoolConfig(minBondedAmount0, minBondedAmount1, poolBondBps);
+        _poolConfigs[id] =
+            PoolConfig({minBondedAmount0: minBondedAmount0, minBondedAmount1: minBondedAmount1, bondBps: poolBondBps});
+        emit PoolConfigUpdated(id, minBondedAmount0, minBondedAmount1, poolBondBps, msg.sender);
+    }
+
+    /// @notice Returns the active custody configuration for a pool.
+    function getPoolConfig(PoolId id) external view returns (PoolConfig memory) {
+        return _poolConfigs[id];
+    }
+
+    function _validatePoolConfig(uint96 minBondedAmount0, uint96 minBondedAmount1, uint16 poolBondBps) internal pure {
+        bool disabled = minBondedAmount0 == 0 && minBondedAmount1 == 0 && poolBondBps == 0;
+        bool enabled = minBondedAmount0 != 0 && minBondedAmount1 != 0 && poolBondBps != 0;
+        if ((!disabled && !enabled) || poolBondBps > 100) revert InvalidPoolConfig();
     }
 
     // ------------------------------------------------------------------
     // Swap callbacks
     // ------------------------------------------------------------------
 
-    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata, bytes calldata hookData)
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
         internal
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -247,7 +326,38 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         _pendingTick[id] = tick;
         _pendingSet[id] = true;
 
-        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        // Exact-output swaps must carry a complete payload even when the eventual input is
+        // below the configured threshold: the user has explicitly opted into this swap's
+        // refund recipient and bond limit. Exact-input payloads are decoded only if the
+        // amount threshold says this swap can actually open a bond.
+        if (params.amountSpecified >= 0) {
+            HookDataCodec.decode(hookData);
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        }
+
+        PoolConfig memory poolConfig = _poolConfigs[id];
+        Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
+        uint256 grossInput = uint256(-params.amountSpecified);
+        uint256 minimumInput = params.zeroForOne ? poolConfig.minBondedAmount0 : poolConfig.minBondedAmount1;
+
+        if (poolConfig.bondBps == 0 || grossInput < minimumInput) {
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        }
+
+        (address owner_, uint128 maxBondAmount) = HookDataCodec.decode(hookData);
+        uint256 bond = (grossInput * uint256(poolConfig.bondBps)) / BPS;
+        if (bond == 0) revert BondTooSmall();
+        if (bond >= grossInput) revert BondTooLarge(); // INV-NOOP: the pool must receive input
+        if (bond > maxBondAmount) revert BondSlippage();
+        if (bond >= (uint256(1) << 127)) revert BondTooLarge();
+
+        _pendingBonds[id] = PendingBond({owner: owner_, currency: inputCurrency, amount: bond.toUint128()});
+        // `take` moves the bond into hook custody and creates the negative half of the hook
+        // delta. The returned specified delta makes the swapper pay gross input while the
+        // pool executes only gross minus bond.
+        poolManager.take(inputCurrency, address(this), bond);
+
+        return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(bond.toInt128(), 0), 0);
     }
 
     /// @dev Everything the bond bookkeeper needs from the swap, passed as a struct to keep
@@ -259,7 +369,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     }
 
     function _afterSwap(
-        address sender,
+        address,
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta delta,
@@ -282,23 +392,37 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         }
 
         SwapReading memory reading = SwapReading(tickBefore, tickAfter, cumulativeNow);
-        int128 hookDelta = _bondIfWarranted(sender, key, params, delta, hookData, id, reading);
-        return (BaseHook.afterSwap.selector, hookDelta);
+        if (params.amountSpecified < 0) {
+            PendingBond memory pending = _pendingBonds[id];
+            delete _pendingBonds[id];
+            if (pending.amount != 0) {
+                _openBond(
+                    id,
+                    pending.owner,
+                    pending.currency,
+                    pending.amount,
+                    reading.tickBefore,
+                    reading.tickAfter,
+                    reading.cumulativeAtOpen
+                );
+            }
+            // The beforeSwap return delta is combined by v4's Hooks library. No afterSwap
+            // delta is needed for exact input; custody was completed before pool execution.
+            return (BaseHook.afterSwap.selector, 0);
+        }
+
+        return (BaseHook.afterSwap.selector, _bondExactOutput(key, params, delta, hookData, id, reading));
     }
 
-    /// @dev Bond rides the swap's unspecified side. Exact input => the output is shaved;
-    ///      exact output => the input owed is raised. PoolManager applies the returned
-    ///      hookDelta to the swapper, so the bond truly comes out of the swap itself.
-    ///      Owner identity: 32-byte hookData carries the end user (v4 router convention);
-    ///      otherwise the direct swap caller. See the OWNERSHIP note in the header.
+    /// @dev Exact-output input is unknown until PoolManager returns the swap delta. The bond
+    ///      is solved from poolInput so bond / (poolInput + bond) equals the configured rate.
     struct BondTerms {
         address owner;
         Currency currency;
         uint128 amount;
     }
 
-    function _bondIfWarranted(
-        address sender,
+    function _bondExactOutput(
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta delta,
@@ -306,11 +430,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         PoolId id,
         SwapReading memory reading
     ) internal returns (int128 hookDelta) {
-        int256 impact = int256(reading.tickAfter) - int256(reading.tickBefore);
-        if (impact < 0) impact = -impact;
-        if (uint256(impact) < uint256(minImpactTicks)) return 0;
-
-        BondTerms memory terms = _bondTerms(sender, key, params, delta, hookData);
+        BondTerms memory terms = _exactOutputTerms(key, params, delta, hookData, id);
         if (terms.amount == 0) return 0;
 
         _openBond(
@@ -322,38 +442,46 @@ contract BondMeBro is BaseHook, IUnlockCallback {
             reading.tickAfter,
             reading.cumulativeAtOpen
         );
-
-        // Convert the hook's claim into real tokens the hook holds for the bond term.
         poolManager.take(terms.currency, address(this), terms.amount);
+        // afterSwap returns the unspecified-currency delta. For exact-output, the input is
+        // the unspecified side in both swap directions, so this adds the bond to the user's
+        // final input obligation.
         hookDelta = uint256(terms.amount).toInt128();
     }
 
-    function _resolveOwner(address swapCaller, bytes calldata hookData) internal pure returns (address) {
-        if (hookData.length != 32) return swapCaller;
-        address decoded = abi.decode(hookData, (address));
-        return decoded == address(0) ? swapCaller : decoded;
-    }
-
-    function _bondTerms(
-        address sender,
+    function _exactOutputTerms(
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta delta,
-        bytes calldata hookData
+        bytes calldata hookData,
+        PoolId id
     ) internal view returns (BondTerms memory terms) {
-        bool unspecifiedIsCurrency1 = (params.amountSpecified < 0) == params.zeroForOne;
-        int128 unspecifiedDelta = unspecifiedIsCurrency1 ? delta.amount1() : delta.amount0();
-        int256 magnitude = int256(unspecifiedDelta);
-        if (magnitude < 0) magnitude = -magnitude;
+        PoolConfig memory poolConfig = _poolConfigs[id];
+        if (poolConfig.bondBps == 0) return terms;
 
-        uint256 bond = (uint256(magnitude) * bondBps) / BPS;
-        // PoolManager deltas are signed int128 values. Do not allow an extreme swap
-        // amount to cross that representation boundary and make the hook callback revert.
-        if (bond == 0 || bond >= (uint256(1) << 127)) return terms;
+        terms.currency = params.zeroForOne ? key.currency0 : key.currency1;
+        int128 inputDelta = params.zeroForOne ? delta.amount0() : delta.amount1();
+        if (inputDelta >= 0) return terms;
 
-        terms.owner = _resolveOwner(sender, hookData);
-        terms.currency = unspecifiedIsCurrency1 ? key.currency1 : key.currency0;
+        uint256 poolInput = uint256(-int256(inputDelta));
+        uint256 bond = (poolInput * uint256(poolConfig.bondBps)) / (BPS - uint256(poolConfig.bondBps));
+        uint256 totalInput = poolInput + bond;
+        uint256 minimumInput = params.zeroForOne ? poolConfig.minBondedAmount0 : poolConfig.minBondedAmount1;
+        if (totalInput < minimumInput) return terms;
+        if (bond == 0) revert BondTooSmall();
+        if (bond >= totalInput || bond >= (uint256(1) << 127)) revert BondTooLarge();
+
+        uint128 maxBondAmount;
+        (terms.owner, maxBondAmount) = HookDataCodec.decode(hookData);
+        if (bond > maxBondAmount) revert BondSlippage();
         terms.amount = bond.toUint128();
+    }
+
+    function _resolveOwner(address swapCaller, bytes calldata hookData) internal pure returns (address) {
+        if (hookData.length == 0) return swapCaller;
+        if (hookData.length != HookDataCodec.LENGTH) revert HookDataCodec.InvalidHookDataLength();
+        (address refundRecipient,) = HookDataCodec.decode(hookData);
+        return refundRecipient;
     }
 
     // ------------------------------------------------------------------
@@ -362,7 +490,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
 
     function _openBond(
         PoolId id,
-        address owner,
+        address bondOwner,
         Currency currency,
         uint128 amount,
         int24 tickBefore,
@@ -371,7 +499,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     ) internal {
         bytes32 bondId = keccak256(abi.encode(id, uint64(++_bondNonce[id])));
         _bonds[id][bondId] = Bond({
-            owner: owner,
+            owner: bondOwner,
             openBlock: uint48(block.number),
             tickBefore: tickBefore,
             tickAfter: tickAfter,
@@ -390,7 +518,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         _queueTail[id] = bondId;
 
         emit BondOpened(
-            id, bondId, owner, currency, amount, tickBefore, tickAfter, uint48(block.number) + observationBlocks
+            id, bondId, bondOwner, currency, amount, tickBefore, tickAfter, uint48(block.number) + observationBlocks
         );
     }
 

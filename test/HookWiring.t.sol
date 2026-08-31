@@ -16,10 +16,11 @@ import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
 import {BondMeBro} from "../src/BondMeBro.sol";
+import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 
 /// @notice Phase 1 wiring: the mined address must encode the extended permission bits
-///         (afterSwapReturnDelta is new — the bond is taken out of the swap itself), and a
-///         real swap through PoolManager must drive the bond logic end to end.
+///         (both swap callbacks return deltas), and a real swap through PoolManager must
+///         drive input-side bond custody end to end.
 contract HookWiringTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -30,18 +31,20 @@ contract HookWiringTest is Test, Deployers {
 
     uint160 internal constant FLAGS = uint160(
         Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
-            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+            | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
     );
 
-    function config() internal pure returns (BondMeBro.Config memory) {
+    function config() internal view returns (BondMeBro.Config memory) {
         return BondMeBro.Config({
-            bondBps: 1000, // 10% of the swap's unspecified side
-            minImpactTicks: 10,
+            bondBps: 25, // 0.25% of total input
             refundTolTicks: 5,
             observationBlocks: 10,
             maxAbsTickDelta: 1000,
             settlerFeeBps: 500, // 5% of slash to piggyback owner or direct settler
-            maxSettlesPerSwap: 4
+            maxSettlesPerSwap: 4,
+            minBondedAmount0: 1e15,
+            minBondedAmount1: 1e15,
+            owner: address(this)
         });
     }
 
@@ -82,7 +85,7 @@ contract HookWiringTest is Test, Deployers {
         new BondMeBro{salt: salt}(IPoolManager(address(0)), cfg);
     }
 
-    /// @notice A small swap (impact below minImpactTicks) must not be bonded at all.
+    /// @notice A small input below the currency0 threshold must not be bonded at all.
     function test_smallSwap_opensNoBond() public {
         swapRouter.swap(
             key_,
@@ -91,31 +94,24 @@ contract HookWiringTest is Test, Deployers {
             ""
         );
 
-        (, int24 tick,,) = manager.getSlot0(pid);
-        uint256 impact = uint256(int256(-tick)); // started at tick 0, zeroForOne moves down
-        assertLt(impact, hook.minImpactTicks(), "test setup: swap must be below the impact threshold");
-        assertEq(hook.queueLength(pid), 0, "small swap must not open a bond");
+        assertEq(hook.queueLength(pid), 0, "small input must not open a bond");
     }
 
     /// @notice A large swap opens a bond and the hook holds the bonded tokens.
     function test_largeSwap_opensBond_andTakesTokens() public {
-        uint256 hookBefore = Currency.unwrap(currency1) == address(0)
+        uint256 hookBefore = Currency.unwrap(currency0) == address(0)
             ? address(hook).balance
-            : MockERC20Like(Currency.unwrap(currency1)).balanceOf(address(hook));
+            : MockERC20Like(Currency.unwrap(currency0)).balanceOf(address(hook));
 
         swapRouter.swap(
             key_,
             SwapParams({zeroForOne: true, amountSpecified: -5e16, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-            abi.encode(address(this)) // owner = test contract
+            HookDataCodec.encode(address(this), type(uint128).max) // owner = test contract
         );
 
-        (, int24 tick,,) = manager.getSlot0(pid);
-        uint256 impact = uint256(int256(-tick));
-        assertGe(impact, hook.minImpactTicks(), "test setup: swap must cross the impact threshold");
-
         assertEq(hook.queueLength(pid), 1, "bond not enqueued");
-        uint256 hookAfter = MockERC20Like(Currency.unwrap(currency1)).balanceOf(address(hook));
+        uint256 hookAfter = MockERC20Like(Currency.unwrap(currency0)).balanceOf(address(hook));
         assertGt(hookAfter, hookBefore, "hook must be holding the bond");
     }
 }

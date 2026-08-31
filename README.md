@@ -32,10 +32,10 @@ including harmless traders — for damage that only some of them cause.
 
 Don't guess. **Wait and see.**
 
-BondMeBro asks high-impact swaps to post a refundable bond, then looks at the price
-a short while later and settles based on what actually happened. Traders whose
-impact reverted pay nothing. Traders whose impact stuck pay into an insurance pot
-for LPs.
+BondMeBro asks swaps whose total input exceeds a configured per-currency threshold
+to post a refundable bond, then looks at the price a short while later and settles
+based on what actually happened. Traders whose impact reverted pay nothing. Traders
+whose impact stuck pay into an insurance pot for LPs.
 
 It's less "toxicity detection" and more **insurance that prices itself after the
 fact**.
@@ -46,7 +46,7 @@ fact**.
 
 ```mermaid
 flowchart TD
-    A[Trader submits a swap] --> B{Is the price impact<br/>big enough to bond?}
+    A[Trader submits a swap] --> B{Is total input above<br/>the currency threshold?}
     B -- No --> C[Swap goes through normally<br/>nothing else happens]
     B -- Yes --> D[Hook takes a refundable bond<br/>out of the swap itself]
     D --> E[Record: tick before, tick after,<br/>accumulator reading, owner]
@@ -61,14 +61,16 @@ flowchart TD
 
 ### The three moments that matter
 
-**1. Before the swap** — the hook checks how much the price is about to move. If
-it's small, nothing happens and the swap proceeds as normal. If it's large, the
-hook takes a bond directly out of the swap. No separate deposit transaction, no
-router in front of the pool.
+**1. Before the swap** — the hook checks the actual input amount against the threshold
+for the input currency. If it is small, nothing happens and the swap proceeds as
+normal. If it qualifies, exact-input custody takes the bond before the pool executes
+and the returned delta makes the trader pay gross input while the pool receives net
+input. No separate deposit transaction is required.
 
 **2. After the swap** — the hook writes down where the price was before, where it
-landed after, and a reading from the price accumulator. This record is what
-settlement will later be judged against.
+landed after, and a reading from the price accumulator. For exact-output, only here
+does it know the real input, so it solves and takes the bond in this callback. This
+record is what settlement will later be judged against.
 
 **3. After the observation window** — the hook compares the price now against the
 price then, and works out what fraction of the original impact is still there.
@@ -85,8 +87,8 @@ flowchart LR
     end
 
     subgraph Hook["BondMeBro"]
-        BS[beforeSwap<br/>size check + take bond]
-        AS[afterSwap<br/>open bond record]
+        BS[beforeSwap<br/>threshold + exact-input bond]
+        AS[afterSwap<br/>tick record + exact-output bond]
         SB[settleBonds<br/>refund or slash]
         ST[(Bond records<br/>+ LP insurance pot)]
     end
@@ -115,13 +117,29 @@ pass end-user identity in `hookData`. That was a deliberate choice — comparabl
 projects add outside infrastructure, and every added dependency is another thing
 that can break or be captured.
 
-### The three source files
+### The main source files
 
 | File | What it does |
 |---|---|
-| `src/BondMeBro.sol` | The hook itself. Holds bond records and the insurance pot, and wires the swap callbacks together. |
+| `src/BondMeBro.sol` | The hook itself. Holds per-pool custody configuration, bond records and the insurance pot, and wires the swap callbacks together. |
+| `src/libraries/HookDataCodec.sol` | Fixed 37-byte versioned trader payload with refund recipient and maximum-bond protection. |
 | `src/libraries/PersistenceMathLib.sol` | The settlement curve. Pure math: given the tick before, the tick after, and a later reference tick, returns how much impact survived. |
 | `src/libraries/TickAccumulatorLib.sol` | A single-slot time-weighted price accumulator. Provides the reference price for settlement. |
+
+### Hook permissions
+
+The deployed address encodes five enabled permissions:
+
+```text
+afterInitialize
+beforeSwap
+afterSwap
+beforeSwapReturnDelta
+afterSwapReturnDelta
+```
+
+Their low address bits sum to `0x10CC` (`4300`). The CREATE2 deploy script mines this
+mask; changing the callback set or any constructor argument requires a new hook address.
 
 ---
 
@@ -218,24 +236,54 @@ toward zero by at most one tick.
 
 ## Runtime configuration
 
-All values are immutable constructor parameters, and therefore part of the CREATE2
-salt calculation. Changing one means mining and deploying a new hook address.
+Settlement settings and the default custody settings are immutable constructor
+parameters and therefore part of the CREATE2 salt calculation. Changing an immutable
+value means mining and deploying a new hook address. Each initialized pool also stores
+its own custody thresholds and bond rate; the owner can update those mutable values
+with `ConfigureBondMeBroPool` without changing the hook address.
 
 | Parameter | Meaning |
 |---|---|
-| `bondBps` | Posted bond as basis points of the swap's unspecified-side amount |
-| `minImpactTicks` | Minimum raw absolute tick impact that opens a bond |
+| `bondBps` | Per-pool bond percentage of final input; capped at 100 bps (1%) |
+| `minBondedAmount0` | Minimum total input when currency0 is the input |
+| `minBondedAmount1` | Minimum total input when currency1 is the input |
 | `refundTolTicks` | Noise floor used by the persistence curve |
 | `observationBlocks` | Minimum age before a bond can settle |
 | `maxAbsTickDelta` | Maximum recorded accumulator move per touched block |
 | `settlerFeeBps` | Piggyback owner or permissionless settler's share of slashed value |
 | `maxSettlesPerSwap` | Piggyback settlement budget, capped at 32 |
+| `owner` | Address authorized to update a pool's thresholds and bond rate |
 
-The deployment script reads these from `BOND_BPS`, `MIN_IMPACT_TICKS`,
-`REFUND_TOL_TICKS`, `OBSERVATION_BLOCKS`, `MAX_ABS_TICK_DELTA`,
-`SETTLER_FEE_BPS`, and `MAX_SETTLES_PER_SWAP`. Its defaults are conservative demo
-values; production deployments should derive the clamp and window together from
-expected volatility and the desired manipulation cost.
+The deployment script reads these from `BOND_BPS`, `MIN_BONDED_AMOUNT0`,
+`MIN_BONDED_AMOUNT1`, `REFUND_TOL_TICKS`, `OBSERVATION_BLOCKS`,
+`MAX_ABS_TICK_DELTA`, `SETTLER_FEE_BPS`,
+`MAX_SETTLES_PER_SWAP`, and `OWNER`. A pool is enabled only when all three custody
+values are non-zero. Set all three to zero to disable bonding; a partial configuration
+is rejected. Production deployments should derive thresholds, the clamp and the window
+together from expected volatility, token decimals and the desired manipulation cost.
+
+### Trader hook data
+
+Bonded swaps must pass the fixed 37-byte `HookDataCodec` payload:
+
+```text
+1 byte   version = 1
+20 bytes refund recipient
+16 bytes maximum bond amount
+```
+
+The maximum is checked against the bond before any custody transfer. Empty hook data is
+accepted only for an unbonded exact-input swap. The current Universal Router script
+sets `TRADER` and `MAX_BOND_AMOUNT` and encodes this payload for the caller.
+
+### Integration boundaries
+
+The supported custody surface is one pool hop per swap, standard ERC-20s, and native
+currency. Fee-on-transfer and rebasing tokens are not supported. An exact-input swap
+that stops early at a price limit is bonded from its requested gross input, so callers
+must use a suitable price limit and output bound rather than treating a partial fill as
+an ordinary quote. Multi-hop routing needs a separate design because each hop can
+otherwise attach a bond.
 
 ## Backend production runbook
 
@@ -295,7 +343,52 @@ ETH allowed for the mint. Pool setup remains network-specific because canonical
 PositionManager, Permit2, WETH, token approval, and slippage addresses differ by
 network.
 
-### 3. Operate settlement
+If the pool was created with disabled defaults, enable it with the owner account after
+initialization and before accepting bonded swaps:
+
+```bash
+forge script script/ConfigureBondMeBroPool.s.sol:ConfigureBondMeBroPool \\
+  --rpc-url "$RPC_URL" \\
+  --private-key "$PRIVATE_KEY" \\
+  --broadcast
+```
+
+Set `POOL_MIN_BONDED_AMOUNT0`, `POOL_MIN_BONDED_AMOUNT1`, and `POOL_BOND_BPS` first.
+The broadcaster must equal the immutable `OWNER`; both thresholds and the rate must be
+non-zero, or all three must be zero to disable bonding.
+
+### 3. Execute a swap
+
+For a testnet smoke test, set `UNIVERSAL_ROUTER`, `PERMIT2`, `TRADER`,
+`ZERO_FOR_ONE`, `SWAP_AMOUNT_IN`, `MAX_BOND_AMOUNT`, and
+`SWAP_AMOUNT_OUT_MINIMUM`. The script encodes the fixed 37-byte versioned payload and
+executes `SWAP_EXACT_IN_SINGLE`, `SETTLE`, and `TAKE` through the Universal Router:
+
+```bash
+forge script script/SwapBondMeBro.s.sol:SwapBondMeBro \\
+  --rpc-url "$RPC_URL" \\
+  --private-key "$PRIVATE_KEY" \\
+  --broadcast
+```
+
+Use a non-zero `SWAP_AMOUNT_OUT_MINIMUM` and a bounded `MAX_BOND_AMOUNT` outside a
+smoke test. Use the canonical Universal Router address for the selected network; do
+not use a test router in production.
+
+For an exact-output single-hop smoke test, set `SWAP_AMOUNT_OUT` and
+`SWAP_AMOUNT_IN_MAXIMUM` and run:
+
+```bash
+forge script script/SwapBondMeBroExactOutput.s.sol:SwapBondMeBroExactOutput \\
+  --rpc-url "$RPC_URL" \\
+  --private-key "$PRIVATE_KEY" \\
+  --broadcast
+```
+
+`SWAP_AMOUNT_IN_MAXIMUM` must include the bond. The Universal Router enforces that
+maximum after the hook adds the exact-output bond.
+
+### 4. Operate settlement
 
 Set `BOND_HOOK`, `CURRENCY0`, `CURRENCY1`, `POOL_FEE`, and `TICK_SPACING` in the
 environment. A public keeper or cron job can settle a quiet pool with:
@@ -310,7 +403,7 @@ forge script script/SettleBondMeBro.s.sol:SettleBondMeBro \\
 `MAX_COUNT` is optional and is capped by the contract at 32. Active pools do not
 need this script because later swaps piggyback matured settlement.
 
-### 4. Distribute the insurance pot
+### 5. Distribute the insurance pot
 
 After settlement, set `POT_CURRENCY` to either pool currency and run:
 
@@ -325,10 +418,18 @@ Large pots are intentionally donated in manager-sized chunks. Confirm that the
 pool has in-range liquidity before calling; a failed donation leaves accounting
 unchanged.
 
-Before a production launch, run the full test suite, verify the deployed bytecode
-and hook permissions, rehearse the runbook on a testnet, and obtain an independent
-security audit. The current implementation is production-oriented MVP backend
-code, not a formal audit or a guarantee against economic risk.
+Before a production launch, run the full test suite and the read-only verification
+script:
+
+```bash
+forge script script/VerifyBondMeBro.s.sol:VerifyBondMeBro \\
+  --rpc-url "$RPC_URL"
+```
+
+Then verify the deployed bytecode and hook permissions, rehearse the runbook on a
+testnet, and obtain an independent security audit. The current implementation is
+production-oriented MVP backend code, not a formal audit or a guarantee against
+economic risk.
 
 ---
 
@@ -368,12 +469,16 @@ Create your own `.env` locally with the values you need for deployment:
 - `RPC_URL` — the RPC endpoint for your target network
 - `PRIVATE_KEY` — the deployer key
 - `POOL_MANAGER` — the deployed Uniswap v4 PoolManager address
+- `OWNER` — the address authorized to update per-pool custody thresholds
 - `ETHERSCAN_API_KEY` — only if you want contract verification
 
-The deployment script also accepts the immutable policy knobs listed above as
-optional environment variables. If an owner or settler receiver rejects a token or
-native transfer, the hook records a pull payment in `claimablePayments`; that
-recipient can retry with `claimPayments(currency)`.
+The deployment script also accepts the immutable policy and default custody values
+listed above. `MIN_BONDED_AMOUNT0`, `MIN_BONDED_AMOUNT1`, and `BOND_BPS` are copied
+into each newly initialized pool; use `ConfigureBondMeBroPool` for later updates. If
+an owner or settler receiver rejects a token or native transfer, the hook records a
+pull payment in `claimablePayments`; that recipient can retry with
+`claimPayments(currency)`. The `MAX_BOND_AMOUNT` swap setting protects traders from
+configuration or quote changes.
 
 `.env` is gitignored. Keep it that way.
 
@@ -381,9 +486,11 @@ recipient can retry with `claimPayments(currency)`.
 
 Uniswap v4 encodes a hook's permissions into its **address**, so this can't be
 deployed with a plain `forge create`. The deploy script mines a CREATE2 salt until
-it finds an address carrying the right permission bits. Also note: changing the
-constructor arguments changes the address, so expect to redeploy as the contract
-evolves.
+it finds an address carrying the right permission bits. The current revision enables
+both swap return-delta flags and includes owner/default-threshold constructor data;
+the earlier Sepolia hook address is therefore a legacy deployment. Changing the
+constructor arguments or callback permissions changes the address, so redeploy before
+repeating the rehearsal.
 
 ---
 

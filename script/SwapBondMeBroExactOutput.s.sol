@@ -13,24 +13,13 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 
 import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 
-/// @title SwapBondMeBro
-/// @notice Executes one exact-input, single-hop v4 swap through the canonical Universal
-///         Router. This is the production-shaped smoke test for opening a BondMeBro bond.
+/// @title SwapBondMeBroExactOutput
+/// @notice Executes an exact-output, single-hop v4 swap through the canonical Universal Router.
 ///
-/// @dev The Universal Router's V4_SWAP command receives the standard v4 action plan:
-///      SWAP_EXACT_IN_SINGLE, SETTLE, TAKE. The fixed 37-byte hookData carries TRADER and
-///      MAX_BOND_AMOUNT through the router so a refund and piggyback reward go to the end
-///      user rather than the router contract. Set a non-zero SWAP_AMOUNT_OUT_MINIMUM outside
-///      a demo.
-///
-/// Required environment variables:
-/// - RPC_URL and PRIVATE_KEY (provided to forge script)
-/// - UNIVERSAL_ROUTER, PERMIT2, TRADER, BOND_HOOK
-/// - CURRENCY0, CURRENCY1, POOL_FEE, TICK_SPACING
-/// - ZERO_FOR_ONE, SWAP_AMOUNT_IN, SWAP_AMOUNT_OUT_MINIMUM, MAX_BOND_AMOUNT
-/// Optional:
-/// - DEADLINE (defaults to block.timestamp + 20 minutes)
-contract SwapBondMeBro is Script {
+/// @dev The hook cannot know exact-output input until the pool has solved the swap. It then
+///      adds the calculated bond to the caller's input delta. `SWAP_AMOUNT_IN_MAXIMUM` must
+///      include both the pool input and the possible bond; the router enforces that bound.
+contract SwapBondMeBroExactOutput is Script {
     using CurrencyLibrary for Currency;
 
     bytes1 internal constant V4_SWAP_COMMAND = 0x10;
@@ -41,8 +30,8 @@ contract SwapBondMeBro is Script {
         address trader;
         PoolKey key;
         bool zeroForOne;
-        uint128 amountIn;
-        uint128 amountOutMinimum;
+        uint128 amountOut;
+        uint128 amountInMaximum;
         uint128 maxBondAmount;
         uint256 deadline;
     }
@@ -51,9 +40,9 @@ contract SwapBondMeBro is Script {
         SwapRequest memory request = _request();
         _execute(request);
 
-        console2.log("swap executed through Universal Router");
+        console2.log("exact-output swap executed through Universal Router");
         console2.log("trader       ", request.trader);
-        console2.log("amount in    ", request.amountIn);
+        console2.log("amount out   ", request.amountOut);
         console2.log("zeroForOne   ", request.zeroForOne);
     }
 
@@ -64,59 +53,60 @@ contract SwapBondMeBro is Script {
         request.trader = vm.envAddress("TRADER");
         request.key = _poolKey(hookAddress);
 
-        require(request.router.code.length != 0, "SwapBondMeBro: invalid UNIVERSAL_ROUTER");
-        require(request.permit2.code.length != 0, "SwapBondMeBro: invalid PERMIT2");
-        require(hookAddress.code.length != 0, "SwapBondMeBro: invalid BOND_HOOK");
-        require(request.trader != address(0), "SwapBondMeBro: invalid TRADER");
+        require(request.router.code.length != 0, "SwapBondMeBroExactOutput: invalid UNIVERSAL_ROUTER");
+        require(request.permit2.code.length != 0, "SwapBondMeBroExactOutput: invalid PERMIT2");
+        require(hookAddress.code.length != 0, "SwapBondMeBroExactOutput: invalid BOND_HOOK");
+        require(request.trader != address(0), "SwapBondMeBroExactOutput: invalid TRADER");
 
         request.zeroForOne = vm.envBool("ZERO_FOR_ONE");
-        request.amountIn = _envUint128("SWAP_AMOUNT_IN");
-        request.amountOutMinimum = _envUint128("SWAP_AMOUNT_OUT_MINIMUM");
+        request.amountOut = _envUint128("SWAP_AMOUNT_OUT");
+        request.amountInMaximum = _envUint128("SWAP_AMOUNT_IN_MAXIMUM");
         request.maxBondAmount = _envOrUint128("MAX_BOND_AMOUNT", type(uint128).max);
         request.deadline = vm.envOr("DEADLINE", block.timestamp + 20 minutes);
     }
 
     function _envUint128(string memory name) internal view returns (uint128 value) {
         uint256 raw = vm.envUint(name);
-        require(raw <= type(uint128).max, "SwapBondMeBro: uint128 environment overflow");
+        require(raw <= type(uint128).max, "SwapBondMeBroExactOutput: uint128 environment overflow");
         value = uint128(raw);
     }
 
     function _envOrUint128(string memory name, uint128 defaultValue) internal view returns (uint128 value) {
         uint256 raw = vm.envOr(name, uint256(defaultValue));
-        require(raw <= type(uint128).max, "SwapBondMeBro: uint128 environment overflow");
+        require(raw <= type(uint128).max, "SwapBondMeBroExactOutput: uint128 environment overflow");
         value = uint128(raw);
     }
 
     function _execute(SwapRequest memory request) internal {
         Currency inputCurrency = request.zeroForOne ? request.key.currency0 : request.key.currency1;
-        (bytes memory commands, bytes[] memory inputs) = _encodePlan(request, inputCurrency);
+        (bytes memory commands, bytes[] memory inputs) = _encodePlan(request);
 
         vm.startBroadcast();
         _approveInput(inputCurrency, request.permit2, request.router);
-        IUniversalRouterLike(request.router).execute{value: inputCurrency.isAddressZero() ? request.amountIn : 0}(
+        IUniversalRouterLike(request.router).execute{value: inputCurrency.isAddressZero() ? request.amountInMaximum : 0}(
             commands, inputs, request.deadline
         );
         vm.stopBroadcast();
     }
 
-    function _encodePlan(SwapRequest memory request, Currency inputCurrency)
+    function _encodePlan(SwapRequest memory request)
         internal
         pure
         returns (bytes memory commands, bytes[] memory inputs)
     {
+        Currency inputCurrency = request.zeroForOne ? request.key.currency0 : request.key.currency1;
         Currency outputCurrency = request.zeroForOne ? request.key.currency1 : request.key.currency0;
-        IV4Router.ExactInputSingleParams memory swapParams = IV4Router.ExactInputSingleParams({
+        IV4Router.ExactOutputSingleParams memory swapParams = IV4Router.ExactOutputSingleParams({
             poolKey: request.key,
             zeroForOne: request.zeroForOne,
-            amountIn: request.amountIn,
-            amountOutMinimum: request.amountOutMinimum,
+            amountOut: request.amountOut,
+            amountInMaximum: request.amountInMaximum,
             minHopPriceX36: 0,
             hookData: HookDataCodec.encode(request.trader, request.maxBondAmount)
         });
 
         bytes memory actions = abi.encodePacked(
-            bytes1(uint8(Actions.SWAP_EXACT_IN_SINGLE)), bytes1(uint8(Actions.SETTLE)), bytes1(uint8(Actions.TAKE))
+            bytes1(uint8(Actions.SWAP_EXACT_OUT_SINGLE)), bytes1(uint8(Actions.SETTLE)), bytes1(uint8(Actions.TAKE))
         );
         bytes[] memory actionParams = new bytes[](3);
         actionParams[0] = abi.encode(swapParams);

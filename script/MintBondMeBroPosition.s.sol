@@ -83,8 +83,9 @@ contract MintBondMeBroPosition is Script {
         if (currency.isAddressZero()) return;
 
         IERC20Minimal(Currency.unwrap(currency)).approve(permit2, type(uint256).max);
-        IAllowanceTransfer(permit2)
-            .approve(Currency.unwrap(currency), positionManager, type(uint160).max, type(uint48).max);
+        IAllowanceTransfer(permit2).approve(
+            Currency.unwrap(currency), positionManager, type(uint160).max, type(uint48).max
+        );
     }
 
     function _poolKey(address hookAddress) internal view returns (PoolKey memory key) {

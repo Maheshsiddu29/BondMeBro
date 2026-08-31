@@ -1,5 +1,10 @@
 # Research: settlement trigger (Problem 2) & the accumulation problem (Problem 3)
 
+> **Historical research note:** this document records the design state before the
+> settlement implementation. The current hook now includes bond records, capped
+> piggyback settlement, permissionless settlement, insurance-pot accounting, and the
+> truncation-aware accumulator described by the implementation README.
+
 > Date: 2026-08-28 · Prepared overnight for tomorrow's sync (Akshay see §5)
 > Scope: validate the two open design problems against the actual code, run the
 > concrete calculations, and collect the prior art worth building from.

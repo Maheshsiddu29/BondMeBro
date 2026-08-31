@@ -18,10 +18,11 @@ import {BondMeBro} from "../src/BondMeBro.sol";
 ///      your own EOA produces a different address and `initialize` reverts with
 ///      HookAddressNotValid. `CREATE2_DEPLOYER` below is what HookMiner must be given.
 ///
-/// @dev Phase 1 note: AFTER_SWAP_RETURNS_DELTA_FLAG was added — the hook now takes bonds
-///      out of the swap itself — so the permission bits, and therefore EVERY previously
-///      mined salt/address, changed. Config is part of the constructor, hence part of the
-///      mined address: change any knob, re-mine.
+/// @dev Phase 1 note: BEFORE_SWAP_RETURNS_DELTA_FLAG and AFTER_SWAP_RETURNS_DELTA_FLAG
+///      are enabled — exact-input bonds adjust the swap before execution and exact-output
+///      bonds adjust it after the pool solves the input. The permission bits, and therefore
+///      EVERY previously mined salt/address, changed. Config is part of the constructor,
+///      hence part of the mined address: change any knob, re-mine.
 contract DeployBondMeBro is Script {
     /// @notice Canonical deterministic-deployment proxy, same address on every chain.
     address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
@@ -30,22 +31,32 @@ contract DeployBondMeBro is Script {
     /// @dev Must stay in lockstep with `getHookPermissions()`. Change one, re-mine the salt.
     uint160 internal constant FLAGS = uint160(
         Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
-            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+            | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
     );
 
     function run() external returns (BondMeBro hook) {
         IPoolManager poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
         require(address(poolManager).code.length != 0, "DeployBondMeBro: invalid POOL_MANAGER");
 
-        // Sane defaults with env overrides, e.g. BOND_BPS=500 forge script ...
+        // Sane defaults with env overrides. Validate before narrowing casts so a mistyped
+        // threshold cannot wrap into a much smaller custody limit.
+        uint256 rawBondBps = vm.envOr("BOND_BPS", uint256(0));
+        uint256 rawMinBondedAmount0 = vm.envOr("MIN_BONDED_AMOUNT0", uint256(0));
+        uint256 rawMinBondedAmount1 = vm.envOr("MIN_BONDED_AMOUNT1", uint256(0));
+        require(rawBondBps <= 100, "DeployBondMeBro: BOND_BPS must be <= 100");
+        require(rawMinBondedAmount0 <= type(uint96).max, "DeployBondMeBro: amount0 threshold overflows uint96");
+        require(rawMinBondedAmount1 <= type(uint96).max, "DeployBondMeBro: amount1 threshold overflows uint96");
+
         BondMeBro.Config memory cfg = BondMeBro.Config({
-            bondBps: uint16(vm.envOr("BOND_BPS", uint256(500))),
-            minImpactTicks: uint24(vm.envOr("MIN_IMPACT_TICKS", uint256(25))),
+            bondBps: uint16(rawBondBps),
             refundTolTicks: uint24(vm.envOr("REFUND_TOL_TICKS", uint256(10))),
             observationBlocks: uint32(vm.envOr("OBSERVATION_BLOCKS", uint256(50))),
             maxAbsTickDelta: uint24(vm.envOr("MAX_ABS_TICK_DELTA", uint256(9116) / 18)), // TruncGeoOracle's cap scaled to ~15-min window
             settlerFeeBps: uint16(vm.envOr("SETTLER_FEE_BPS", uint256(500))),
-            maxSettlesPerSwap: uint8(vm.envOr("MAX_SETTLES_PER_SWAP", uint256(4)))
+            maxSettlesPerSwap: uint8(vm.envOr("MAX_SETTLES_PER_SWAP", uint256(4))),
+            minBondedAmount0: uint96(rawMinBondedAmount0),
+            minBondedAmount1: uint96(rawMinBondedAmount1),
+            owner: vm.envAddress("OWNER")
         });
 
         console2.log("chainid     ", block.chainid);

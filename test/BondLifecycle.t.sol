@@ -16,6 +16,7 @@ import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
 import {BondMeBro} from "../src/BondMeBro.sol";
+import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 
 interface ERC20Like {
     function balanceOf(address) external view returns (uint256);
@@ -39,18 +40,20 @@ contract BondLifecycleTest is Test, Deployers {
 
     uint160 internal constant FLAGS = uint160(
         Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
-            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+            | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
     );
 
-    function config() internal pure returns (BondMeBro.Config memory) {
+    function config() internal view returns (BondMeBro.Config memory) {
         return BondMeBro.Config({
-            bondBps: 1000, // 10%
-            minImpactTicks: 10,
+            bondBps: 25, // 0.25% of total input
             refundTolTicks: 5,
             observationBlocks: 10,
             maxAbsTickDelta: 1000,
             settlerFeeBps: 500, // 5% of the slash, to the piggyback owner or direct settler
-            maxSettlesPerSwap: 4
+            maxSettlesPerSwap: 4,
+            minBondedAmount0: 1e15,
+            minBondedAmount1: 1e15,
+            owner: address(this)
         });
     }
 
@@ -87,7 +90,7 @@ contract BondLifecycleTest is Test, Deployers {
     }
 
     function _ownerData() internal view returns (bytes memory) {
-        return abi.encode(address(this));
+        return HookDataCodec.encode(address(this), type(uint128).max);
     }
 
     /// @dev One big zeroForOne swap from the test contract; posts a bond given the setup.
@@ -138,36 +141,34 @@ contract BondLifecycleTest is Test, Deployers {
     ///         block after it happened, and honest residue is the documented price of a
     ///         manipulation-resistant reference.
     function test_revertedTrade_mostlyRefunded() public {
-        uint256 owner1Before = token1().balanceOf(address(this));
-
-        _bigSwapDown(); // B: tick pushed down, bond A posts in token1
+        _bigSwapDown(); // B: zeroForOne exact-input, bond A is in the input currency0
         assertEq(hook.queueLength(pid), 1, "bond A not opened");
-        uint256 bondA = token1().balanceOf(address(hook));
+        uint256 bondA = token0().balanceOf(address(hook));
         assertGt(bondA, 0, "hook must hold bond A");
 
         vm.roll(block.number + 2);
-        _bigSwapUp(); // B+2: arb — also bonded (bond B, in token0), tick back near 0
+        _bigSwapUp(); // B+2: arb — bond B is in currency1 and the tick returns near 0
 
         vm.roll(block.number + 11); // B+13: both bonds well past their 10-block windows
-        uint256 owner1AtSettle = token1().balanceOf(address(this));
+        uint256 owner0AtSettle = token0().balanceOf(address(this));
 
         vm.prank(keeper);
         uint256 settled = hook.settleBonds(key_, 10);
         assertEq(settled, 2, "both bonds matured");
 
-        uint256 refundA = token1().balanceOf(address(this)) - owner1AtSettle;
+        uint256 refundA = token0().balanceOf(address(this)) - owner0AtSettle;
         assertGt(refundA, bondA / 2, "early-reverted trade must be mostly refunded");
         assertLt(refundA, bondA, "some honest residue: the revert is visible one block late");
 
         // exact relationships: fee = 5% of the slash, and the pot holds the remainder.
         uint256 slashA = bondA - refundA;
         uint256 feeA = (slashA * 500) / 10_000;
-        assertEq(token1().balanceOf(keeper), feeA, "keeper fee must come out of the slash");
-        assertEq(token1().balanceOf(address(hook)), slashA - feeA, "pot residue accounting");
-        assertEq(hook.insurancePot(pid, currency1), slashA - feeA);
+        assertEq(token0().balanceOf(keeper), feeA, "keeper fee must come out of the slash");
+        assertEq(token0().balanceOf(address(hook)), slashA - feeA, "pot residue accounting");
+        assertEq(hook.insurancePot(pid, currency0), slashA - feeA);
 
-        // sanity: we spent the gross output net of bond at open, and got refundA back.
-        assertLt(token1().balanceOf(address(this)), owner1Before, "opening a bond always costs output");
+        // The bond is input-side custody. The exact token conservation assertions above
+        // prove the hook received only the calculated bond and the queue settled it once.
     }
 
     /// @notice ENDING 2 — the trade persisted. Nothing reverts during the window; the quiet
@@ -176,20 +177,20 @@ contract BondLifecycleTest is Test, Deployers {
     function test_persistedTrade_fullySlashed_permissionlessSettle() public {
         _bigSwapDown();
         bytes32 bondId = _onlyBondId();
-        uint256 bondA = token1().balanceOf(address(hook));
+        uint256 bondA = token0().balanceOf(address(hook));
 
         vm.roll(block.number + 11);
-        uint256 owner1Before = token1().balanceOf(address(this));
+        uint256 owner0Before = token0().balanceOf(address(this));
 
         vm.prank(keeper);
         uint256 settled = hook.settleBonds(key_, 10);
         assertEq(settled, 1);
 
         // owner: nothing back. keeper: 5% of the slash. pot: the rest. hook holds exactly pot.
-        assertEq(token1().balanceOf(address(this)), owner1Before, "full slash: no refund");
-        assertEq(token1().balanceOf(keeper), (bondA * 500) / 10_000, "settler fee from slash only");
-        assertEq(hook.insurancePot(pid, currency1), bondA - (bondA * 500) / 10_000);
-        assertEq(token1().balanceOf(address(hook)), hook.insurancePot(pid, currency1));
+        assertEq(token0().balanceOf(address(this)), owner0Before, "full slash: no refund");
+        assertEq(token0().balanceOf(keeper), (bondA * 500) / 10_000, "settler fee from slash only");
+        assertEq(hook.insurancePot(pid, currency0), bondA - (bondA * 500) / 10_000);
+        assertEq(token0().balanceOf(address(hook)), hook.insurancePot(pid, currency0));
 
         BondMeBro.Bond memory gone = hook.getBond(pid, bondId);
         assertEq(gone.amount, 0, "settled bond must be deleted");
@@ -206,25 +207,22 @@ contract BondLifecycleTest is Test, Deployers {
     ///         from the slash, while the rest lands in the pot.
     function test_piggyback_laterSwapSettlesMaturedBond() public {
         _bigSwapDown();
-        uint256 bondA = token1().balanceOf(address(hook));
+        uint256 bondA = token0().balanceOf(address(hook));
 
         vm.roll(block.number + 11);
         assertEq(hook.queueLength(pid), 1, "bond must sit until triggered");
 
-        uint256 ownerBefore = token1().balanceOf(address(this));
+        uint256 ownerBefore = token0().balanceOf(address(this));
         BalanceDelta tinyDelta = _tinySwap(_ownerData()); // not bonded itself; it still drains the queue
         assertEq(hook.queueLength(pid), 0, "piggyback settlement did not fire");
 
         // The quiet window fully slashes bond A. The current swap's resolved owner receives
         // the configured 5% settler fee; only the remainder enters the LP pot.
         uint256 fee = (bondA * 500) / 10_000;
-        assertEq(hook.insurancePot(pid, currency1), bondA - fee);
-        assertEq(
-            token1().balanceOf(address(this)) - ownerBefore,
-            uint256(uint128(tinyDelta.amount1())) + fee,
-            "piggyback reward must be paid from the slash"
-        );
-        assertEq(token1().balanceOf(keeper), 0);
+        assertEq(hook.insurancePot(pid, currency0), bondA - fee);
+        int256 ownerDelta = int256(token0().balanceOf(address(this))) - int256(ownerBefore);
+        assertEq(ownerDelta, int256(fee) + int256(tinyDelta.amount0()), "piggyback reward must be paid from the slash");
+        assertEq(token0().balanceOf(keeper), 0);
     }
 
     /// @notice The piggyback budget caps how many bonds one swap settles, so no swapper is
@@ -258,14 +256,14 @@ contract BondLifecycleTest is Test, Deployers {
     /// @notice Maturity gate: settling early must be a no-op, not a revert and not a loss.
     function test_settle_beforeMaturity_isNoOp() public {
         _bigSwapDown();
-        uint256 bondA = token1().balanceOf(address(hook));
+        uint256 bondA = token0().balanceOf(address(hook));
 
         vm.roll(block.number + 3); // < observationBlocks
         vm.prank(keeper);
         uint256 settled = hook.settleBonds(key_, 10);
         assertEq(settled, 0, "immature bonds must not settle");
         assertEq(hook.queueLength(pid), 1);
-        assertEq(token1().balanceOf(address(hook)), bondA, "no value may move");
+        assertEq(token0().balanceOf(address(hook)), bondA, "no value may move");
 
         vm.roll(block.number + 8); // past maturity now
         vm.prank(keeper);
@@ -279,7 +277,7 @@ contract BondLifecycleTest is Test, Deployers {
     /// @notice Native-currency bonds use the same custody and donation path as ERC-20
     ///         bonds. This catches the address-zero branch in both settle and unlockCallback.
     function test_nativeBondAndPotDonation() public {
-        vm.deal(address(this), 1 ether);
+        vm.deal(address(this), 2 ether);
         (PoolKey memory nativeKey,) = initPool(
             CurrencyLibrary.ADDRESS_ZERO, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0)
         );
@@ -290,13 +288,13 @@ contract BondLifecycleTest is Test, Deployers {
         );
         PoolId nativePid = nativeKey.toId();
 
-        // One-for-zero exact input takes token1 and outputs native currency; native is the
-        // unspecified side, so the bond is held as ETH by the hook. Move to a new block so
-        // the once-per-block accumulator records this first post-initialization move.
+        // Zero-for-one exact input uses native currency0 as the input, so the bond is held
+        // as ETH by the hook. Move to a new block so the first post-initialization move is
+        // recorded by the accumulator.
         vm.roll(block.number + 1);
-        swapRouter.swap(
+        swapRouter.swap{value: 1e16}(
             nativeKey,
-            SwapParams({zeroForOne: false, amountSpecified: -1e16, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1}),
+            SwapParams({zeroForOne: true, amountSpecified: -1e16, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             _ownerData()
         );
@@ -320,7 +318,7 @@ contract BondLifecycleTest is Test, Deployers {
     /// @notice A callback-capable native receiver cannot freeze the queue. Its settler fee
     ///         becomes a pull payment, then succeeds after the receiver enables withdrawals.
     function test_rejectingReceiverGetsDeferredPayment() public {
-        vm.deal(address(this), 1 ether);
+        vm.deal(address(this), 2 ether);
         (PoolKey memory nativeKey,) = initPool(
             CurrencyLibrary.ADDRESS_ZERO, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0)
         );
@@ -333,9 +331,9 @@ contract BondLifecycleTest is Test, Deployers {
         ToggleReceiver receiver = new ToggleReceiver();
 
         vm.roll(block.number + 1);
-        swapRouter.swap(
+        swapRouter.swap{value: 1e16}(
             nativeKey,
-            SwapParams({zeroForOne: false, amountSpecified: -1e16, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1}),
+            SwapParams({zeroForOne: true, amountSpecified: -1e16, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             _ownerData()
         );
@@ -379,25 +377,25 @@ contract BondLifecycleTest is Test, Deployers {
         vm.roll(block.number + 11);
         vm.prank(keeper);
         hook.settleBonds(key_, 10);
-        uint256 pot = hook.insurancePot(pid, currency1);
+        uint256 pot = hook.insurancePot(pid, currency0);
         assertGt(pot, 0);
 
         vm.prank(alice);
-        hook.donatePot(key_, currency1);
+        hook.donatePot(key_, currency0);
 
-        assertEq(hook.insurancePot(pid, currency1), 0, "pot accounting must reset");
-        assertEq(token1().balanceOf(address(hook)), 0, "hook must no longer hold donated funds");
+        assertEq(hook.insurancePot(pid, currency0), 0, "pot accounting must reset");
+        assertEq(token0().balanceOf(address(hook)), 0, "hook must no longer hold donated funds");
 
         vm.expectRevert(BondMeBro.NothingToDonate.selector);
-        hook.donatePot(key_, currency1);
+        hook.donatePot(key_, currency0);
     }
 
     // ---------------------------------------------------------------
     // Bond accounting edges
     // ---------------------------------------------------------------
 
-    /// @notice The bond currency is the swap's unspecified side: for exact-output the hook
-    ///         raises the INPUT owed instead of shaving output.
+    /// @notice For exact-output, the hook raises the INPUT owed instead of shaving output
+    ///         and stores the bond in that input currency.
     function test_exactOutput_bondComesFromInputSide() public {
         uint256 hook0Before = token0().balanceOf(address(hook));
 
@@ -416,17 +414,17 @@ contract BondLifecycleTest is Test, Deployers {
         assertEq(token0().balanceOf(address(hook)) - hook0Before, b.amount, "hook must hold the bond in token0");
     }
 
-    /// @notice Without 32-byte hookData the bond owner falls back to the direct swap caller
-    ///         (in production: the router; identity via hookData is the documented path).
-    function test_owner_fallsBackToSwapCaller() public {
+    /// @notice A bonded swap cannot omit the versioned payload. Accepting an address-only
+    ///         payload would remove the trader's maximum-bond protection.
+    function test_bondedSwap_rejectsMissingHookData() public {
+        vm.expectRevert();
         swapRouter.swap(
             key_,
             SwapParams({zeroForOne: true, amountSpecified: -1e16, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-        BondMeBro.Bond memory b = hook.getBond(pid, _onlyBondId());
-        assertEq(b.owner, address(swapRouter));
+        assertEq(hook.queueLength(pid), 0, "reverted malformed swap must not open a bond");
     }
 }
 
