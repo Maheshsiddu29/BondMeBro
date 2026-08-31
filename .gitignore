@@ -12,10 +12,10 @@ crytic-export/
 .env
 .env.*
 !.env.example
-.env.example
 
 # OS / editor
 .DS_Store
 .idea/
+.venv/
 .vscode/
 node_modules/

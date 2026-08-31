@@ -24,7 +24,7 @@ coverage:
 	forge coverage --no-match-coverage "lib|test|script" --report summary
 
 slither:
-	slither . --exclude-dependencies --filter-paths "lib/"
+	slither . --exclude-dependencies --filter-paths "lib/" --fail-medium
 
 # Run exactly what CI runs, before you push.
 ci: fmt-check build test coverage slither
