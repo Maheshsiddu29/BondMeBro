@@ -327,8 +327,8 @@ forge script script/InitializeBondMeBroPool.s.sol:InitializeBondMeBroPool \\
 
 Then use the network's canonical PositionManager to add enough broad or otherwise
 intentional liquidity for the expected price range. The included script sets the
-necessary ERC-20 and Permit2 approvals and uses the non-deprecated mint action with
-explicit amount limits:
+necessary ERC-20 and Permit2 approvals, skips pool initialization when the pool
+already exists, and uses the non-deprecated mint action with explicit amount limits:
 
 ```bash
 forge script script/MintBondMeBroPosition.s.sol:MintBondMeBroPosition \\

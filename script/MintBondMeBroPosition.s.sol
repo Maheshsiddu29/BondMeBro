@@ -5,10 +5,16 @@ import {Script, console2} from "forge-std/Script.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IERC20Minimal} from "@uniswap/v4-core/src/interfaces/external/IERC20Minimal.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+
+import {BondMeBro} from "../src/BondMeBro.sol";
 
 /// @title MintBondMeBroPosition
 /// @notice Mints one protected Uniswap v4 liquidity position through the canonical
@@ -20,25 +26,42 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 ///
 /// Required environment variables:
 /// - RPC_URL and PRIVATE_KEY (provided to forge script)
-/// - POSITION_MANAGER, PERMIT2, LIQUIDITY_OWNER, BOND_HOOK
+/// - POOL_MANAGER, POSITION_MANAGER, PERMIT2, LIQUIDITY_OWNER, BOND_HOOK
 /// - CURRENCY0, CURRENCY1, POOL_FEE, TICK_SPACING
 /// - TICK_LOWER, TICK_UPPER, LIQUIDITY, AMOUNT0_MAX, AMOUNT1_MAX
 /// Optional:
-/// - SQRT_PRICE_X96 (initializes the pool through PositionManager if supplied)
+/// - SQRT_PRICE_X96 (initializes the pool only when it is not already initialized)
 /// - NATIVE_VALUE (ETH sent for a native currency0 position)
 /// - DEADLINE (defaults to block.timestamp + 1 hour)
 contract MintBondMeBroPosition is Script {
     using CurrencyLibrary for Currency;
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    uint160 internal constant CURRENT_HOOK_FLAGS = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+    );
 
     function run() external returns (uint256 tokenId) {
+        IPoolManager poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
         IPositionManager positionManager = IPositionManager(vm.envAddress("POSITION_MANAGER"));
         address permit2 = vm.envAddress("PERMIT2");
         address hookAddress = vm.envAddress("BOND_HOOK");
         address owner = vm.envAddress("LIQUIDITY_OWNER");
+        require(address(poolManager).code.length != 0, "MintBondMeBroPosition: invalid POOL_MANAGER");
         require(address(positionManager).code.length != 0, "MintBondMeBroPosition: invalid POSITION_MANAGER");
         require(permit2.code.length != 0, "MintBondMeBroPosition: invalid PERMIT2");
         require(hookAddress.code.length != 0, "MintBondMeBroPosition: invalid BOND_HOOK");
         require(owner != address(0), "MintBondMeBroPosition: invalid LIQUIDITY_OWNER");
+        require(
+            address(BondMeBro(payable(hookAddress)).poolManager()) == address(poolManager),
+            "MintBondMeBroPosition: manager mismatch"
+        );
+        require(
+            (uint160(hookAddress) & CURRENT_HOOK_FLAGS) == CURRENT_HOOK_FLAGS,
+            "MintBondMeBroPosition: legacy hook permissions"
+        );
         PoolKey memory key = _poolKey(hookAddress);
 
         uint256 nativeValue = vm.envOr("NATIVE_VALUE", uint256(0));
@@ -49,7 +72,13 @@ contract MintBondMeBroPosition is Script {
         _approveCurrency(key.currency1, permit2, address(positionManager));
 
         uint256 initialPrice = vm.envOr("SQRT_PRICE_X96", uint256(0));
-        if (initialPrice != 0) positionManager.initializePool(key, uint160(initialPrice));
+        (uint160 existingSqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
+        if (existingSqrtPriceX96 == 0) {
+            require(initialPrice != 0, "MintBondMeBroPosition: missing SQRT_PRICE_X96");
+            positionManager.initializePool(key, uint160(initialPrice));
+        } else {
+            console2.log("pool already initialized; skipping initializePool");
+        }
 
         bytes memory actions = abi.encodePacked(
             bytes1(uint8(Actions.MINT_POSITION)),

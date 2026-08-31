@@ -90,10 +90,12 @@ forge script script/MintBondMeBroPosition.s.sol:MintBondMeBroPosition \
   --broadcast
 ```
 
-The initialization script is safe to rerun for an already initialized pool. Use the
-canonical network-specific PositionManager and Permit2 addresses. Set bounded
-`AMOUNT0_MAX` and `AMOUNT1_MAX`; the all-maximum values in `.env.example` are for
-local demos only.
+The initialization and mint scripts are safe to rerun for an already initialized
+pool; the mint script checks PoolManager state and skips its optional initializer when
+`SQRT_PRICE_X96` is already initialized. Use the canonical network-specific
+PositionManager and Permit2 addresses. Set bounded `AMOUNT0_MAX` and `AMOUNT1_MAX`;
+the all-maximum values in `.env.example` are for local demos only. The mint script
+also rejects a legacy hook that does not carry the current return-delta permissions.
 
 If the deployment used disabled defaults, set these values for the configuration
 script:
@@ -191,6 +193,20 @@ cast call "$BOND_HOOK" "owner()(address)" --rpc-url "$RPC_URL"
 Confirm the returned manager and owner, the hook address permission bits, the pool ID,
 the active pool configuration, position liquidity, and all transaction hashes before
 launching a network.
+
+## Troubleshooting
+
+- `DeployBondMeBro: BOND_BPS must be <= 100`: change the old 500 bps value to a
+  value from 0 through 100. `25` means 0.25%.
+- `custom error 0x7983c051` from `initializePool`: the pool already exists. The
+  current initialize and mint scripts detect this and skip the duplicate initializer;
+  pull the latest branch before retrying.
+- `legacy hook permissions`: `BOND_HOOK` is from the earlier deployment. Deploy the
+  current hook first; a pool ID includes the hook address, so a new hook needs a new
+  pool initialization.
+- `OutOfFunds` while minting a native `currency0`: `NATIVE_VALUE` is the ETH sent to
+  the mint. It must be affordable after gas, and `LIQUIDITY`/the amount limits must
+  match the wallet balance. WETH balance is not ETH balance.
 
 This remains a production-oriented MVP backend, not a security audit. Mainnet still
 requires independent audit, economic-parameter review, network-address verification,
