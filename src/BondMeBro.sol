@@ -58,21 +58,58 @@ contract BondMeBro is BaseHook {
 
     uint16 public constant MAX_BOND_BPS = 100;
 
-    /// @notice Upper bound on any bond's observation window, in blocks. This is `W` in ADR-0003.
+    /// @notice Technical maximum scan horizon, in blocks. This is `W` in ADR-0003.
     ///
-    /// @dev Compile-time and protocol-wide. ADR-0003 § 3.1 frames `W` as a per-pool cap; T5.1
-    ///      narrows it to one constant because `PoolConfig` is unchanged and per-pool windows are
-    ///      out of scope. A single constant satisfies `OBSERVATION_BLOCKS <= W` trivially.
+    /// @dev A GAS DECISION, chosen by measurement — NOT the economic observation period, which is
+    ///      `OBSERVATION_BLOCKS` below. The two are deliberately different numbers.
     ///
-    ///      `W` bounds the maturity scan: a swap inspects at most `W` maturity buckets, whatever
-    ///      the bond count or the length of the preceding quiet period. Its value is set by
-    ///      measurement, not preference — see the T5.1 scan-cost curve.
-    uint32 public constant MAX_OBSERVATION_BLOCKS = 8;
+    ///      `W` bounds the maturity scan: a swap inspects at most `W` buckets whatever the bond
+    ///      count or the length of the preceding quiet period.
+    ///
+    ///      Chosen from the measured Stage 3 scan-cost curve, which is linear:
+    ///
+    ///          empty bucket read      2,464 gas   (cold SLOAD plus loop overhead)
+    ///          occupied bucket freeze 3,176 gas   (the read, plus a warm SSTORE and an event)
+    ///
+    ///      Against the 150,000 `beforeSwap` ceiling and the worst pre-scan cost of 60,489
+    ///      (exact-output, after ADR-0004 moved the record header into this callback), 89,511 gas
+    ///      is available. A hypothetical all-occupied W=32 scan measures 107,636 for the scan
+    ///      alone and breaches; W=16 leaves a real margin. See the T5.1 Stage 3 review report.
+    ///
+    ///      ADR-0003 § 3.1 frames `W` as a per-pool cap; this narrows it to one protocol-wide
+    ///      constant because `PoolConfig` is unchanged and per-pool windows are out of scope.
+    uint32 public constant MAX_OBSERVATION_BLOCKS = 16;
 
-    /// @notice Blocks between a bond opening and its maturity.
-    /// @dev Must satisfy `0 < OBSERVATION_BLOCKS <= MAX_OBSERVATION_BLOCKS`.
+    /// @notice The protocol's economic observation period, in blocks.
+    ///
+    /// @dev AN ECONOMIC DECISION, NOT A GAS ONE, and deliberately NOT set to the largest value
+    ///      that fits the gas budget. It is how long the mechanism waits before judging whether a
+    ///      swap's price displacement persisted, so it belongs to the product, not the profiler.
+    ///
+    ///      THIS VALUE IS A PLACEHOLDER. It was NOT chosen economically, and 10 carries no
+    ///      analytical weight — a worked example in a design document is an illustration, not a
+    ///      calibrated observation period. It exists so the contract compiles and can be tested.
+    ///
+    ///      **Choosing the real value is an OUTSTANDING DECISION and belongs to the persistence
+    ///      research, not to the gas work that fixed `MAX_OBSERVATION_BLOCKS`.** It determines how
+    ///      long the mechanism waits before judging whether a price displacement persisted, which
+    ///      is the core economic parameter of the whole mechanism: too short and ordinary noise
+    ///      reads as persistence, too long and the bond is held far beyond its useful life. That
+    ///      trade-off can only be settled against the simulation and toxicity research, none of
+    ///      which is present in this repository.
+    ///
+    ///      Must satisfy `0 < OBSERVATION_BLOCKS <= MAX_OBSERVATION_BLOCKS`; 10 <= 16 holds, with
+    ///      room to raise it without re-measuring the scan.
+    ///
+    ///      A useful consequence of `OBSERVATION_BLOCKS <= MAX_OBSERVATION_BLOCKS`: the number of
+    ///      OCCUPIED buckets one advancement can cross is bounded by `OBSERVATION_BLOCKS`, not by
+    ///      `W`. A bucket at `m` is occupied only if a bond opened at `m - OBSERVATION_BLOCKS`,
+    ///      and opening a bond advances the cursor — so distinct occupied buckets require distinct
+    ///      opening blocks within the last `OBSERVATION_BLOCKS`. The rest of the horizon can only
+    ///      ever be cheaper empty reads.
+    ///
     ///      `_maturityOf` is the single place this is applied.
-    uint32 public constant OBSERVATION_BLOCKS = 8;
+    uint32 public constant OBSERVATION_BLOCKS = 10;
 
     /*              TYPES            /*/
 
@@ -521,22 +558,14 @@ contract BondMeBro is BaseHook {
         // Scoped so these locals do not stay live across the bonded-custody code below, which is
         // already at the EVM stack limit.
         {
-            // Only the current tick is needed.
+            // Only the current tick is needed, and only to seed an unseeded accumulator.
             // slither-disable-next-line unused-return
             (, int24 tick,,) = poolManager.getSlot0(id);
 
-            TickAccumulatorLib.Accumulator storage acc = accumulator[id];
-
-            // The elapsed interval is credited at the tick that was actually live across it, which
-            // is `acc.lastTick`, not the tick this swap is about to produce. Passing `lastTick`
-            // back into `update` advances time without changing the effective tick; `_afterSwap`
-            // sets the new tick afterwards with zero elapsed blocks. ADR-0003 § 13.1.
-            //
-            // First-touch fallback: pools initialized through this hook are seeded in
-            // `_afterInitialize`, so the `lastUpdate == 0` branch normally never fires. It exists
-            // so an unseeded accumulator adopts the pool's REAL tick rather than the default `0`.
-            // slither-disable-next-line unused-return
-            acc.update(acc.lastUpdate == 0 ? tick : acc.lastTick);
+            // Freeze every crossed maturity checkpoint, THEN advance the accumulator — both
+            // before the pool moves the tick. Order is the whole correctness argument: after the
+            // swap the cumulative at a crossed maturity is unrecoverable.
+            _advanceAndCheckpoint(id, tick);
         }
 
         PoolConfig memory cfg = poolConfig[id];
@@ -788,6 +817,98 @@ contract BondMeBro is BaseHook {
         inputCurrency.take(poolManager, address(this), candidateBond, false);
 
         return candidateBond.toInt128();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        MATURITY CHECKPOINT ADVANCEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Freezes every crossed maturity checkpoint, then advances the accumulator to now.
+    ///
+    /// @dev THE STAGE 3 CORE. Called from `_beforeSwap`, before the swap moves the tick, on EVERY
+    ///      swap regardless of configuration.
+    ///
+    ///      WHY ORDER MATTERS. A checkpoint records the cumulative EXACTLY at a maturity block `M`.
+    ///      That value is computable only while the accumulator still sits at `lastUpdate <= M`
+    ///      with the tick that was live across the interval. Once a swap moves the tick, the value
+    ///      at `M` is gone — no history is kept and none can be reconstructed. So freezing happens
+    ///      first, advancement second, and the swap third.
+    ///
+    ///      THE BOUNDED DOMAIN. With `L = lastUpdate` and `C = block.number`, only
+    ///
+    ///          (L, min(C, L + W)]
+    ///
+    ///      can contain an uncheckpointed matured bucket. ADR-0003 section 3.4 proves both ends:
+    ///      nothing at or below `L` is still unfrozen, because the advancement that reached `L`
+    ///      froze what it crossed; and nothing above `L + W` can exist yet, because opening a bond
+    ///      requires a swap, a swap advances `lastUpdate`, and maturity is `openBlock + W` at most.
+    ///
+    ///      THE CLAMP IS WHAT KEEPS THIS BOUNDED. When a pool has been quiet for a month,
+    ///      `C - L` is enormous but the loop still runs at most `W` times. A long gap does NOT
+    ///      license skipping the scan: a bond opened at or before `L` may mature anywhere inside
+    ///      `(L, L + W]`, and its checkpoint must be frozen before this swap changes the price.
+    ///
+    ///      OCCUPANCY. `pendingBonds[M] > 0` is the ONLY occupancy signal, per ADR-0004 Rule 3.
+    ///      Because that counter holds finalized bonds only, provisional exact-output records are
+    ///      structurally invisible here — they cannot create checkpoint work, cannot make a bucket
+    ///      look occupied, and cannot cause a freeze. That is ADR-0004 Rule 1, satisfied by
+    ///      construction rather than by an extra check.
+    ///
+    ///      Empty buckets are skipped without freezing: with no bond depending on `M` there is
+    ///      nothing to settle against it.
+    ///
+    /// @param id Pool being advanced.
+    /// @param currentTick Pool tick read this block, used only to seed an unseeded accumulator.
+    function _advanceAndCheckpoint(PoolId id, int24 currentTick) private {
+        TickAccumulatorLib.Accumulator storage acc = accumulator[id];
+
+        uint32 lastUpdate = acc.lastUpdate;
+
+        // First touch: nothing has elapsed and no maturity can exist yet.
+        if (lastUpdate == 0) {
+            // slither-disable-next-line unused-return
+            acc.update(currentTick);
+
+            return;
+        }
+
+        uint32 nowBlock = _blockNumber32();
+
+        // Freeze before advancing. Skipped entirely when no block has elapsed, which is the
+        // common case of a second swap in the same block.
+        if (nowBlock > lastUpdate) {
+            // The clamp. `scanEnd` never exceeds `lastUpdate + W`, so the loop below runs at most
+            // W times however long the pool was quiet.
+            uint32 horizon = lastUpdate + MAX_OBSERVATION_BLOCKS;
+            uint32 scanEnd = nowBlock < horizon ? nowBlock : horizon;
+
+            // Read once into memory: the loop must not re-read storage per candidate block.
+            TickAccumulatorLib.Accumulator memory snapshot = acc;
+
+            for (uint32 m = lastUpdate + 1; m <= scanEnd; m++) {
+                MaturityCheckpoint storage bucket = maturity[id][m];
+
+                // Unoccupied, or already frozen by an earlier advancement. Either way, nothing to
+                // do. `checkpointed` is the sole authority on whether the checkpoint exists, and a
+                // frozen one is never rewritten.
+                if (bucket.pendingBonds == 0 || bucket.checkpointed) continue;
+
+                // The cumulative exactly at `m`, from PRE-ADVANCE state. Valid because the tick
+                // cannot have changed inside `(lastUpdate, nowBlock)` — a change needs a swap, and
+                // a swap would have moved `lastUpdate`.
+                int56 cumulative = snapshot.cumulativeAt(m);
+
+                bucket.cumulative = cumulative;
+                bucket.checkpointed = true;
+
+                emit MaturityCheckpointed(id, m, cumulative);
+            }
+        }
+
+        // Now advance. Credits the elapsed interval at the tick that was live across it and leaves
+        // the effective tick unchanged; `_afterSwap` sets the new tick with zero elapsed blocks.
+        // slither-disable-next-line unused-return
+        acc.update(acc.lastTick);
     }
 
     /*//////////////////////////////////////////////////////////////

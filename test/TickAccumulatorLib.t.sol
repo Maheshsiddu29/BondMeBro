@@ -23,10 +23,19 @@ contract AccumulatorHost {
         return acc.lastTick;
     }
 
+    function lastUpdate() external view returns (uint32) {
+        return acc.lastUpdate;
+    }
+
     /// @dev External wrapper: vm.expectRevert only intercepts external calls, so a pure
     ///      internal library revert cannot be asserted without a boundary like this.
     function twa(int56 open, int56 current, uint32 elapsed) external pure returns (int24) {
         return TickAccumulatorLib.twaTick(open, current, elapsed);
+    }
+
+    /// @dev External wrapper for the T5.1 Stage 3 helper, for the same reason as `twa`.
+    function cumulativeAt(uint32 atBlock) external view returns (int56) {
+        return TickAccumulatorLib.cumulativeAt(acc, atBlock);
     }
 }
 
@@ -163,5 +172,88 @@ contract TickAccumulatorLibTest is Test {
         int24 hi = a < b ? int24(b) : int24(a);
         assertGe(twa, lo - 1); // -1/+1 absorbs truncation toward zero
         assertLe(twa, hi + 1);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                   cumulativeAt — the Stage 3 helper
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice `cumulativeAt` generalises `observe` to any block inside its domain, which is what
+    ///         lets a maturity checkpoint freeze at the exact maturity block rather than at
+    ///         whichever block the crossing swap happened to land on.
+    function test_cumulativeAt_matchesObserveAtTheCurrentBlock() public {
+        host.update(100);
+
+        vm.roll(block.number + 20);
+
+        assertEq(host.cumulativeAt(uint32(block.number)), host.observe(), "cumulativeAt disagrees with observe");
+    }
+
+    /// @notice Interior points extrapolate the stored tick exactly.
+    function test_cumulativeAt_extrapolatesInteriorBlocks() public {
+        host.update(100);
+
+        uint32 start = host.lastUpdate();
+
+        vm.roll(block.number + 50);
+
+        // Seven blocks after the cursor, at a constant tick of 100.
+        assertEq(host.cumulativeAt(start + 7), int56(700), "interior extrapolation is wrong");
+
+        // And the cursor itself credits nothing.
+        assertEq(host.cumulativeAt(start), int56(0), "the cursor block should credit no time");
+    }
+
+    /// @notice Blocks before the cursor are REJECTED, not extrapolated.
+    ///
+    /// @dev The domain guard matters more than it looks. Below `lastUpdate` the accumulator keeps
+    ///      no history, so answering would mean extrapolating backwards using the WRONG tick and
+    ///      returning a plausible but false number. Reverting is what stops this helper becoming a
+    ///      historical oracle — the checkpoint design depends on values being captured while they
+    ///      are still knowable, never reconstructed afterwards.
+    function test_cumulativeAt_rejectsBlocksBeforeTheCursor() public {
+        host.update(100);
+
+        vm.roll(block.number + 10);
+        host.update(200);
+
+        uint32 cursor = host.lastUpdate();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(TickAccumulatorLib.BlockOutOfDomain.selector, cursor - 1, cursor, block.number)
+        );
+        host.cumulativeAt(cursor - 1);
+    }
+
+    /// @notice Future blocks are rejected: the helper must not invent time that has not elapsed.
+    function test_cumulativeAt_rejectsFutureBlocks() public {
+        host.update(100);
+
+        uint32 future = uint32(block.number) + 1;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TickAccumulatorLib.BlockOutOfDomain.selector, future, host.lastUpdate(), block.number
+            )
+        );
+        host.cumulativeAt(future);
+    }
+
+    /// @notice A negative tick accumulates downward, and the helper handles the sign correctly.
+    function testFuzz_cumulativeAt_isLinearInElapsedBlocks(int16 rawTick, uint8 rawOffset) public {
+        int24 tick = int24(rawTick);
+
+        host.update(tick);
+
+        uint32 start = host.lastUpdate();
+        uint32 offset = uint32(rawOffset);
+
+        vm.roll(block.number + 256);
+
+        assertEq(
+            host.cumulativeAt(start + offset),
+            int56(tick) * int56(uint56(offset)),
+            "cumulativeAt is not linear in elapsed blocks"
+        );
     }
 }

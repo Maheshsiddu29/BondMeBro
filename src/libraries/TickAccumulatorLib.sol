@@ -21,6 +21,11 @@ library TickAccumulatorLib {
     /// @dev Settlement should normally prevent this by requiring maturity before evaluating a bond, but the library still checks it directly so division by zero can never occur.
     error ZeroWindow();
 
+    /// @notice Thrown when `cumulativeAt` is asked for a block outside its valid domain.
+    /// @dev Below `lastUpdate` the value is unrecoverable; above the current block it does not
+    ///      exist yet. Reverting keeps this helper from becoming a historical oracle.
+    error BlockOutOfDomain(uint32 atBlock, uint32 lastUpdate, uint256 currentBlock);
+
     /// @notice Running tick accumulator for one pool. The fields fit in one storage slot: 24 + 32 + 56 = 112 bits.
 
     struct Accumulator {
@@ -76,6 +81,37 @@ library TickAccumulatorLib {
     /// This function observes the current block only. If settlement happens after a bond's maturity, T5 must use the accumulator value frozen or reconstructed at the maturity checkpoint rather than calling this function and using the later settlement block directly.
     function observe(Accumulator memory acc) internal view returns (int56) {
         uint32 elapsed = uint32(block.number) - acc.lastUpdate;
+
+        return acc.tickCumulative + int56(acc.lastTick) * int56(uint56(elapsed));
+    }
+
+    /// @notice Returns the accumulator value at a chosen block at or after `lastUpdate`.
+
+    /// @dev The one additive helper ADR-0003 section 13.3 authorises. `observe` is the special case
+    /// `atBlock == block.number`; this generalises it so a maturity checkpoint can be frozen at the
+    /// exact block the bond matured rather than at the block the crossing swap happened to land on.
+
+    /// DOMAIN, AND WHY IT IS ENFORCED. Valid only for `acc.lastUpdate <= atBlock <= block.number`.
+
+    /// Below `lastUpdate` the answer is unknowable: the accumulator keeps no history, so a caller
+    /// asking about an earlier block would silently receive a value extrapolated from the WRONG
+    /// tick. Above the current block it would be inventing the future. Both are rejected rather
+    /// than returning a plausible-looking number, because this function must never become a
+    /// general historical oracle — the whole point of the checkpoint design is that values are
+    /// captured while they are still knowable, not reconstructed afterwards.
+
+    /// Within the domain the answer is exact, not an approximation: the tick cannot change without
+    /// a swap, and a swap would have moved `lastUpdate` forward.
+
+    /// @param acc Accumulator to read.
+    /// @param atBlock Block to evaluate at. Must satisfy `acc.lastUpdate <= atBlock <= block.number`.
+    /// @return cumulative Accumulator value at `atBlock`, in tick-blocks.
+    function cumulativeAt(Accumulator memory acc, uint32 atBlock) internal view returns (int56 cumulative) {
+        if (atBlock < acc.lastUpdate || uint256(atBlock) > block.number) {
+            revert BlockOutOfDomain(atBlock, acc.lastUpdate, block.number);
+        }
+
+        uint32 elapsed = atBlock - acc.lastUpdate;
 
         return acc.tickCumulative + int56(acc.lastTick) * int56(uint56(elapsed));
     }

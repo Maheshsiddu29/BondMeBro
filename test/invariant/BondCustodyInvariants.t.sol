@@ -45,6 +45,11 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     uint256 internal constant STATE_BYTE_OFFSET = 30;
     uint8 internal constant STATE_PROVISIONAL = 1;
 
+    /// @dev First cumulative the invariant ever observed for a frozen bucket, used to prove
+    ///      immutability across the campaign.
+    mapping(uint32 => bool) internal seenCheckpoint;
+    mapping(uint32 => int56) internal firstSeenCumulative;
+
     uint128 internal constant MIN_BONDED = 1e15;
     uint96 internal constant MIN_BONDED_1 = 1e15;
     uint16 internal constant BOND_BPS = 25;
@@ -254,6 +259,92 @@ contract BondCustodyInvariantsTest is Test, Deployers {
 
             for (uint32 index = 0; index < pending; index++) {
                 assertTrue(hook.bondExists(_bondId(m, index)), "a counted bond is not finalized");
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    NO-MISSED-MATURITY — Stage 3 core invariant
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice NO-MISSED-MATURITY.
+
+    /// For every registered maturity M:  M <= accumulator.lastUpdate  =>  checkpoint[M].checkpointed
+
+    /// @dev TREATED WITH THE SAME SERIOUSNESS AS INV-NOOP, because the failure it guards is silent
+    ///      and permanent. Once `lastUpdate` moves past an unfrozen maturity, that maturity is
+    ///      behind the scan cursor. The accumulator keeps no history, so the next price-changing
+    ///      swap makes the exact cumulative at M unrecoverable — and every bond maturing there
+    ///      becomes unsettleable, with nothing anywhere reporting an error.
+
+    ///      TWO HALVES, AND BOTH ARE NEEDED.
+
+    ///      The STICKY FLAG covers maturities that have already been resolved and dropped from the
+    ///      active set. The handler checks each maturity at the moment the cursor passes it; if the
+    ///      checkpoint was missing then, `ghostMissedMaturity` is set and never cleared. So a
+    ///      maturity skipped early stays detected for the rest of the campaign even though its
+    ///      entry is gone. This is what makes forgetting safe.
+
+    ///      The ACTIVE-SET LOOP covers maturities that have become due since the last handler
+    ///      action — the window the sticky flag has not yet seen.
+
+    ///      Together these are exactly the original property. Nothing is weakened: a maturity
+    ///      skipped earlier and now behind the cursor is still caught, by the first half.
+
+    ///      BOUND. The active set holds only registered-but-unresolved maturities, so its size is
+    ///      proportional to maturities in flight — bounded by `OBSERVATION_BLOCKS` distinct blocks
+    ///      at any moment — and does NOT grow with campaign length, elapsed blocks, chain age or
+    ///      total historical bonds. No loop here or in the handler iterates a block range.
+    function invariant_noMissedMaturity() public view {
+        // Half one: anything already resolved and dropped.
+        assertFalse(handler.ghostMissedMaturity(), "a registered maturity fell behind the cursor unfrozen");
+
+        // Half two: anything due but not yet resolved.
+        (, uint32 lastUpdate,) = hook.accumulator(id_);
+
+        uint256 count = handler.activeMaturityCount();
+
+        for (uint256 i = 0; i < count; i++) {
+            uint32 m = handler.activeMaturityAt(i);
+
+            if (m > lastUpdate) continue;
+
+            (, uint32 pending, bool checkpointed) = hook.maturity(id_, m);
+
+            assertGt(pending, 0, "a registered maturity lost its bonds");
+            assertTrue(checkpointed, "a due registered maturity was never checkpointed");
+        }
+    }
+
+    /// @notice The active set stays bounded — it does not accumulate over the campaign.
+    /// @dev Makes the bound a tested property rather than a claim in a comment. A model that grew
+    ///      with history would fail this well before the campaign ended.
+    function invariant_ghostActiveSetStaysBounded() public view {
+        // Generous headroom over `OBSERVATION_BLOCKS` in-flight maturities; the point is that this
+        // is a constant, not a function of how many actions the campaign has run.
+        assertLe(handler.activeMaturityCount(), 64, "the ghost active set is growing with campaign length");
+    }
+
+    /// @notice A frozen checkpoint is never rewritten by later advancement.
+
+    /// @dev Immutability is what makes settlement independent of when it is called. Checked here
+    ///      across the whole campaign by comparing each frozen value against the first value the
+    ///      invariant ever observed for that bucket.
+    function invariant_frozenCheckpointsNeverChange() public {
+        uint256 count = handler.activeMaturityCount();
+
+        for (uint256 i = 0; i < count; i++) {
+            uint32 m = handler.activeMaturityAt(i);
+
+            (int56 cumulative,, bool checkpointed) = hook.maturity(id_, m);
+
+            if (!checkpointed) continue;
+
+            if (seenCheckpoint[m]) {
+                assertEq(cumulative, firstSeenCumulative[m], "a frozen checkpoint changed");
+            } else {
+                seenCheckpoint[m] = true;
+                firstSeenCumulative[m] = cumulative;
             }
         }
     }

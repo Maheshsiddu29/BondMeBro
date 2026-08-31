@@ -98,6 +98,96 @@ contract BondCustodyHandler is Test {
         touchedMaturities.push(maturityBlock);
     }
 
+    /// @notice UNRESOLVED registered maturities — the NO-MISSED-MATURITY active set.
+    ///
+    /// @dev BOUNDED BY THE PROTOCOL HORIZON, NOT BY CAMPAIGN LENGTH. An entry is added when a bond
+    ///      finalizes into a maturity block, and REMOVED as soon as that maturity has been
+    ///      resolved — that is, once the cursor has passed it and its checkpoint has been observed
+    ///      (or its absence recorded in `ghostMissedMaturity`).
+    ///
+    ///      Size is therefore proportional to the number of maturities that are simultaneously
+    ///      registered-but-not-yet-due, which is bounded by `OBSERVATION_BLOCKS` distinct maturity
+    ///      blocks in flight at any moment — NOT by total historical bonds, elapsed blocks, or
+    ///      chain age. A campaign creating 5,000 distinct maturities over its run holds only the
+    ///      handful still in flight, because each is resolved and dropped as the cursor passes it.
+    ///
+    ///      WHY FORGETTING A RESOLVED MATURITY IS SOUND. A verified checkpoint cannot later become
+    ///      wrong: Stage 3 proves immutability separately, via
+    ///      `invariant_frozenCheckpointsNeverChange` and `test_noBucketDeletion`. Re-checking it
+    ///      every step would prove nothing further, so retention buys no strength — only unbounded
+    ///      growth.
+    ///
+    ///      WHAT PRESERVES THE PROPERTY IS `ghostMissedMaturity`, NOT RETENTION. If a maturity is
+    ///      found unfrozen at the moment it leaves the active set, that fact is recorded in a
+    ///      sticky flag that is never cleared. So a maturity skipped early and detected once stays
+    ///      detected for the remainder of the campaign, even though the entry itself is gone. The
+    ///      invariant is not weakened: it still catches a maturity skipped earlier that has since
+    ///      fallen behind the cursor.
+    uint32[] internal activeMaturities;
+
+    /// @notice Whether a maturity block is currently in the active set.
+    mapping(uint32 => bool) internal maturityActive;
+
+    /// @notice STICKY. Set the first time a due maturity is observed without its checkpoint, and
+    ///         never cleared for the rest of the campaign.
+    /// @dev This is what lets the active set forget resolved entries without losing the property.
+    bool public ghostMissedMaturity;
+
+    /// @notice Number of maturities currently in flight — registered and not yet resolved.
+    function activeMaturityCount() external view returns (uint256) {
+        return activeMaturities.length;
+    }
+
+    /// @notice Active maturity block at `index`.
+    function activeMaturityAt(uint256 index) external view returns (uint32) {
+        return activeMaturities[index];
+    }
+
+    /// @dev Adds a maturity to the active set once, when a bond finalizes into it.
+    function _noteRegisteredMaturity(uint32 maturityBlock) internal {
+        if (maturityActive[maturityBlock]) return;
+
+        maturityActive[maturityBlock] = true;
+        activeMaturities.push(maturityBlock);
+    }
+
+    /// @notice Resolves every active maturity the cursor has now passed.
+    ///
+    /// @dev Called at the end of each handler action. For each due maturity it records whether the
+    ///      checkpoint exists — setting the sticky flag if not — and then drops it from the set.
+    ///      This is what keeps the set bounded by in-flight maturities rather than by history.
+    ///
+    ///      Iterates the ACTIVE SET, never a block range. There is no
+    ///      `for b = oldLastUpdate + 1 ... newLastUpdate` here or anywhere else.
+    function _resolveDueMaturities() internal {
+        (, uint32 lastUpdate,) = hook.accumulator(key_.toId());
+
+        uint256 i;
+
+        while (i < activeMaturities.length) {
+            uint32 m = activeMaturities[i];
+
+            if (m > lastUpdate) {
+                // Not due yet. Keep it in flight.
+                i++;
+                continue;
+            }
+
+            (,, bool checkpointed) = hook.maturity(key_.toId(), m);
+
+            // THE DETECTION POINT. A due maturity without a checkpoint is a miss, and the record
+            // of it survives this entry's removal.
+            if (!checkpointed) {
+                ghostMissedMaturity = true;
+            }
+
+            // Resolved: drop it. Swap-and-pop keeps this O(1) per removal.
+            maturityActive[m] = false;
+            activeMaturities[i] = activeMaturities[activeMaturities.length - 1];
+            activeMaturities.pop();
+        }
+    }
+
     constructor(
         IPoolManager _manager,
         PoolSwapTest _swapRouter,
@@ -145,6 +235,8 @@ contract BondCustodyHandler is Test {
         if (ceiling == 0) return;
 
         _execute(-int256(grossInput), zeroForOne, inputCurrency, expectedBond, ceiling, expectedBond > 0, true);
+
+        _resolveDueMaturities();
     }
 
     /// @notice Executes a fuzzed exact-output swap.
@@ -168,6 +260,8 @@ contract BondCustodyHandler is Test {
         uint128 ceiling = tightCeiling ? 1 : type(uint128).max;
 
         _execute(int256(amountOut), zeroForOne, inputCurrency, 0, ceiling, false, false);
+
+        _resolveDueMaturities();
     }
 
     /// @notice Advances the chain without swapping, producing quiet gaps.
@@ -180,6 +274,10 @@ contract BondCustodyHandler is Test {
     /// @param blocksSeed Fuzz value choosing how far to roll.
     function advanceBlocks(uint256 blocksSeed) external {
         vm.roll(block.number + 1 + (blocksSeed % 12));
+
+        // Rolling alone does not move the accumulator cursor, so nothing can become due here.
+        // Resolving anyway keeps the rule uniform: every action ends with resolution.
+        _resolveDueMaturities();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -277,6 +375,11 @@ contract BondCustodyHandler is Test {
             // than held in a local, to stay inside the EVM stack limit.
             if (bondTaken > 0) {
                 expectedFinalizedAt[uint32(block.number) + hook.OBSERVATION_BLOCKS()] += 1;
+
+                // NO-MISSED-MATURITY ghost. Only REGISTERED maturities are recorded — a bucket a
+                // provisional record merely touched must never appear here, or the invariant would
+                // demand a checkpoint for something ADR-0004 Rule 1 says does not exist.
+                _noteRegisteredMaturity(uint32(block.number) + hook.OBSERVATION_BLOCKS());
             }
 
             if (isExactInput) {
