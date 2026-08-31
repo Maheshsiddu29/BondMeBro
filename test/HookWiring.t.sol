@@ -70,18 +70,12 @@ contract HookWiringTest is Test, Deployers {
         assertEq(HOOK_FLAGS, 0x10CC, "HOOK_FLAGS drifted from the value recorded in ADR-0002 s12");
     }
 
-    /// @dev The `beforeSwapCount` / `afterSwapCount` counters this test used to read were removed
-    ///      in T3B — two cold SSTOREs at ~20,000 gas each on every swap, to prove something the
-    ///      `CallbackFired` event and the tick writes already prove for free. Invocation is now
-    ///      asserted from the events, and the tick state confirms each callback ran far enough to
-    ///      do its work.
+    /// @dev The invocation proof has been progressively cheapened as the scaffolding it relied on
+    ///      was removed: `beforeSwapCount`/`afterSwapCount` in T3B (two ~20,000-gas SSTOREs per
+    ///      swap), then the `CallbackFired` events in T5.1 (a string-argument LOG in each callback,
+    ///      on a gas-budgeted path). The accumulator now proves both callbacks ran, for free: only
+    ///      `beforeSwap` advances `lastUpdate`, and only `afterSwap` writes the post-swap tick.
     function test_hookIsCalledOnSwap() public {
-        // Both callbacks must fire, in order, with the tick each observed.
-        vm.expectEmit(false, false, false, true, address(hook));
-        emit BondMeBro.CallbackFired("beforeSwap", 0);
-        vm.expectEmit(false, false, false, false, address(hook));
-        emit BondMeBro.CallbackFired("afterSwap", 0); // tick not checked; asserted below
-
         swapRouter.swap(
             key_,
             SwapParams({
@@ -93,14 +87,16 @@ contract HookWiringTest is Test, Deployers {
             ""
         );
 
-        int24 tickBefore = hook.lastTickBefore();
-        int24 tickAfter = hook.lastTickAfter();
-        console2.log("tickBefore", tickBefore);
-        console2.log("tickAfter ", tickAfter);
+        // The accumulator replaced the lastTickBefore/lastTickAfter diagnostics in T5.1.
+        (int24 effectiveTick, uint32 lastUpdate,) = hook.accumulator(key_.toId());
 
-        // zeroForOne sells token0, so price and tick must move DOWN. This also proves both
-        // callbacks actually ran: lastTickAfter is only written by afterSwap, and it could not
-        // differ from lastTickBefore unless beforeSwap had written that first.
-        assertLt(tickAfter, tickBefore, "zeroForOne should move tick down");
+        console2.log("effective tick after swap", effectiveTick);
+
+        // Both callbacks ran: `beforeSwap` advanced `lastUpdate` to this block, and `afterSwap`
+        // stored the post-swap tick. zeroForOne sells token0, so the tick must have moved DOWN
+        // from the pool's starting tick of 0.
+        assertEq(lastUpdate, uint32(block.number), "beforeSwap did not advance the accumulator");
+
+        assertLt(effectiveTick, 0, "zeroForOne should move the effective tick down");
     }
 }

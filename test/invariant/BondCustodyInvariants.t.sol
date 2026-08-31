@@ -37,6 +37,14 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     PoolKey internal key_;
     PoolId internal id_;
 
+    /// @dev `bonds` mapping slot and the byte offset of `Bond.state` within struct slot 1, both
+    ///      from `forge inspect BondMeBro storage-layout`. Raw access is required because Rule 1
+    ///      deliberately makes PROVISIONAL indistinguishable from absent through the public API —
+    ///      which is the property under test.
+    uint256 internal constant BONDS_SLOT = 4;
+    uint256 internal constant STATE_BYTE_OFFSET = 30;
+    uint8 internal constant STATE_PROVISIONAL = 1;
+
     uint128 internal constant MIN_BONDED = 1e15;
     uint96 internal constant MIN_BONDED_1 = 1e15;
     uint16 internal constant BOND_BPS = 25;
@@ -84,15 +92,33 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         vm.stopPrank();
 
         // Restrict the stateful campaign to the handler's two swap actions.
-        bytes4[] memory selectors = new bytes4[](2);
+        bytes4[] memory selectors = new bytes4[](3);
 
         selectors[0] = BondCustodyHandler.swapExactInput.selector;
 
         selectors[1] = BondCustodyHandler.swapExactOutput.selector;
 
+        selectors[2] = BondCustodyHandler.advanceBlocks.selector;
+
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
 
         targetContract(address(handler));
+    }
+
+    /// @dev Mirrors the contract's bond-id derivation.
+    function _bondId(uint32 maturityBlock, uint32 indexInBucket) internal view returns (bytes32) {
+        return keccak256(abi.encode(id_, maturityBlock, indexInBucket));
+    }
+
+    /// @dev Reads `Bond.state` straight from storage. Raw access is required precisely because
+    ///      ADR-0004 Rule 1 makes PROVISIONAL indistinguishable from absent through the public
+    ///      API — which is the property under test.
+    function _rawBondState(bytes32 bondId) internal view returns (uint8) {
+        bytes32 base = keccak256(abi.encode(bondId, BONDS_SLOT));
+
+        bytes32 word = vm.load(address(hook), bytes32(uint256(base) + 1));
+
+        return uint8(uint256(word) >> (STATE_BYTE_OFFSET * 8));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -161,6 +187,75 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         assertGe(
             currency1.balanceOf(address(hook)), handler.expectedBondTotal(currency1), "currency1: bonds not backed"
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        ADR-0004 SPLIT-PHASE INVARIANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice INV-PROVISIONAL (a) — no bond record is ever left `PROVISIONAL` once a transaction
+    ///         has ended.
+
+    /// @dev THE CORE SAFETY PROPERTY OF ADR-0004. The exact-output header is written in
+    ///      `beforeSwap`, before anyone knows whether the swap will bond. Every exit from
+    ///      `afterSwap` must finalize it or clear it, and a revert must unwind it. If any path
+    ///      returns without doing one of those, a half-written record survives and a later swap
+    ///      reusing that bucket index inherits it.
+
+    ///      Checked over the ghost model's maturity blocks, never by scanning block ranges or all
+    ///      historical bonds, so work stays bounded by the distinct maturity blocks touched.
+    function invariant_noProvisionalRecordSurvives() public view {
+        uint256 maturityCount = handler.touchedMaturityCount();
+
+        for (uint256 i = 0; i < maturityCount; i++) {
+            uint32 m = handler.touchedMaturityAt(i);
+
+            (, uint32 pending,) = hook.maturity(id_, m);
+
+            // Indices [0, pending) hold finalized bonds; index `pending` is where the next
+            // provisional record would sit. Checking one past the end is the point.
+            for (uint32 index = 0; index <= pending; index++) {
+                assertTrue(
+                    _rawBondState(_bondId(m, index)) != STATE_PROVISIONAL,
+                    "a PROVISIONAL bond record survived its transaction"
+                );
+            }
+        }
+    }
+
+    /// @notice INV-PENDING-FINALIZED — `pendingBonds[M]` counts finalized bonds only.
+
+    /// @dev The cheapest sentinel for the split-phase design. If a provisional record ever leaked
+    ///      into the count — the Option B failure mode ADR-0004 section 5 rejects — this fails.
+    ///      The handler's expectation comes from observed collateral movement, not from the
+    ///      contract's own counter, so this is a genuine cross-check rather than a tautology.
+    function invariant_pendingBondsCountsFinalizedOnly() public view {
+        uint256 maturityCount = handler.touchedMaturityCount();
+
+        for (uint256 i = 0; i < maturityCount; i++) {
+            uint32 m = handler.touchedMaturityAt(i);
+
+            (, uint32 pending,) = hook.maturity(id_, m);
+
+            assertEq(pending, handler.expectedFinalizedAt(m), "pendingBonds does not equal the finalized bond count");
+        }
+    }
+
+    /// @notice Every bond the contract counts is readable as a finalized bond.
+    /// @dev Pairs with the two above: they prove nothing provisional is counted, this proves
+    ///      nothing counted is missing.
+    function invariant_countedBondsAreAllFinalized() public view {
+        uint256 maturityCount = handler.touchedMaturityCount();
+
+        for (uint256 i = 0; i < maturityCount; i++) {
+            uint32 m = handler.touchedMaturityAt(i);
+
+            (, uint32 pending,) = hook.maturity(id_, m);
+
+            for (uint32 index = 0; index < pending; index++) {
+                assertTrue(hook.bondExists(_bondId(m, index)), "a counted bond is not finalized");
+            }
+        }
     }
 
     /*//////////////////////////////////////////////////////////////

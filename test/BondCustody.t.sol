@@ -438,10 +438,14 @@ contract BondCustodyTest is Test, Deployers {
 
         assertGt(currency1.balanceOf(address(this)), swapperBefore1, "unbonded swap produced no output");
 
-        // Tick diagnostics confirm that both swap callbacks executed.
-        assertEq(hook.lastTickBefore(), 0, "beforeSwap did not record the pre-swap tick");
+        // The accumulator confirms both swap callbacks executed. `beforeSwap` advances it
+        // unconditionally, before any bonded/unbonded branch; `afterSwap` writes the post-swap
+        // tick into it. This replaces the lastTickBefore/lastTickAfter diagnostics removed in T5.1.
+        (int24 effectiveTick, uint32 lastUpdate,) = hook.accumulator(id_);
 
-        assertLt(hook.lastTickAfter(), 0, "afterSwap did not record the post-swap tick");
+        assertEq(lastUpdate, uint32(block.number), "beforeSwap did not advance the accumulator");
+
+        assertLt(effectiveTick, 0, "afterSwap did not store the post-swap tick");
     }
 
     /// @notice A swap exactly equal to the threshold is bonded.

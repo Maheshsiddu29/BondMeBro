@@ -61,6 +61,43 @@ contract BondCustodyHandler is Test {
     /// @notice Number of swap attempts that reverted.
     uint256 public reverted;
 
+    /// @notice Every maturity block any swap has plausibly touched, in first-seen order.
+    ///
+    /// @dev GHOST MODEL FOR INV-PROVISIONAL AND INV-PENDING-FINALIZED. Recorded per maturity
+    ///      BLOCK, never per elapsed block and never per historical bond, so invariant work stays
+    ///      bounded by the number of distinct blocks the campaign swapped in rather than by the
+    ///      protocol's history.
+    ///
+    ///      Recorded for EVERY attempt, including reverted and unbonded ones, because those are
+    ///      exactly the cases where a provisional record could be left behind.
+    uint32[] internal touchedMaturities;
+
+    /// @notice Whether a maturity block is already in `touchedMaturities`.
+    mapping(uint32 => bool) internal maturitySeen;
+
+    /// @notice Count of bonds the handler believes were finalized at each maturity block.
+    /// @dev Independently maintained, so `INV-PENDING-FINALIZED` compares the contract's counter
+    ///      against a number derived from observed behaviour rather than from itself.
+    mapping(uint32 => uint32) public expectedFinalizedAt;
+
+    /// @notice Number of distinct maturity blocks the campaign has touched.
+    function touchedMaturityCount() external view returns (uint256) {
+        return touchedMaturities.length;
+    }
+
+    /// @notice Maturity block at `index` in the ghost model.
+    function touchedMaturityAt(uint256 index) external view returns (uint32) {
+        return touchedMaturities[index];
+    }
+
+    /// @dev Records a maturity block once. Cheap enough to call on every swap attempt.
+    function _noteMaturity(uint32 maturityBlock) internal {
+        if (maturitySeen[maturityBlock]) return;
+
+        maturitySeen[maturityBlock] = true;
+        touchedMaturities.push(maturityBlock);
+    }
+
     constructor(
         IPoolManager _manager,
         PoolSwapTest _swapRouter,
@@ -133,6 +170,18 @@ contract BondCustodyHandler is Test {
         _execute(int256(amountOut), zeroForOne, inputCurrency, 0, ceiling, false, false);
     }
 
+    /// @notice Advances the chain without swapping, producing quiet gaps.
+    ///
+    /// @dev Lets the campaign spread bonds across many maturity blocks instead of piling them all
+    ///      into one, and exercises the case where a bond matures with no swap having touched the
+    ///      pool since. Bounded so the campaign does not wander thousands of blocks from any
+    ///      maturity it created.
+    ///
+    /// @param blocksSeed Fuzz value choosing how far to roll.
+    function advanceBlocks(uint256 blocksSeed) external {
+        vm.roll(block.number + 1 + (blocksSeed % 12));
+    }
+
     /*//////////////////////////////////////////////////////////////
                                INTERNALS
     //////////////////////////////////////////////////////////////*/
@@ -197,6 +246,11 @@ contract BondCustodyHandler is Test {
         bool expectBondedExactInput,
         bool isExactInput
     ) internal {
+        // Record the maturity this attempt would use, BEFORE the swap. A reverted or unbonded
+        // attempt is exactly the case that could strand a provisional record, so the ghost model
+        // must know about the bucket even when nothing is finalized into it.
+        _noteMaturity(uint32(block.number) + hook.OBSERVATION_BLOCKS());
+
         uint256 hookBefore = inputCurrency.balanceOf(address(hook));
 
         uint256 managerBefore = inputCurrency.balanceOf(address(manager));
@@ -218,6 +272,12 @@ contract BondCustodyHandler is Test {
             uint256 poolInput = inputCurrency.balanceOf(address(manager)) - managerBefore;
 
             measuredBondTotal[inputCurrency] += bondTaken;
+
+            // A bond was finalized exactly when collateral actually moved. Recomputed rather
+            // than held in a local, to stay inside the EVM stack limit.
+            if (bondTaken > 0) {
+                expectedFinalizedAt[uint32(block.number) + hook.OBSERVATION_BLOCKS()] += 1;
+            }
 
             if (isExactInput) {
                 // Exact-input expected collateral was calculated before execution.
