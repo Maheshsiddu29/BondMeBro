@@ -34,4 +34,6 @@ AGENTS.md
 
 # Working docs
 Documents/
-docs/
+docs/*
+!docs/adr/
+!docs/adr/**
