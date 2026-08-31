@@ -35,5 +35,3 @@ AGENTS.md
 # Working docs
 Documents/
 docs/*
-!docs/adr/
-!docs/adr/**
