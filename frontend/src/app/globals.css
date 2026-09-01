@@ -3000,3 +3000,327 @@ select:focus-visible {
     margin: 10px 0 0;
   }
 }
+
+/* Final UI touch-up: larger type, clearer hierarchy, and more tactile controls. */
+body {
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.sidebar-brand {
+  gap: 13px;
+}
+
+.brand-name {
+  font-size: 16px;
+}
+
+.brand-subtitle {
+  font-size: 9px;
+}
+
+.sidebar-section-label {
+  font-size: 10px;
+}
+
+.sidebar-nav-item {
+  min-height: 48px;
+  font-size: 15px;
+}
+
+.sidebar-tools button,
+.sidebar-tools a {
+  min-height: 40px;
+  font-size: 11px;
+}
+
+.topbar {
+  min-height: 84px;
+  position: sticky;
+  top: 0;
+  z-index: 15;
+  background: color-mix(in srgb, var(--app-bg) 88%, transparent);
+  backdrop-filter: blur(16px);
+}
+
+.topbar-location,
+.rpc-chip,
+.wallet-button {
+  font-size: 11px;
+}
+
+.rpc-chip {
+  gap: 10px;
+}
+
+h2 {
+  font-size: 27px;
+}
+
+.card-heading {
+  gap: 20px;
+}
+
+.eyebrow {
+  font-size: 11px;
+}
+
+.welcome-copy > p,
+.screen-intro > p {
+  font-size: 17px;
+  line-height: 1.65;
+}
+
+.primary-button,
+.large-button {
+  min-height: 46px;
+  font-size: 11px;
+}
+
+.large-button {
+  min-height: 54px;
+}
+
+.text-button,
+.card-link,
+.learn-link {
+  font-size: 12px;
+}
+
+.metric-card {
+  min-height: 151px;
+  padding: 21px;
+}
+
+.metric-card-top,
+.metric-detail,
+.card-footer,
+.panel-footnote {
+  font-size: 10px;
+}
+
+.metric-card strong {
+  margin-top: 24px;
+  font-size: 31px;
+}
+
+.metric-icon {
+  width: 30px;
+  height: 30px;
+  font-size: 17px;
+}
+
+.bond-table-head,
+.activity-table-head {
+  font-size: 9px;
+}
+
+.bond-table-row {
+  min-height: 84px;
+  font-size: 12px;
+}
+
+.bond-table-row strong,
+.activity-table-row strong {
+  font-size: 12px;
+}
+
+.bond-table-row small,
+.pool-cell small,
+.activity-row small,
+.activity-row-hash,
+.readonly-note {
+  font-size: 9px;
+}
+
+.card-link {
+  padding-top: 7px;
+}
+
+.badge {
+  min-height: 29px;
+  padding: 0 11px;
+  font-size: 9px;
+}
+
+.process-strip p {
+  font-size: 10px;
+}
+
+.activity-row {
+  min-height: 70px;
+}
+
+.activity-row strong {
+  font-size: 12px;
+}
+
+.activity-table-row {
+  min-height: 68px;
+  font-size: 10px;
+}
+
+.swap-step strong {
+  font-size: 13px;
+}
+
+.swap-step small,
+.swap-step > span,
+.swap-step i {
+  font-size: 10px;
+}
+
+.field-label {
+  font-size: 11px;
+}
+
+.amount-line input {
+  font-size: 32px;
+}
+
+.token-select,
+.segmented-control button {
+  font-size: 11px;
+}
+
+.swap-settings {
+  font-size: 10px;
+}
+
+.swap-settings b {
+  font-size: 12px;
+}
+
+.preview-amount > span,
+.preview-rows span {
+  font-size: 10px;
+}
+
+.preview-rows strong,
+.detail-info-grid strong,
+.pool-stat-grid strong,
+.mini-stats strong {
+  font-size: 12px;
+}
+
+.preview-amount strong {
+  font-size: 43px;
+}
+
+.risk-callout p,
+.card-copy,
+.section-heading p,
+.faq-card p {
+  font-size: 14px;
+}
+
+.timeline-step span,
+.timeline-step b,
+.detail-info-grid span,
+.detail-id span,
+.detail-id b,
+.pool-stat-grid span,
+.config-list span,
+.owner-row span,
+.mini-stats span,
+.coverage-balance span {
+  font-size: 9px;
+}
+
+.detail-hero strong {
+  font-size: 46px;
+}
+
+.user-bond-record-top strong,
+.user-bond-record-grid strong,
+.user-bond-record-grid a,
+.settlement-result strong,
+.claim-row strong {
+  font-size: 12px;
+}
+
+.user-bond-record-grid span,
+.bond-record-pair,
+.settlement-result span,
+.claim-row span,
+.bond-progress b {
+  font-size: 9px;
+}
+
+.outline-button {
+  min-height: 47px;
+  font-size: 10px;
+}
+
+.pot-card .coverage-balance .outline-button,
+.claim-row .outline-button {
+  min-height: 39px;
+  font-size: 9px;
+}
+
+.neo-card,
+.glass-card,
+.metric-card,
+.learn-step {
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.neo-card:hover,
+.glass-card:hover,
+.metric-card:hover,
+.learn-step:hover {
+  transform: translateY(-2px);
+}
+
+.theme-dark .neo-card:hover,
+.theme-dark .glass-card:hover,
+.theme-dark .metric-card:hover,
+.theme-dark .learn-step:hover {
+  border-color: rgba(255, 107, 26, 0.28);
+  box-shadow: 0 0 0 1px rgba(255, 107, 26, 0.08), 0 14px 34px rgba(0, 0, 0, 0.35);
+}
+
+@media (max-width: 760px) {
+  .topbar {
+    position: sticky;
+    min-height: 70px;
+  }
+
+  h2 {
+    font-size: 24px;
+  }
+
+  .welcome-copy > p,
+  .screen-intro > p {
+    font-size: 15px;
+  }
+
+  .metric-card {
+    min-height: 125px;
+    padding: 17px;
+  }
+
+  .metric-card strong {
+    margin-top: 17px;
+    font-size: 24px;
+  }
+
+  .amount-line input {
+    font-size: 26px;
+  }
+
+  .preview-amount strong {
+    font-size: 36px;
+  }
+
+  .detail-hero strong {
+    font-size: 37px;
+  }
+
+  .neo-card:hover,
+  .glass-card:hover,
+  .metric-card:hover,
+  .learn-step:hover {
+    transform: none;
+  }
+}
