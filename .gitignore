@@ -4,6 +4,9 @@ cache/
 broadcast/
 !broadcast/*/31337/
 lib/
+# Keep the frontend's tracked source helpers; the Foundry dependency tree stays ignored.
+!frontend/src/lib/
+!frontend/src/lib/**
 # Slither / crytic
 crytic-export/
 *.sarif
