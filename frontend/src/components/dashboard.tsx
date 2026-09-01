@@ -278,6 +278,36 @@ function bondProgress(bond: Pick<UserBond, "openBlock" | "maturesAtBlock">, curr
   return Math.round((Number(currentBlock - bond.openBlock) / Number(bond.maturesAtBlock - bond.openBlock)) * 100);
 }
 
+function activityKey(item: Activity) {
+  return `${item.kind}:${item.hash ?? item.block}`;
+}
+
+function mergeActivity(previous: Activity[], fetched: Activity[]) {
+  const fetchedKeys = new Set(fetched.map(activityKey));
+  const retained = previous.filter((item) => !fetchedKeys.has(activityKey(item)));
+  const merged = [...fetched, ...retained];
+  merged.sort((a, b) => {
+    const blockA = a.block === "—" ? -1n : BigInt(a.block);
+    const blockB = b.block === "—" ? -1n : BigInt(b.block);
+    return blockB > blockA ? 1 : blockB < blockA ? -1 : 0;
+  });
+  return merged.slice(0, 8);
+}
+
+function mergeUserBonds(previous: UserBond[], fetched: UserBond[]) {
+  const fetchedById = new Map(fetched.map((bond) => [bond.id.toLowerCase(), bond]));
+  const merged = fetched.map((bond) => {
+    const prior = previous.find((item) => item.id.toLowerCase() === bond.id.toLowerCase());
+    // Keep a receipt-reconciled settlement result if the RPC has not indexed it yet.
+    return prior?.settlement && !bond.settlement ? { ...bond, settlement: prior.settlement } : bond;
+  });
+  previous.forEach((bond) => {
+    if (!fetchedById.has(bond.id.toLowerCase())) merged.push(bond);
+  });
+  merged.sort((a, b) => (a.openBlock > b.openBlock ? -1 : a.openBlock < b.openBlock ? 1 : 0));
+  return merged;
+}
+
 function formatToken(value: unknown, decimals = 18, digits = 8) {
   if (typeof value !== "bigint") return "—";
   const formatted = formatUnits(value, decimals);
@@ -551,9 +581,9 @@ export function Dashboard() {
         if (!cancelled) {
           // Do not blank a confirmed history during a temporary RPC/indexer lag. A wallet
           // change still resets the filter, while a successful non-empty response replaces it.
-          setActivity((previous) => nextActivity.length > 0 || previous.length === 0 ? nextActivity.slice(0, 8) : previous);
+          setActivity((previous) => mergeActivity(previous, nextActivity));
           if (walletChanged) setUserBonds(nextUserBonds);
-          else setUserBonds((previous) => nextUserBonds.length > 0 || previous.length === 0 ? nextUserBonds : previous);
+          else setUserBonds((previous) => mergeUserBonds(previous, nextUserBonds));
           setActivityError(false);
         }
       } catch {
