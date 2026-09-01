@@ -52,18 +52,29 @@ function tupleItem(value: unknown, index: number, name: string): unknown {
   return undefined;
 }
 
+/** viem may return small Solidity integers as numbers and wider values as bigint. */
+function asBigInt(value: unknown): bigint | undefined {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
+  return undefined;
+}
+
 function normalizeConfig(value: unknown): ConfigTuple | undefined {
   const result = [
-    tupleItem(value, 0, "minBondedAmount0"),
-    tupleItem(value, 1, "minBondedAmount1"),
-    tupleItem(value, 2, "bondBps"),
+    asBigInt(tupleItem(value, 0, "minBondedAmount0")),
+    asBigInt(tupleItem(value, 1, "minBondedAmount1")),
+    asBigInt(tupleItem(value, 2, "bondBps")),
   ];
-  return result.every((item): item is bigint => typeof item === "bigint") ? (result as unknown as ConfigTuple) : undefined;
+  return result.every((item): item is bigint => item !== undefined) ? (result as unknown as ConfigTuple) : undefined;
 }
 
 function normalizeAccumulator(value: unknown): AccumulatorTuple | undefined {
-  const result = [tupleItem(value, 0, "lastTick"), tupleItem(value, 1, "lastUpdate"), tupleItem(value, 2, "tickCumulative")];
-  return result.every((item): item is bigint => typeof item === "bigint") ? (result as unknown as AccumulatorTuple) : undefined;
+  const result = [
+    asBigInt(tupleItem(value, 0, "lastTick")),
+    asBigInt(tupleItem(value, 1, "lastUpdate")),
+    asBigInt(tupleItem(value, 2, "tickCumulative")),
+  ];
+  return result.every((item): item is bigint => item !== undefined) ? (result as unknown as AccumulatorTuple) : undefined;
 }
 
 function normalizeBounds(value: unknown): BoundsTuple | undefined {
@@ -74,15 +85,15 @@ function normalizeBounds(value: unknown): BoundsTuple | undefined {
 function normalizeBond(value: unknown): BondTuple | undefined {
   const result = [
     tupleItem(value, 0, "owner"),
-    tupleItem(value, 1, "openBlock"),
-    tupleItem(value, 2, "tickBefore"),
-    tupleItem(value, 3, "tickAfter"),
+    asBigInt(tupleItem(value, 1, "openBlock")),
+    asBigInt(tupleItem(value, 2, "tickBefore")),
+    asBigInt(tupleItem(value, 3, "tickAfter")),
     tupleItem(value, 4, "currency"),
-    tupleItem(value, 5, "cumulativeAtOpen"),
-    tupleItem(value, 6, "amount"),
+    asBigInt(tupleItem(value, 5, "cumulativeAtOpen")),
+    asBigInt(tupleItem(value, 6, "amount")),
     tupleItem(value, 7, "next"),
   ];
-  const valid = typeof result[0] === "string" && typeof result[1] === "bigint" && typeof result[2] === "bigint" && typeof result[3] === "bigint" && typeof result[4] === "string" && typeof result[5] === "bigint" && typeof result[6] === "bigint" && typeof result[7] === "string";
+  const valid = typeof result[0] === "string" && result[1] !== undefined && result[2] !== undefined && result[3] !== undefined && typeof result[4] === "string" && result[5] !== undefined && result[6] !== undefined && typeof result[7] === "string";
   return valid ? (result as unknown as BondTuple) : undefined;
 }
 
