@@ -433,6 +433,28 @@ economic risk.
 
 ---
 
+## Frontend dashboard
+
+The first frontend phase lives in [`frontend/`](./frontend). It is a Next.js +
+TypeScript read-only dashboard for the deployed Sepolia hook. It shows pool identity,
+per-pool bond configuration, queue state, accumulator data, insurance pots, and recent
+protocol events. The left rail includes a collapsible ChainGPT visual reference:
+[chaingpt.org](https://www.chaingpt.org/).
+
+Run it with:
+
+```bash
+cd frontend
+cp .env.example .env.local
+npm install
+npm run dev
+```
+
+The browser calls the relative `/api/rpc` route; keep the actual RPC URL in the
+server-only `SEPOLIA_RPC_URL` value in `.env.local`.
+
+---
+
 ## Getting started
 
 **Clone with submodules.** Dependencies are pinned git submodules — without this

@@ -1,4 +1,4 @@
-.PHONY: install build test fmt fmt-check snapshot coverage slither ci clean
+.PHONY: install build test fmt fmt-check snapshot coverage slither ci clean frontend-install frontend-build frontend-dev
 
 install:
 	forge install Uniswap/v4-periphery
@@ -32,3 +32,12 @@ ci: fmt-check build test coverage slither
 
 clean:
 	forge clean
+
+frontend-install:
+	cd frontend && npm install
+
+frontend-build:
+	cd frontend && npm run build
+
+frontend-dev:
+	cd frontend && npm run dev
