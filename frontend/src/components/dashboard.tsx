@@ -23,26 +23,21 @@ const eventTopics = [
   keccak256(toBytes("PotDonated(bytes32,address,uint256,address)")),
 ] as const;
 
+type Theme = "light" | "dark";
+type Screen = "overview" | "swap" | "bonds" | "pools" | "activity" | "learn";
+type ActivityKind = "OPENED" | "SETTLED" | "CONFIG" | "DONATED";
+
 type Activity = {
-  kind: "OPENED" | "SETTLED" | "CONFIG" | "DONATED";
+  kind: ActivityKind;
   block: string;
   hash?: string;
   detail: string;
 };
 
-type BondTuple = readonly [
-  Address,
-  bigint,
-  bigint,
-  bigint,
-  Address,
-  bigint,
-  bigint,
-  Hex,
-];
-
 type ConfigTuple = readonly [bigint, bigint, bigint];
 type AccumulatorTuple = readonly [bigint, bigint, bigint];
+type BoundsTuple = readonly [Hex, Hex];
+type BondTuple = readonly [Address, bigint, bigint, bigint, Address, bigint, bigint, Hex];
 
 function formatToken(value: unknown, decimals = 18, digits = 5) {
   if (typeof value !== "bigint") return "—";
@@ -63,27 +58,35 @@ function formatAddress(value?: string) {
 }
 
 function formatBlock(value: unknown) {
-  if (typeof value !== "bigint") return "—";
-  return value.toString();
+  return typeof value === "bigint" ? value.toString() : "—";
 }
 
-function relativeBlock(openBlock: bigint | undefined, currentBlock?: bigint) {
-  if (openBlock === undefined || currentBlock === undefined || currentBlock < openBlock) return "—";
-  return `${formatInteger(currentBlock - openBlock)} blocks ago`;
+function StatusDot({ live = false }: { live?: boolean }) {
+  return <span className={`status-dot${live ? " status-dot-live" : ""}`} aria-hidden="true" />;
 }
 
-function Metric({ label, value, detail, accent = false }: { label: string; value: string; detail: string; accent?: boolean }) {
+function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: "neutral" | "orange" | "green" | "muted" }) {
+  return <span className={`badge badge-${tone}`}>{children}</span>;
+}
+
+function MetricCard({ label, value, detail, icon, accent = false }: { label: string; value: string; detail: string; icon: string; accent?: boolean }) {
   return (
-    <article className={`metric-card${accent ? " metric-card-accent" : ""}`}>
-      <div className="metric-label">{label}</div>
-      <div className="metric-value">{value}</div>
-      <div className="metric-detail">{detail}</div>
+    <article className={`metric-card ${accent ? "metric-card-accent" : ""}`}>
+      <div className="metric-card-top"><span>{label}</span><span className="metric-icon">{icon}</span></div>
+      <strong>{value}</strong>
+      <span className="metric-detail">{detail}</span>
     </article>
   );
 }
 
-function StatusDot({ live }: { live: boolean }) {
-  return <span className={`status-dot${live ? " status-dot-live" : ""}`} aria-hidden="true" />;
+function SectionHeading({ eyebrow, title, copy }: { eyebrow: string; title: string; copy?: string }) {
+  return (
+    <div className="section-heading">
+      <span className="eyebrow">{eyebrow}</span>
+      <h2>{title}</h2>
+      {copy && <p>{copy}</p>}
+    </div>
+  );
 }
 
 export function Dashboard() {
@@ -92,8 +95,10 @@ export function Dashboard() {
   const { disconnect } = useDisconnect();
   const { switchChain } = useSwitchChain();
   const { data: blockNumber } = useBlockNumber({ watch: true });
-  const [referenceOpen, setReferenceOpen] = useState(false);
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [screen, setScreen] = useState<Screen>("overview");
+  const [theme, setTheme] = useState<Theme>("light");
+  const [swapMode, setSwapMode] = useState<"exactIn" | "exactOut">("exactIn");
+  const [swapAmount, setSwapAmount] = useState("1,000");
   const [activity, setActivity] = useState<Activity[]>([]);
   const [activityError, setActivityError] = useState(false);
 
@@ -170,17 +175,14 @@ export function Dashboard() {
     query: { refetchInterval: 15_000 },
   });
 
-  const bounds = boundsRead.data as readonly [Hex, Hex] | undefined;
+  const bounds = boundsRead.data as BoundsTuple | undefined;
   const headId = bounds?.[0];
   const headBondRead = useReadContract({
     address: deployment.hook,
     abi: bondMeBroAbi,
     functionName: "getBond",
     args: [deployment.poolId, headId ?? ZERO_HASH],
-    query: {
-      enabled: Boolean(headId && headId !== ZERO_HASH),
-      refetchInterval: 8_000,
-    },
+    query: { enabled: Boolean(headId && headId !== ZERO_HASH), refetchInterval: 8_000 },
   });
 
   const config = configRead.data as ConfigTuple | undefined;
@@ -192,71 +194,72 @@ export function Dashboard() {
   const observationBlocks = typeof observationValue === "bigint" ? observationValue : 50n;
   const settlerFeeBps = typeof settlerFeeValue === "bigint" ? settlerFeeValue : 500n;
   const clampTicks = typeof clampValue === "bigint" ? clampValue : 506n;
+  const queueLength = typeof queueRead.data === "bigint" ? queueRead.data : 0n;
+  const pot0 = typeof pot0Read.data === "bigint" ? pot0Read.data : 0n;
+  const pot1 = typeof pot1Read.data === "bigint" ? pot1Read.data : 0n;
+  const totalPot = pot0 + pot1;
   const poolConnected = managerRead.data?.toLowerCase() === deployment.poolManager.toLowerCase();
   const rpcOnline = !managerRead.isError && Boolean(managerRead.data);
   const networkCorrect = chainId === sepolia.id;
   const bondingEnabled = Boolean(config && config[0] > 0n && config[1] > 0n && config[2] > 0n);
   const maturityBlock = headBond ? headBond[1] + observationBlocks : undefined;
+  const headCurrency = headBond && headBond[4].toLowerCase() === deployment.currency0.toLowerCase() ? "ETH" : "WETH";
   const maturityProgress = useMemo(() => {
-    if (!headBond || blockNumber === undefined) return 0;
-    const start = headBond[1];
-    const end = maturityBlock ?? start;
-    if (end <= start || blockNumber >= end) return 100;
-    if (blockNumber <= start) return 0;
-    return Math.round((Number(blockNumber - start) / Number(end - start)) * 100);
+    if (!headBond || blockNumber === undefined || maturityBlock === undefined) return 0;
+    if (blockNumber >= maturityBlock) return 100;
+    if (blockNumber <= headBond[1]) return 0;
+    return Math.round((Number(blockNumber - headBond[1]) / Number(maturityBlock - headBond[1])) * 100);
   }, [blockNumber, headBond, maturityBlock]);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("bondmebro-theme") as Theme | null;
+    if (saved === "light" || saved === "dark") setTheme(saved);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("bondmebro-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     let cancelled = false;
     async function loadActivity() {
       if (!managerRead.data) return;
       try {
-        const rpcResponse = await fetch("/api/rpc", {
+        const blockResponse = await fetch("/api/rpc", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: Date.now(),
-            method: "eth_blockNumber",
-            params: [],
-          }),
+          body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "eth_blockNumber", params: [] }),
         });
-        if (!rpcResponse.ok) throw new Error("RPC unavailable");
-        const blockPayload = (await rpcResponse.json()) as { result?: string };
+        if (!blockResponse.ok) throw new Error("RPC unavailable");
+        const blockPayload = (await blockResponse.json()) as { result?: string };
         if (!blockPayload.result) throw new Error("No block number");
         const latest = BigInt(blockPayload.result);
         const fromBlock = latest > 5_000n ? latest - 5_000n : 0n;
-        const eventRequests = eventTopics.map((topic) =>
-          fetch("/api/rpc", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: Date.now() + Math.random(),
-              method: "eth_getLogs",
-              params: [
-                {
-                  address: deployment.hook,
-                  topics: [topic],
-                  fromBlock: `0x${fromBlock.toString(16)}`,
-                  toBlock: `0x${latest.toString(16)}`,
-                },
-              ],
-            }),
-          }).then((response) => response.json()),
+        const responses = await Promise.all(
+          eventTopics.map((topic, index) =>
+            fetch("/api/rpc", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: Date.now() + index,
+                method: "eth_getLogs",
+                params: [{ address: deployment.hook, topics: [topic], fromBlock: `0x${fromBlock.toString(16)}`, toBlock: `0x${latest.toString(16)}` }],
+              }),
+            }).then((response) => response.json()),
+          ),
         );
-        const responses = await Promise.all(eventRequests);
         const nextActivity: Activity[] = [];
+        const kinds: ActivityKind[] = ["OPENED", "SETTLED", "CONFIG", "DONATED"];
+        const details = [
+          "Bond opened and added to the FIFO queue",
+          "Bond settled against the pool-local TWA",
+          "Pool custody thresholds updated",
+          "Insurance pot donated to in-range LPs",
+        ];
         responses.forEach((response, index) => {
           const logs = Array.isArray(response.result) ? response.result : [];
           logs.slice(-6).forEach((log: { blockNumber?: string; transactionHash?: string }) => {
-            const kinds: Activity["kind"][] = ["OPENED", "SETTLED", "CONFIG", "DONATED"];
-            const details = [
-              "Bond opened and added to the FIFO queue",
-              "Bond settled against the pool-local TWA",
-              "Pool custody thresholds updated",
-              "Insurance pot donated to in-range LPs",
-            ];
             nextActivity.push({
               kind: kinds[index],
               block: log.blockNumber ? BigInt(log.blockNumber).toString() : "—",
@@ -282,208 +285,159 @@ export function Dashboard() {
     };
   }, [managerRead.data]);
 
+  function goTo(next: Screen) {
+    setScreen(next);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
   function connectWallet() {
     const connector = connectors[0];
     if (connector) connect({ connector });
   }
 
+  const navItems: { id: Screen; label: string; icon: string }[] = [
+    { id: "overview", label: "Overview", icon: "⌂" },
+    { id: "swap", label: "Swap", icon: "↕" },
+    { id: "bonds", label: "My bonds", icon: "◈" },
+    { id: "pools", label: "Pools", icon: "◫" },
+    { id: "activity", label: "Activity", icon: "≋" },
+    { id: "learn", label: "Learn", icon: "?" },
+  ];
+
   return (
-    <div className="app-shell">
-      <aside className={`sidebar${mobileNavOpen ? " sidebar-open" : ""}`}>
-        <div className="brand-lockup">
-          <div className="brand-mark">B</div>
-          <div>
-            <div className="brand-name">BOND<span>ME</span>BRO</div>
-            <div className="brand-caption">LP INSURANCE PROTOCOL</div>
-          </div>
+    <div className={`app-shell theme-${theme}`}>
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <div className="brand-symbol">B</div>
+          <div><div className="brand-name">BondMeBro</div><div className="brand-subtitle">ACCOUNTABLE LIQUIDITY</div></div>
         </div>
 
-        <div className="sidebar-network">
-          <StatusDot live={rpcOnline} />
-          <span>{deployment.networkName.toUpperCase()}</span>
-          <span className="network-id">#{deployment.chainId}</span>
-        </div>
-
-        <nav className="side-nav" aria-label="Dashboard navigation">
-          <a className="side-nav-item side-nav-active" href="#overview" onClick={() => setMobileNavOpen(false)}>
-            <span className="nav-number">01</span>
-            <span>Overview</span>
-            <span className="nav-arrow">↗</span>
-          </a>
-          <a className="side-nav-item" href="#queue" onClick={() => setMobileNavOpen(false)}>
-            <span className="nav-number">02</span>
-            <span>Bond queue</span>
-          </a>
-          <a className="side-nav-item" href="#insurance" onClick={() => setMobileNavOpen(false)}>
-            <span className="nav-number">03</span>
-            <span>Insurance pot</span>
-          </a>
-          <a className="side-nav-item" href="#activity" onClick={() => setMobileNavOpen(false)}>
-            <span className="nav-number">04</span>
-            <span>Activity</span>
-          </a>
+        <div className="sidebar-section-label">APPLICATION</div>
+        <nav className="sidebar-nav" aria-label="Application navigation">
+          {navItems.map((item) => (
+            <button key={item.id} className={`sidebar-nav-item ${screen === item.id ? "sidebar-nav-active" : ""}`} onClick={() => goTo(item.id)} type="button">
+              <span className="nav-icon">{item.icon}</span><span>{item.label}</span>{screen === item.id && <span className="nav-active-mark" />}
+            </button>
+          ))}
         </nav>
 
         <div className="sidebar-spacer" />
+        <div className="sidebar-section-label">NETWORK</div>
+        <div className="network-card"><StatusDot live={rpcOnline} /><div><strong>Sepolia</strong><span>Chain {deployment.chainId}</span></div><span className="network-check">{rpcOnline ? "✓" : "!"}</span></div>
 
-        <div className="reference-card">
-          <div className="reference-kicker">STYLE REFERENCE</div>
-          <div className="reference-title">NEON MODE</div>
-          <div className="reference-copy">High-contrast signal design for focused protocol monitoring.</div>
-          <button className="reference-toggle" type="button" onClick={() => setReferenceOpen((current) => !current)}>
-            {referenceOpen ? "Hide sample" : "Show sample"}
-            <span>↗</span>
-          </button>
-          {referenceOpen && (
-            <div className="reference-embed">
-              <div className="reference-sample" aria-label="Neon style sample">
-                <div className="reference-sample-top"><span>LIVE / SIGNAL</span><span>01</span></div>
-                <div className="reference-sample-title">DATA<br /><em>IN MOTION.</em></div>
-                <div className="reference-sample-line"><span /><span /><span /><span /></div>
-              </div>
-            </div>
-          )}
+        <div className="sidebar-tools">
+          <button type="button" onClick={() => setTheme(theme === "light" ? "dark" : "light")}><span>{theme === "light" ? "☼" : "☾"}</span>{theme === "light" ? "Light mode" : "Dark mode"}<b>{theme === "light" ? "ON" : "ON"}</b></button>
+          <a href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer"><span>↗</span>Contract explorer</a>
         </div>
-
-        <div className="sidebar-footer">
-          <span>UHI10 / SEPOLIA</span>
-          <a href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">EXPLORER ↗</a>
-        </div>
+        <div className="sidebar-foot"><span>TESTNET BUILD</span><span>01 / 05</span></div>
       </aside>
 
-      <section className="content-area">
+      <div className="main-column">
         <header className="topbar">
-          <button className="mobile-menu" type="button" aria-label="Toggle navigation" onClick={() => setMobileNavOpen((open) => !open)}>
-            <span />
-            <span />
-          </button>
-          <div className="breadcrumb"><span>APP</span><span>/</span><strong>POOL MONITOR</strong></div>
+          <div className="mobile-brand"><div className="brand-symbol">B</div><span>BondMeBro</span></div>
+          <div className="topbar-location"><span>APP</span><i>/</i><strong>{navItems.find((item) => item.id === screen)?.label}</strong></div>
           <div className="topbar-actions">
-            <div className={`connection-state${rpcOnline ? "" : " connection-state-offline"}`}>
-              <StatusDot live={rpcOnline} />
-              {rpcOnline ? "LIVE RPC" : "RPC OFFLINE"}
-            </div>
+            <div className={`rpc-chip ${rpcOnline ? "" : "rpc-chip-offline"}`}><StatusDot live={rpcOnline} />{rpcOnline ? "Live data" : "RPC offline"}</div>
             {!isConnected ? (
-              <button className="connect-button" type="button" onClick={connectWallet} disabled={isConnecting}>
-                {isConnecting ? "CONNECTING…" : "CONNECT WALLET"}
-              </button>
+              <button className="wallet-button primary-button" type="button" onClick={connectWallet} disabled={isConnecting}>{isConnecting ? "Connecting…" : "Connect wallet"}</button>
             ) : !networkCorrect ? (
-              <button className="connect-button" type="button" onClick={() => switchChain({ chainId: sepolia.id })}>
-                SWITCH TO SEPOLIA
-              </button>
+              <button className="wallet-button primary-button" type="button" onClick={() => switchChain({ chainId: sepolia.id })}>Switch to Sepolia</button>
             ) : (
-              <button className="wallet-button" type="button" onClick={() => disconnect()} title="Disconnect wallet">
-                <StatusDot live /> {formatAddress(address)}
-              </button>
+              <button className="wallet-button" type="button" onClick={() => disconnect()}><StatusDot live />{formatAddress(address)}</button>
             )}
           </div>
         </header>
 
-        <main>
-          <section className="hero-section" id="overview">
-            <div className="hero-copy">
-              <div className="section-index">01 <span>/</span> SYSTEM VIEW</div>
-              <h1>Price impact.<br /><em>Accounted for.</em></h1>
-              <p className="hero-lede">BondMeBro turns persistent swap impact into outcome-linked insurance for liquidity providers.</p>
-              <div className="hero-links">
-                <a href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">VIEW HOOK <span>↗</span></a>
-                <span className="hero-divider" />
-                <span className="hero-note">NO KEEPER REQUIRED</span>
-              </div>
-            </div>
-            <div className="hero-console" aria-label="Protocol status visualization">
-              <div className="console-topline"><span>ACCUMULATOR / TICK</span><span>{accumulator ? "SYNCED" : "WAITING"}</span></div>
-              <div className="console-grid-lines" />
-              <div className="console-tick">{accumulator ? accumulator[0].toString() : "000000"}</div>
-              <div className="console-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div>
-              <div className="console-bottomline"><span>LIVE POOL STATE</span><span>BLOCK {blockNumber?.toString() ?? "—"}</span></div>
-            </div>
-          </section>
-
-          <section className="metrics-grid" aria-label="Protocol metrics">
-            <Metric label="QUEUE LENGTH" value={formatInteger(queueRead.data)} detail="matured bonds settle FIFO" accent={Boolean(queueRead.data && queueRead.data > 0n)} />
-            <Metric label="CURRENCY 0 POT" value={`${formatToken(pot0Read.data)} ETH`} detail="native insurance balance" />
-            <Metric label="CURRENCY 1 POT" value={`${formatToken(pot1Read.data)} WETH`} detail="ERC-20 insurance balance" />
-            <Metric label="BOND RATE" value={config ? `${config[2].toString()} BPS` : "—"} detail={bondingEnabled ? "pool bonding enabled" : "pool bonding disabled"} accent={bondingEnabled} />
-          </section>
-
-          <section className="dashboard-grid">
-            <article className="panel pool-panel">
-              <div className="panel-heading">
-                <div><div className="panel-index">A / 01</div><h2>Pool identity</h2></div>
-                <span className={`tag ${poolConnected ? "tag-live" : ""}`}><StatusDot live={poolConnected} /> {poolConnected ? "BOUND" : "CHECKING"}</span>
-              </div>
-              <div className="identity-list">
-                <div className="identity-row"><span>HOOK</span><a href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">{formatAddress(deployment.hook)} ↗</a></div>
-                <div className="identity-row"><span>POOL MANAGER</span><a href={explorerAddress(deployment.poolManager)} target="_blank" rel="noreferrer">{formatAddress(deployment.poolManager)} ↗</a></div>
-                <div className="identity-row"><span>POOL ID</span><span className="mono-value">{shortenHash(deployment.poolId, 8, 6)}</span></div>
-                <div className="identity-row"><span>PAIR</span><span>ETH <b className="pair-slash">/</b> WETH</span></div>
-              </div>
-              <div className="pool-footer"><span>FEE {deployment.poolFee / 10000}%</span><span>SPACING {deployment.tickSpacing}</span><span>CHAIN {deployment.chainId}</span></div>
-            </article>
-
-            <article className="panel config-panel">
-              <div className="panel-heading">
-                <div><div className="panel-index">B / 02</div><h2>Bond controls</h2></div>
-                <span className={`tag ${bondingEnabled ? "tag-accent" : ""}`}>{bondingEnabled ? "ACTIVE" : "PAUSED"}</span>
-              </div>
-              <div className="control-rows">
-                <div className="control-row"><span>MIN INPUT / CURRENCY 0</span><strong>{formatToken(config?.[0])}</strong></div>
-                <div className="control-row"><span>MIN INPUT / CURRENCY 1</span><strong>{formatToken(config?.[1])}</strong></div>
-                <div className="control-row"><span>OBSERVATION WINDOW</span><strong>{observationBlocks.toString()} <small>BLOCKS</small></strong></div>
-                <div className="control-row"><span>SETTLER REWARD</span><strong>{settlerFeeBps.toString()} <small>BPS</small></strong></div>
-              </div>
-              <div className="owner-line"><span>CONFIG OWNER</span><a href={ownerRead.data ? explorerAddress(ownerRead.data) : "#"} target="_blank" rel="noreferrer">{formatAddress(ownerRead.data)} ↗</a></div>
-            </article>
-          </section>
-
-          <section className="dashboard-grid second-row">
-            <article className="panel queue-panel" id="queue">
-              <div className="panel-heading">
-                <div><div className="panel-index">C / 03</div><h2>Bond queue</h2></div>
-                <span className="tag">FIFO</span>
-              </div>
-              {headBond ? (
-                <div className="bond-detail">
-                  <div className="bond-id-line"><span>HEAD BOND</span><span className="mono-value">{shortenHash(headId ?? "", 10, 6)}</span></div>
-                  <div className="bond-amount">{formatToken(headBond[6])} <small>{headBond[4].toLowerCase() === deployment.currency0.toLowerCase() ? "ETH" : "WETH"}</small></div>
-                  <div className="bond-meta"><span>OWNER <b>{formatAddress(headBond[0])}</b></span><span>OPENED <b>{formatBlock(headBond[1])}</b></span></div>
-                  <div className="maturity-track"><div className="maturity-bar" style={{ width: `${maturityProgress}%` }} /></div>
-                  <div className="maturity-label"><span>{maturityProgress >= 100 ? "MATURED / READY TO SETTLE" : `MATURITY IN BLOCK ${formatBlock(maturityBlock)}`}</span><span>{relativeBlock(headBond[1], blockNumber)}</span></div>
+        <main className="page-content">
+          {screen === "overview" && (
+            <>
+              <section className="welcome-grid">
+                <div className="welcome-copy">
+                  <span className="eyebrow">GOOD AFTERNOON / {deployment.networkName.toUpperCase()}</span>
+                  <h1>Trade now.<br /><em>Prove the impact later.</em></h1>
+                  <p>BondMeBro temporarily holds a small bond from qualifying swaps. At maturity, the outcome is measured and the bond is refunded or retained.</p>
+                  <div className="welcome-actions"><button type="button" className="primary-button large-button" onClick={() => goTo("swap")}>Launch swap <span>↗</span></button><button type="button" className="text-button" onClick={() => goTo("learn")}>How it works <span>→</span></button></div>
                 </div>
-              ) : (
-                <div className="empty-state"><div className="empty-glyph">∅</div><strong>QUEUE CLEAR</strong><span>No open bonds are waiting for settlement.</span></div>
-              )}
-              <div className="panel-footnote"><span>HEAD {shortenHash(bounds?.[0] ?? ZERO_HASH, 8, 4)}</span><span>TAIL {shortenHash(bounds?.[1] ?? ZERO_HASH, 8, 4)}</span></div>
-            </article>
+                <div className="hero-visual">
+                  <div className="hero-orb"><span>01</span><div className="orb-ring orb-ring-one" /><div className="orb-ring orb-ring-two" /><div className="orb-dot" /></div>
+                  <div className="floating-card floating-swap"><div className="floating-card-label">SWAP PREVIEW <span>↗</span></div><div className="floating-token-row"><div className="token-bubble token-orange">$</div><div><strong>1,000 USDC</strong><span>Exact input</span></div><b>→</b></div><div className="floating-result"><span>EST. BOND</span><strong>1.00 USDC</strong></div></div>
+                  <div className="floating-card floating-status"><div className="floating-card-label">BOND STATUS</div><div className="status-line"><StatusDot live /><strong>Active</strong><span>matures after checkpoint</span></div></div>
+                </div>
+              </section>
 
-            <article className="panel accumulator-panel">
-              <div className="panel-heading">
-                <div><div className="panel-index">D / 04</div><h2>Accumulator</h2></div>
-                <span className="tag tag-live"><StatusDot live={Boolean(accumulator)} /> {accumulator ? "TRACKING" : "WAITING"}</span>
-              </div>
-              <div className="accumulator-visual"><div className="acc-line acc-line-one" /><div className="acc-line acc-line-two" /><div className="acc-pulse" /></div>
-              <div className="accumulator-stats"><div><span>LAST TICK</span><strong>{accumulator?.[0]?.toString() ?? "—"}</strong></div><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 4) : "—"}</strong></div></div>
-              <div className="panel-footnote"><span>ONCE / BLOCK UPDATE</span><span>CLAMP {clampTicks.toString()} TICKS</span></div>
-            </article>
-          </section>
+              <section className="metric-grid">
+                <MetricCard label="ACTIVE BONDED VALUE" value={headBond ? `${formatToken(headBond[6])} ${headCurrency}` : "0.00 ETH"} detail={headBond ? "current queue head" : "no active bonds"} icon="◈" accent />
+                <MetricCard label="OPEN BONDS" value={formatInteger(queueLength)} detail="FIFO queue length" icon="◌" />
+                <MetricCard label="INSURANCE POT" value={`${formatToken(totalPot)} ETH`} detail="ETH + WETH / testnet" icon="♢" />
+                <MetricCard label="POOL STATUS" value={poolConnected ? "BOUND" : "CHECKING"} detail={bondingEnabled ? "bonding enabled" : "configuration pending"} icon="⌁" />
+              </section>
 
-          <section className="insurance-section" id="insurance">
-            <div className="insurance-heading"><div className="section-index">02 <span>/</span> LP COVERAGE</div><h2>Insurance pot <em>in motion.</em></h2><p>Slashed bonds accumulate by currency, then route to in-range liquidity providers through permissionless donation.</p></div>
-            <div className="pot-cards">
-              <div className="pot-card"><div className="pot-card-top"><span>01 / NATIVE</span><span>ETH</span></div><strong>{formatToken(pot0Read.data)} <small>ETH</small></strong><div className="pot-line"><span className="pot-line-fill" style={{ width: pot0Read.data && pot0Read.data > 0n ? "74%" : "3%" }} /></div><span className="pot-note">{pot0Read.data && pot0Read.data > 0n ? "READY FOR DONATION" : "NO SLASHED VALUE"}</span></div>
-              <div className="pot-card pot-card-highlight"><div className="pot-card-top"><span>02 / ERC-20</span><span>WETH</span></div><strong>{formatToken(pot1Read.data)} <small>WETH</small></strong><div className="pot-line"><span className="pot-line-fill" style={{ width: pot1Read.data && pot1Read.data > 0n ? "58%" : "3%" }} /></div><span className="pot-note">{pot1Read.data && pot1Read.data > 0n ? "READY FOR DONATION" : "NO SLASHED VALUE"}</span></div>
-            </div>
-          </section>
+              <section className="content-grid overview-grid">
+                <article className="neo-card active-bonds-card">
+                  <div className="card-heading"><div><span className="eyebrow">01 / PORTFOLIO</span><h2>Active bonds</h2></div><button className="card-link" type="button" onClick={() => goTo("bonds")}>View all <span>→</span></button></div>
+                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div className="pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card"><div className="empty-icon">◈</div><strong>No active bonds</strong><span>Qualifying swaps will appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
+                  <div className="card-footer"><span>{queueLength > 0n ? `${formatInteger(queueLength)} bond${queueLength === 1n ? "" : "s"} in queue` : "Queue is clear"}</span><span className="footer-status"><StatusDot live={rpcOnline} /> synced</span></div>
+                </article>
+                <article className="glass-card portfolio-card">
+                  <div className="card-heading"><div><span className="eyebrow">02 / PROTOCOL</span><h2>Portfolio summary</h2></div><Badge tone="green"><StatusDot live /> TESTNET</Badge></div>
+                  <div className="portfolio-total"><span>INSURANCE POT / TOTAL</span><strong>{formatToken(totalPot)} <small>ETH</small></strong></div>
+                  <div className="stacked-bar"><span style={{ width: totalPot > 0n ? "58%" : "4%" }} /><span style={{ width: pot0 > 0n ? "24%" : "3%" }} /></div>
+                  <div className="legend-row"><span><i className="dot-orange" />WETH pot <b>{formatToken(pot1)} WETH</b></span><span><i className="dot-warm" />ETH pot <b>{formatToken(pot0)} ETH</b></span></div>
+                  <div className="summary-list"><div><span>Bond rate</span><strong>{config?.[2]?.toString() ?? "—"} bps</strong></div><div><span>Observation</span><strong>{observationBlocks.toString()} blocks</strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} bps</strong></div></div>
+                  <button type="button" className="outline-button full-button" onClick={() => goTo("pools")}>View pool analytics <span>→</span></button>
+                </article>
+              </section>
 
-          <section className="activity-section" id="activity">
-            <div className="activity-header"><div><div className="section-index">03 <span>/</span> EVENT STREAM</div><h2>Protocol activity</h2></div><span className="stream-status"><StatusDot live={!activityError} /> LAST 5,000 BLOCKS</span></div>
-            {activityError ? <div className="activity-empty">RPC event history is unavailable. Core pool reads are still shown above.</div> : activity.length === 0 ? <div className="activity-empty">No BondMeBro events found in the recent block window.</div> : <div className="activity-list">{activity.map((item, index) => <a className="activity-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`activity-kind activity-kind-${item.kind.toLowerCase()}`}>{item.kind}</span><span className="activity-detail">{item.detail}</span><span className="activity-block">BLOCK {item.block}</span><span className="activity-hash">{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div>}
-          </section>
+              <section className="process-strip"><div><span className="eyebrow">THE MECHANISM</span><h2>Swap <i>→</i> Bond <i>→</i> Settle</h2></div><p>Temporary collateral makes price impact accountable without an external classifier.</p><button type="button" className="round-arrow" onClick={() => goTo("learn")}>↗</button></section>
+              <ActivityPreview activity={activity} activityError={activityError} onViewAll={() => goTo("activity")} />
+            </>
+          )}
+
+          {screen === "swap" && <SwapScreen isConnected={isConnected} swapMode={swapMode} setSwapMode={setSwapMode} swapAmount={swapAmount} setSwapAmount={setSwapAmount} onConnect={connectWallet} onLearn={() => goTo("learn")} />}
+          {screen === "bonds" && <BondsScreen headBond={headBond} headId={headId} queueLength={queueLength} maturityBlock={maturityBlock} maturityProgress={maturityProgress} currentBlock={blockNumber} headCurrency={headCurrency} onSwap={() => goTo("swap")} />}
+          {screen === "pools" && <PoolsScreen config={config} accumulator={accumulator} clampTicks={clampTicks} observationBlocks={observationBlocks} settlerFeeBps={settlerFeeBps} queueLength={queueLength} pot0={pot0} pot1={pot1} poolConnected={poolConnected} owner={ownerRead.data} />}
+          {screen === "activity" && <ActivityScreen activity={activity} activityError={activityError} />}
+          {screen === "learn" && <LearnScreen onSwap={() => goTo("swap")} />}
         </main>
+        <footer className="page-footer"><span>BondMeBro / outcome-linked LP insurance</span><span>READ-ONLY TESTNET BUILD / SEPOLIA</span></footer>
+      </div>
 
-        <footer className="app-footer"><span>BOND<span>ME</span>BRO / OUTCOME-LINKED LP INSURANCE</span><span>READ-ONLY DASHBOARD / FRONTEND PHASE 01</span></footer>
-      </section>
+      <nav className="mobile-nav" aria-label="Mobile navigation">{navItems.slice(0, 5).map((item) => <button key={item.id} type="button" className={screen === item.id ? "mobile-nav-active" : ""} onClick={() => goTo(item.id)}><span>{item.icon}</span>{item.label}</button>)}</nav>
     </div>
   );
+}
+
+function ActivityPreview({ activity, activityError, onViewAll }: { activity: Activity[]; activityError: boolean; onViewAll: () => void }) {
+  return (
+    <section className="activity-preview"><div className="card-heading"><div><span className="eyebrow">03 / ACTIVITY</span><h2>Recent activity</h2></div><button type="button" className="card-link" onClick={onViewAll}>View activity <span>→</span></button></div>{activityError ? <div className="inline-empty">Event history is unavailable. Core reads remain visible.</div> : activity.length === 0 ? <div className="inline-empty">No protocol events in the recent block window.</div> : <div className="activity-rows">{activity.slice(0, 4).map((item, index) => <a className="activity-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-icon event-${item.kind.toLowerCase()}`}>{item.kind === "OPENED" ? "◈" : item.kind === "SETTLED" ? "✓" : item.kind === "DONATED" ? "♢" : "⌁"}</span><div><strong>{item.detail}</strong><small>Block {item.block}</small></div><span className="activity-row-hash">{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div>}</section>
+  );
+}
+
+function SwapScreen({ isConnected, swapMode, setSwapMode, swapAmount, setSwapAmount, onConnect, onLearn }: { isConnected: boolean; swapMode: "exactIn" | "exactOut"; setSwapMode: (mode: "exactIn" | "exactOut") => void; swapAmount: string; setSwapAmount: (value: string) => void; onConnect: () => void; onLearn: () => void }) {
+  return (
+    <>
+      <section className="screen-intro"><div><span className="eyebrow">01 / TRADE WITH CONTEXT</span><h1>Make a swap.<br /><em>See the bond first.</em></h1></div><p>The bond is temporary collateral carved from qualifying input. It is not an extra fee, and the settlement outcome is decided at the protocol checkpoint.</p></section>
+      <section className="swap-layout"><article className="neo-card swap-card"><div className="swap-card-top"><div className="segmented-control"><button type="button" className={swapMode === "exactIn" ? "segment-active" : ""} onClick={() => setSwapMode("exactIn")}>Exact in</button><button type="button" className={swapMode === "exactOut" ? "segment-active" : ""} onClick={() => setSwapMode("exactOut")}>Exact out</button></div><Badge tone="muted">PREVIEW</Badge></div><div className="swap-field"><div className="field-label"><span>You pay</span><span>Balance —</span></div><div className="amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" /><button type="button" className="token-select"><span className="token-bubble token-orange">$</span>USDC <b>⌄</b></button></div></div><button type="button" className="direction-button" aria-label="Switch swap direction">↕</button><div className="swap-field"><div className="field-label"><span>You receive</span><span>Estimated output</span></div><div className="amount-line"><input aria-label="Estimated output" value="—" readOnly /><button type="button" className="token-select"><span className="token-bubble token-purple">W</span>WETH <b>⌄</b></button></div></div><div className="swap-settings"><span>Slippage <b>0.50%</b></span><span>Pool <b>ETH / WETH</b></span><span>Route <b>Single hop</b></span></div><button type="button" className="primary-button large-button full-button" onClick={isConnected ? onLearn : onConnect}>{isConnected ? "Review swap" : "Connect wallet"} <span>→</span></button><span className="readonly-note">Transaction wiring uses the audited Universal Router path.</span></article><aside className="swap-context"><article className="glass-card bond-preview-card"><div className="card-heading"><div><span className="eyebrow">BOND PREVIEW</span><h2>Accountability, up front.</h2></div><span className="preview-lock">⌁</span></div><div className="preview-amount"><span>ESTIMATED BOND</span><strong>— <small>USDC</small></strong></div><div className="preview-rows"><div><span>Pool input after bond</span><strong>—</strong></div><div><span>Bond rate</span><strong>25 bps</strong></div><div><span>Maturity checkpoint</span><strong>50 blocks</strong></div><div><span>Refund recipient</span><strong>{isConnected ? "Connected wallet" : "Connect wallet"}</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>This is temporary collateral, not a guaranteed refund. Settlement is permissionless and uses the protocol-defined outcome rule.</p></div></article><button type="button" className="learn-link" onClick={onLearn}>Why is there a bond? <span>→</span></button></aside></section>
+    </>
+  );
+}
+
+function BondsScreen({ headBond, headId, queueLength, maturityBlock, maturityProgress, currentBlock, headCurrency, onSwap }: { headBond?: BondTuple; headId?: Hex; queueLength: bigint; maturityBlock?: bigint; maturityProgress: number; currentBlock?: bigint; headCurrency: string; onSwap: () => void }) {
+  return (
+    <><section className="screen-intro"><div><span className="eyebrow">02 / PORTFOLIO</span><h1>My bonds<br /><em>in one view.</em></h1></div><p>Track active and matured collateral. Any account may settle a matured bond; the refund is always sent to its encoded recipient.</p></section><section className="bond-summary-grid"><MetricCard label="OPEN BONDS" value={formatInteger(queueLength)} detail="across selected pool" icon="◈" accent /><MetricCard label="READY TO SETTLE" value={headBond && maturityProgress >= 100 ? "1" : "0"} detail="maturity checkpoint" icon="✓" /><MetricCard label="POOL" value="ETH / WETH" detail="0.30% fee tier" icon="◫" /></section><article className="neo-card detail-card"><div className="card-heading"><div><span className="eyebrow">BOND QUEUE / FIFO HEAD</span><h2>{headBond ? "Active bond" : "No bonds yet"}</h2></div><Badge tone={headBond && maturityProgress >= 100 ? "orange" : "neutral"}>{headBond ? maturityProgress >= 100 ? "READY" : "ACTIVE" : "CLEAR"}</Badge></div>{headBond ? <><div className="detail-hero"><div><span className="eyebrow">BOND AMOUNT</span><strong>{formatToken(headBond[6])} <small>{headCurrency}</small></strong></div><div className="detail-id"><span>BOND ID</span><b>{shortenHash(headId ?? ZERO_HASH, 10, 8)}</b></div></div><div className="timeline"><div className="timeline-line"><span style={{ width: `${maturityProgress}%` }} /></div><div className="timeline-step timeline-done"><i>✓</i><span>Swap submitted</span><b>Block {formatBlock(headBond[1])}</b></div><div className={maturityProgress >= 100 ? "timeline-step timeline-done" : "timeline-step"}><i>{maturityProgress >= 100 ? "✓" : "2"}</i><span>Maturity checkpoint</span><b>Block {formatBlock(maturityBlock)}</b></div><div className="timeline-step"><i>3</i><span>Settlement</span><b>{maturityProgress >= 100 ? "Ready now" : `${maturityProgress}% complete`}</b></div></div><div className="detail-info-grid"><div><span>REFUND RECIPIENT</span><strong>{formatAddress(headBond[0])}</strong></div><div><span>OPENED</span><strong>{formatBlock(headBond[1])}</strong></div><div><span>CURRENT BLOCK</span><strong>{formatBlock(currentBlock)}</strong></div><div><span>IMPACT TICKS</span><strong>{(headBond[3] - headBond[2]).toString()}</strong></div></div><div className="detail-actions"><button type="button" className="primary-button large-button" disabled={maturityProgress < 100}>Settle bond <span>→</span></button><span>Settlement transactions will be enabled in the next frontend phase.</span></div></> : <div className="empty-card large-empty"><div className="empty-icon">◈</div><strong>Your bond portfolio is empty</strong><span>Use the swap preview to see how qualifying input becomes temporary collateral.</span><button type="button" className="primary-button" onClick={onSwap}>Preview a swap →</button></div>}</article></>
+  );
+}
+
+function PoolsScreen({ config, accumulator, clampTicks, observationBlocks, settlerFeeBps, queueLength, pot0, pot1, poolConnected, owner }: { config?: ConfigTuple; accumulator?: AccumulatorTuple; clampTicks: bigint; observationBlocks: bigint; settlerFeeBps: bigint; queueLength: bigint; pot0: bigint; pot1: bigint; poolConnected: boolean; owner?: Address }) {
+  return (
+    <><section className="screen-intro"><div><span className="eyebrow">03 / POOL ANALYTICS</span><h1>Pool health.<br /><em>Clearly stated.</em></h1></div><p>Protocol-level state for the selected Uniswap v4 pool. Values below come from the deployed hook and are labeled as testnet data.</p></section><section className="content-grid pool-analytics-grid"><article className="neo-card analytics-card"><div className="card-heading"><div><span className="eyebrow">SELECTED POOL</span><h2>ETH / WETH</h2></div><Badge tone={poolConnected ? "green" : "neutral"}><StatusDot live={poolConnected} /> {poolConnected ? "HOOK ACTIVE" : "CHECKING"}</Badge></div><div className="pool-identity-large"><div className="large-pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><span>PoolManager bound · Sepolia</span></div></div><div className="pool-stat-grid"><div><span>FEE TIER</span><strong>0.30%</strong></div><div><span>TICK SPACING</span><strong>60</strong></div><div><span>QUEUE</span><strong>{formatInteger(queueLength)}</strong></div><div><span>LAST TICK</span><strong>{accumulator?.[0]?.toString() ?? "—"}</strong></div></div><a className="outline-button full-button button-as-link" href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">View hook contract ↗</a></article><article className="glass-card configuration-card"><div className="card-heading"><div><span className="eyebrow">BOND CONFIGURATION</span><h2>Pool parameters</h2></div><Badge tone={config && config[2] > 0n ? "orange" : "muted"}>{config && config[2] > 0n ? "ENABLED" : "DISABLED"}</Badge></div><div className="config-list"><div><span>Bond BPS</span><strong>{config?.[2]?.toString() ?? "—"} <small>basis points</small></strong></div><div><span>Minimum / currency 0</span><strong>{formatToken(config?.[0])} <small>ETH</small></strong></div><div><span>Minimum / currency 1</span><strong>{formatToken(config?.[1])} <small>WETH</small></strong></div><div><span>Observation window</span><strong>{observationBlocks.toString()} <small>blocks</small></strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} <small>bps of slash</small></strong></div></div><div className="owner-row"><span>OWNER</span><a href={owner ? explorerAddress(owner) : "#"} target="_blank" rel="noreferrer">{formatAddress(owner)} ↗</a></div></article></section><section className="content-grid pool-analytics-grid analytics-lower"><article className="neo-card"><SectionHeading eyebrow="ACCUMULATOR" title="Pool-local reference" copy="The accumulator updates once per block and clamps large movements before they become settlement reference data." /><div className="tick-display"><strong>{accumulator?.[0]?.toString() ?? "—"}</strong><span>LAST RECORDED TICK</span></div><div className="mini-stats"><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CLAMP</span><strong>{clampTicks.toString()} ticks</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 5) : "—"}</strong></div></div></article><article className="glass-card"><SectionHeading eyebrow="LP COVERAGE" title="Insurance balances" /><div className="coverage-balance"><div><span>ETH POT</span><strong>{formatToken(pot0)} ETH</strong></div><div><span>WETH POT</span><strong>{formatToken(pot1)} WETH</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>Donations are permissionless and reward in-range LPs at donation time.</p></div></article></section></>
+  );
+}
+
+function ActivityScreen({ activity, activityError }: { activity: Activity[]; activityError: boolean }) {
+  return <><section className="screen-intro"><div><span className="eyebrow">04 / EVENT STREAM</span><h1>Everything<br /><em>on record.</em></h1></div><p>A unified view of BondMeBro events from the recent block window. Select any transaction to inspect it on the network explorer.</p></section><article className="neo-card full-activity-card"><div className="card-heading"><div><span className="eyebrow">LAST 5,000 BLOCKS</span><h2>Protocol activity</h2></div><Badge tone={activityError ? "neutral" : "green"}><StatusDot live={!activityError} /> {activityError ? "UNAVAILABLE" : "SYNCED"}</Badge></div>{activityError ? <div className="inline-empty">Event history is unavailable. Check the server-side RPC configuration.</div> : activity.length === 0 ? <div className="empty-card large-empty"><div className="empty-icon">≋</div><strong>No events in this window</strong><span>Bond openings, settlements, configuration, and donations will appear here.</span></div> : <div className="activity-table"><div className="activity-table-head"><span>EVENT</span><span>DETAIL</span><span>BLOCK</span><span>TRANSACTION</span></div>{activity.map((item, index) => <a className="activity-table-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-pill event-${item.kind.toLowerCase()}`}>{item.kind}</span><strong>{item.detail}</strong><span>#{item.block}</span><span>{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div>}</article></>;
+}
+
+function LearnScreen({ onSwap }: { onSwap: () => void }) {
+  return <><section className="screen-intro"><div><span className="eyebrow">05 / LEARN</span><h1>Accountable<br /><em>liquidity.</em></h1></div><p>BondMeBro is outcome-linked LP insurance. It does not label intent; it waits for the pool&apos;s price outcome and settles temporary collateral accordingly.</p></section><section className="learn-steps"><article className="learn-step"><span>01</span><div><h2>Swap</h2><p>Submit a normal single-hop swap. If the requested input crosses the pool&apos;s threshold, a bond preview appears before confirmation.</p></div><b>→</b></article><article className="learn-step learn-step-active"><span>02</span><div><h2>Bond</h2><p>A small portion of the input is held as temporary collateral. The trader chooses the maximum bond they accept.</p></div><b>→</b></article><article className="learn-step"><span>03</span><div><h2>Settle</h2><p>At the maturity checkpoint, anyone can settle. Reverted impact refunds the bond; persistent impact supports the LP insurance pot.</p></div><b>✓</b></article></section><section className="learn-bottom"><article className="glass-card learn-example"><span className="eyebrow">SIMPLE EXAMPLE</span><h2>1,000 units in.<br /><em>999 units to the pool.</em></h2><div className="example-list"><div><span>Gross input</span><strong>1,000</strong></div><div><span>Temporary bond</span><strong>1</strong></div><div><span>Effective pool input</span><strong>999</strong></div></div></article><article className="neo-card faq-card"><span className="eyebrow">FAQ / RISK</span><h2>Not a guarantee.<br />A defined checkpoint.</h2><p>Settlement uses the configured maturity rule and pool-local observation data. Market drift and unrelated flow remain economic limitations.</p><button type="button" className="primary-button" onClick={onSwap}>Preview a swap <span>→</span></button></article></section></>;
 }
