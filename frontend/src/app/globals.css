@@ -502,8 +502,8 @@ button {
 
 .eyebrow {
   color: var(--orange-deep);
-  font-size: 8px;
-  font-weight: 500;
+  font-size: 9px;
+  font-weight: 600;
 }
 
 .welcome-copy > p,
@@ -1334,7 +1334,7 @@ h2 {
   display: flex;
   justify-content: space-between;
   color: var(--app-muted);
-  font-size: 8px;
+  font-size: 9px;
 }
 
 .amount-line {
@@ -1407,6 +1407,71 @@ select.token-select {
   line-height: 1.5;
 }
 
+.swap-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 53px;
+  padding: 0 14px;
+  margin-top: 19px;
+  border: 1px solid var(--app-border);
+  border-radius: 14px;
+  background: var(--app-muted-surface);
+}
+
+.swap-status > div {
+  display: grid;
+  gap: 5px;
+}
+
+.swap-status strong {
+  color: var(--app-ink-soft);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.swap-status span:not(.status-dot) {
+  color: var(--app-muted);
+  font-size: 9px;
+}
+
+.swap-status-ready {
+  border-color: rgba(66, 139, 104, 0.2);
+  background: var(--green-soft);
+}
+
+.swap-status-ready strong,
+.swap-status-success strong {
+  color: var(--green);
+}
+
+.swap-status-warning {
+  border-color: rgba(255, 107, 26, 0.19);
+  background: var(--orange-soft);
+}
+
+.swap-status-warning strong {
+  color: var(--orange-deep);
+}
+
+.swap-status-pending {
+  border-color: rgba(255, 107, 26, 0.19);
+  background: var(--orange-soft);
+}
+
+.swap-status-pending strong {
+  color: var(--orange-deep);
+}
+
+.swap-status-error {
+  border-color: rgba(164, 75, 53, 0.2);
+  background: #fff0ed;
+}
+
+.swap-status-error strong {
+  color: #a44b35;
+}
+
 .transaction-message {
   padding: 11px 13px;
   margin-top: 13px;
@@ -1452,7 +1517,7 @@ select.token-select {
   border-top: 1px solid var(--app-border);
   border-bottom: 1px solid var(--app-border);
   color: var(--app-muted);
-  font-size: 7px;
+  font-size: 8px;
   text-transform: none;
 }
 
@@ -1496,7 +1561,7 @@ select.token-select {
 }
 
 .preview-amount > span {
-  font-size: 7px;
+  font-size: 8px;
 }
 
 .preview-amount strong {
@@ -1530,7 +1595,7 @@ select.token-select {
 }
 
 .preview-rows span {
-  font-size: 7px;
+  font-size: 8px;
 }
 
 .preview-rows strong {
