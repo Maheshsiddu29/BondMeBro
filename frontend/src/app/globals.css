@@ -3406,3 +3406,26 @@ h2 {
     gap: 13px;
   }
 }
+
+.rpc-chip {
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--app-border);
+  border-radius: 11px;
+  background: var(--app-surface);
+  cursor: pointer;
+  transition: border-color 180ms ease, color 180ms ease, transform 180ms ease;
+}
+
+.rpc-chip:hover {
+  border-color: rgba(255, 107, 26, 0.4);
+  transform: translateY(-1px);
+}
+
+@media (max-width: 760px) {
+  .rpc-chip {
+    min-height: 30px;
+    padding: 0 8px;
+    font-size: 9px;
+  }
+}
