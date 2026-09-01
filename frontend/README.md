@@ -27,6 +27,12 @@ key is not exposed in client-side JavaScript.
 - Accumulator tick, block, and cumulative reading.
 - Recent BondMeBro event stream.
 - Wallet connection and Sepolia network prompt.
+- Exact-input browser swap for the configured ETH/WETH pool, including the ERC-20
+  and Permit2 approval sequence.
+- Token selector entries for ETH, WETH, and Sepolia USDC. Unsupported pairs are
+  blocked instead of pretending that a pool or route exists.
 
-Write operations remain in the audited Foundry scripts and deployment runbook for
-this first frontend phase.
+Settlement, donation, liquidity minting, and exact-output execution remain in the
+Foundry scripts for now. A browser swap requires the configured Universal Router and
+an active BondMeBro pool for the selected pair. Do not put a private key in frontend
+environment variables; only the server-side RPC URL and public addresses belong there.

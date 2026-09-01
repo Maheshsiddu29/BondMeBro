@@ -436,9 +436,10 @@ economic risk.
 ## Frontend dashboard
 
 The first frontend phase lives in [`frontend/`](./frontend). It is a Next.js +
-TypeScript read-only dashboard for the deployed Sepolia hook. It shows pool identity,
-per-pool bond configuration, queue state, accumulator data, insurance pots, and recent
-protocol events. The left rail includes a collapsible neon style sample.
+TypeScript dashboard for the deployed Sepolia hook. It shows pool identity, per-pool
+bond configuration, queue state, accumulator data, insurance pots, recent protocol
+events, and a guarded exact-input swap flow for the active ETH/WETH pool. The left
+rail includes a collapsible neon style sample.
 
 Run it with:
 

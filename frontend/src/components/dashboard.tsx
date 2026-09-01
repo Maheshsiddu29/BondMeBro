@@ -1,19 +1,24 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { formatUnits, keccak256, toBytes, type Address, type Hex } from "viem";
+import { formatUnits, keccak256, parseUnits, toBytes, type Address, type Hex } from "viem";
 import {
   useAccount,
+  useBalance,
   useBlockNumber,
   useConnect,
   useDisconnect,
+  usePublicClient,
   useReadContract,
   useSwitchChain,
+  useWriteContract,
 } from "wagmi";
 import { sepolia } from "wagmi/chains";
 
 import { bondMeBroAbi } from "@/lib/abi";
 import { deployment, explorerAddress, explorerTx, shortenHash } from "@/lib/config";
+import { isConfiguredPair, tokenOptions, type TokenOption } from "@/lib/tokens";
+import { encodeExactInputRouterPlan, erc20Abi, permit2Abi, universalRouterAbi } from "@/lib/swap";
 
 const ZERO_HASH = `0x${"0".repeat(64)}` as Hex;
 const eventTopics = [
@@ -38,6 +43,47 @@ type ConfigTuple = readonly [bigint, bigint, bigint];
 type AccumulatorTuple = readonly [bigint, bigint, bigint];
 type BoundsTuple = readonly [Hex, Hex];
 type BondTuple = readonly [Address, bigint, bigint, bigint, Address, bigint, bigint, Hex];
+
+/** viem decodes named ABI tuples as objects, while unnamed returns are arrays. */
+function tupleItem(value: unknown, index: number, name: string): unknown {
+  if (Array.isArray(value)) return value[index];
+  if (value !== null && typeof value === "object") return (value as Record<string, unknown>)[name];
+  return undefined;
+}
+
+function normalizeConfig(value: unknown): ConfigTuple | undefined {
+  const result = [
+    tupleItem(value, 0, "minBondedAmount0"),
+    tupleItem(value, 1, "minBondedAmount1"),
+    tupleItem(value, 2, "bondBps"),
+  ];
+  return result.every((item): item is bigint => typeof item === "bigint") ? (result as unknown as ConfigTuple) : undefined;
+}
+
+function normalizeAccumulator(value: unknown): AccumulatorTuple | undefined {
+  const result = [tupleItem(value, 0, "lastTick"), tupleItem(value, 1, "lastUpdate"), tupleItem(value, 2, "tickCumulative")];
+  return result.every((item): item is bigint => typeof item === "bigint") ? (result as unknown as AccumulatorTuple) : undefined;
+}
+
+function normalizeBounds(value: unknown): BoundsTuple | undefined {
+  const result = [tupleItem(value, 0, "head"), tupleItem(value, 1, "tail")];
+  return result.every((item): item is string => typeof item === "string") ? (result as unknown as BoundsTuple) : undefined;
+}
+
+function normalizeBond(value: unknown): BondTuple | undefined {
+  const result = [
+    tupleItem(value, 0, "owner"),
+    tupleItem(value, 1, "openBlock"),
+    tupleItem(value, 2, "tickBefore"),
+    tupleItem(value, 3, "tickAfter"),
+    tupleItem(value, 4, "currency"),
+    tupleItem(value, 5, "cumulativeAtOpen"),
+    tupleItem(value, 6, "amount"),
+    tupleItem(value, 7, "next"),
+  ];
+  const valid = typeof result[0] === "string" && typeof result[1] === "bigint" && typeof result[2] === "bigint" && typeof result[3] === "bigint" && typeof result[4] === "string" && typeof result[5] === "bigint" && typeof result[6] === "bigint" && typeof result[7] === "string";
+  return valid ? (result as unknown as BondTuple) : undefined;
+}
 
 function formatToken(value: unknown, decimals = 18, digits = 5) {
   if (typeof value !== "bigint") return "—";
@@ -175,7 +221,7 @@ export function Dashboard() {
     query: { refetchInterval: 15_000 },
   });
 
-  const bounds = boundsRead.data as BoundsTuple | undefined;
+  const bounds = normalizeBounds(boundsRead.data);
   const headId = bounds?.[0];
   const headBondRead = useReadContract({
     address: deployment.hook,
@@ -185,9 +231,9 @@ export function Dashboard() {
     query: { enabled: Boolean(headId && headId !== ZERO_HASH), refetchInterval: 8_000 },
   });
 
-  const config = configRead.data as ConfigTuple | undefined;
-  const accumulator = accumulatorRead.data as AccumulatorTuple | undefined;
-  const headBond = headBondRead.data as BondTuple | undefined;
+  const config = normalizeConfig(configRead.data);
+  const accumulator = normalizeAccumulator(accumulatorRead.data);
+  const headBond = normalizeBond(headBondRead.data);
   const observationValue = (observationRead as unknown as { data?: unknown }).data;
   const settlerFeeValue = (settlerFeeRead as unknown as { data?: unknown }).data;
   const clampValue = (clampRead as unknown as { data?: unknown }).data;
@@ -393,7 +439,7 @@ export function Dashboard() {
             </>
           )}
 
-          {screen === "swap" && <SwapScreen isConnected={isConnected} swapMode={swapMode} setSwapMode={setSwapMode} swapAmount={swapAmount} setSwapAmount={setSwapAmount} onConnect={connectWallet} onLearn={() => goTo("learn")} />}
+          {screen === "swap" && <SwapScreen isConnected={isConnected} address={address} networkCorrect={networkCorrect} poolConfig={config} swapMode={swapMode} setSwapMode={setSwapMode} swapAmount={swapAmount} setSwapAmount={setSwapAmount} onConnect={connectWallet} onLearn={() => goTo("learn")} />}
           {screen === "bonds" && <BondsScreen headBond={headBond} headId={headId} queueLength={queueLength} maturityBlock={maturityBlock} maturityProgress={maturityProgress} currentBlock={blockNumber} headCurrency={headCurrency} onSwap={() => goTo("swap")} />}
           {screen === "pools" && <PoolsScreen config={config} accumulator={accumulator} clampTicks={clampTicks} observationBlocks={observationBlocks} settlerFeeBps={settlerFeeBps} queueLength={queueLength} pot0={pot0} pot1={pot1} poolConnected={poolConnected} owner={ownerRead.data} />}
           {screen === "activity" && <ActivityScreen activity={activity} activityError={activityError} />}
@@ -413,13 +459,152 @@ function ActivityPreview({ activity, activityError, onViewAll }: { activity: Act
   );
 }
 
-function SwapScreen({ isConnected, swapMode, setSwapMode, swapAmount, setSwapAmount, onConnect, onLearn }: { isConnected: boolean; swapMode: "exactIn" | "exactOut"; setSwapMode: (mode: "exactIn" | "exactOut") => void; swapAmount: string; setSwapAmount: (value: string) => void; onConnect: () => void; onLearn: () => void }) {
+function SwapScreen({
+  isConnected,
+  address,
+  networkCorrect,
+  poolConfig,
+  swapMode,
+  setSwapMode,
+  swapAmount,
+  setSwapAmount,
+  onConnect,
+  onLearn,
+}: {
+  isConnected: boolean;
+  address?: Address;
+  networkCorrect: boolean;
+  poolConfig?: ConfigTuple;
+  swapMode: "exactIn" | "exactOut";
+  setSwapMode: (mode: "exactIn" | "exactOut") => void;
+  swapAmount: string;
+  setSwapAmount: (value: string) => void;
+  onConnect: () => void;
+  onLearn: () => void;
+}) {
+  const [paySymbol, setPaySymbol] = useState("ETH");
+  const [receiveSymbol, setReceiveSymbol] = useState("WETH");
+  const [minimumOutput, setMinimumOutput] = useState("0");
+  const [transactionState, setTransactionState] = useState<"idle" | "approving" | "sending" | "success" | "error">("idle");
+  const [transactionHash, setTransactionHash] = useState<Hex | undefined>();
+  const [transactionError, setTransactionError] = useState("");
+  const publicClient = usePublicClient({ chainId: sepolia.id });
+  const { writeContractAsync } = useWriteContract();
+
+  const payToken = tokenOptions.find((token) => token.symbol === paySymbol) ?? tokenOptions[0];
+  const receiveToken = tokenOptions.find((token) => token.symbol === receiveSymbol) ?? tokenOptions[1];
+  const amountIn = parseSwapAmount(swapAmount, payToken.decimals);
+  const minimumAmountOut = parseSwapAmount(minimumOutput, receiveToken.decimals) ?? 0n;
+  const bondBps = poolConfig?.[2] ?? 0n;
+  const estimatedBond = amountIn && bondBps > 0n ? (amountIn * bondBps) / 10_000n : 0n;
+  const effectivePoolInput = amountIn && amountIn > estimatedBond ? amountIn - estimatedBond : 0n;
+  const activePair = isConfiguredPair(payToken, receiveToken, deployment.currency0, deployment.currency1);
+  const zeroForOne = payToken.address.toLowerCase() === deployment.currency0.toLowerCase();
+  const supportedDirection = activePair && (zeroForOne
+    ? receiveToken.address.toLowerCase() === deployment.currency1.toLowerCase()
+    : receiveToken.address.toLowerCase() === deployment.currency0.toLowerCase());
+  const nativeBalance = useBalance({
+    address,
+    chainId: sepolia.id,
+    query: { enabled: Boolean(address && payToken.kind === "native"), refetchInterval: 10_000 },
+  });
+  const tokenBalanceRead = useReadContract({
+    address: payToken.address,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [address ?? deployment.hook],
+    query: { enabled: Boolean(address && payToken.kind === "erc20"), refetchInterval: 10_000 },
+  });
+  const payBalance = payToken.kind === "native" ? nativeBalance.data?.value : tokenBalanceRead.data as bigint | undefined;
+  const maxBondAmount = estimatedBond > 0n ? estimatedBond + estimatedBond / 10n + 1n : 1n;
+  const routerConfigured = deployment.universalRouter !== "0x0000000000000000000000000000000000000000";
+  const amountFitsBalance = payBalance === undefined || (amountIn !== undefined && amountIn <= payBalance);
+  const canSubmit = isConnected && networkCorrect && swapMode === "exactIn" && supportedDirection && routerConfigured && bondingEnabledForSwap(poolConfig) && amountIn !== undefined && amountIn > 0n && amountFitsBalance && transactionState !== "approving" && transactionState !== "sending";
+
+  async function submitSwap() {
+    if (!canSubmit || !address || !publicClient || amountIn === undefined) return;
+    setTransactionState("idle");
+    setTransactionError("");
+    setTransactionHash(undefined);
+    try {
+      const plan = encodeExactInputRouterPlan({
+        currency0: deployment.currency0,
+        currency1: deployment.currency1,
+        hooks: deployment.hook,
+        fee: deployment.poolFee,
+        tickSpacing: deployment.tickSpacing,
+        zeroForOne,
+        amountIn,
+        amountOutMinimum: minimumAmountOut,
+        refundRecipient: address,
+        maxBondAmount,
+      });
+      if (payToken.kind === "erc20") {
+        setTransactionState("approving");
+        const tokenApproval = await writeContractAsync({
+          address: payToken.address,
+          abi: erc20Abi,
+          functionName: "approve",
+          args: [deployment.permit2, MAX_UINT256],
+        });
+        await publicClient.waitForTransactionReceipt({ hash: tokenApproval });
+        const permitApproval = await writeContractAsync({
+          address: deployment.permit2,
+          abi: permit2Abi,
+          functionName: "approve",
+          args: [payToken.address, deployment.universalRouter, MAX_UINT160, MAX_UINT48],
+        });
+        await publicClient.waitForTransactionReceipt({ hash: permitApproval });
+      }
+      setTransactionState("sending");
+      const hash = await writeContractAsync({
+        address: deployment.universalRouter,
+        abi: universalRouterAbi,
+        functionName: "execute",
+        args: [plan.commands, plan.inputs, BigInt(Math.floor(Date.now() / 1000) + 1_200)],
+        value: payToken.kind === "native" ? amountIn : 0n,
+      });
+      setTransactionHash(hash);
+      await publicClient.waitForTransactionReceipt({ hash });
+      setTransactionState("success");
+    } catch (error) {
+      setTransactionState("error");
+      setTransactionError(friendlyTransactionError(error));
+    }
+  }
+
   return (
     <>
       <section className="screen-intro"><div><span className="eyebrow">01 / TRADE WITH CONTEXT</span><h1>Make a swap.<br /><em>See the bond first.</em></h1></div><p>The bond is temporary collateral carved from qualifying input. It is not an extra fee, and the settlement outcome is decided at the protocol checkpoint.</p></section>
-      <section className="swap-layout"><article className="neo-card swap-card"><div className="swap-card-top"><div className="segmented-control"><button type="button" className={swapMode === "exactIn" ? "segment-active" : ""} onClick={() => setSwapMode("exactIn")}>Exact in</button><button type="button" className={swapMode === "exactOut" ? "segment-active" : ""} onClick={() => setSwapMode("exactOut")}>Exact out</button></div><Badge tone="muted">PREVIEW</Badge></div><div className="swap-field"><div className="field-label"><span>You pay</span><span>Balance —</span></div><div className="amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" /><button type="button" className="token-select"><span className="token-bubble token-orange">$</span>USDC <b>⌄</b></button></div></div><button type="button" className="direction-button" aria-label="Switch swap direction">↕</button><div className="swap-field"><div className="field-label"><span>You receive</span><span>Estimated output</span></div><div className="amount-line"><input aria-label="Estimated output" value="—" readOnly /><button type="button" className="token-select"><span className="token-bubble token-purple">W</span>WETH <b>⌄</b></button></div></div><div className="swap-settings"><span>Slippage <b>0.50%</b></span><span>Pool <b>ETH / WETH</b></span><span>Route <b>Single hop</b></span></div><button type="button" className="primary-button large-button full-button" onClick={isConnected ? onLearn : onConnect}>{isConnected ? "Review swap" : "Connect wallet"} <span>→</span></button><span className="readonly-note">Transaction wiring uses the audited Universal Router path.</span></article><aside className="swap-context"><article className="glass-card bond-preview-card"><div className="card-heading"><div><span className="eyebrow">BOND PREVIEW</span><h2>Accountability, up front.</h2></div><span className="preview-lock">⌁</span></div><div className="preview-amount"><span>ESTIMATED BOND</span><strong>— <small>USDC</small></strong></div><div className="preview-rows"><div><span>Pool input after bond</span><strong>—</strong></div><div><span>Bond rate</span><strong>25 bps</strong></div><div><span>Maturity checkpoint</span><strong>50 blocks</strong></div><div><span>Refund recipient</span><strong>{isConnected ? "Connected wallet" : "Connect wallet"}</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>This is temporary collateral, not a guaranteed refund. Settlement is permissionless and uses the protocol-defined outcome rule.</p></div></article><button type="button" className="learn-link" onClick={onLearn}>Why is there a bond? <span>→</span></button></aside></section>
+      <section className="swap-layout"><article className="neo-card swap-card"><div className="swap-card-top"><div className="segmented-control"><button type="button" className={swapMode === "exactIn" ? "segment-active" : ""} onClick={() => setSwapMode("exactIn")}>Exact in</button><button type="button" className={swapMode === "exactOut" ? "segment-active" : ""} onClick={() => setSwapMode("exactOut")}>Exact out</button></div><Badge tone={swapMode === "exactIn" ? "green" : "muted"}>{swapMode === "exactIn" ? "READY" : "PREVIEW"}</Badge></div><div className="swap-field"><div className="field-label"><span>You pay</span><span>Balance {payBalance === undefined ? "—" : `${formatToken(payBalance, payToken.decimals)} ${payToken.symbol}`}</span></div><div className="amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" placeholder="0.00" /><select aria-label="Pay token" className="token-select" value={payToken.symbol} onChange={(event) => setPaySymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div></div><button type="button" className="direction-button" aria-label="Switch swap direction" onClick={() => { const oldPay = paySymbol; setPaySymbol(receiveSymbol); setReceiveSymbol(oldPay); }}>↕</button><div className="swap-field"><div className="field-label"><span>You receive</span><span>Minimum output</span></div><div className="amount-line"><input aria-label="Minimum output" value={minimumOutput} onChange={(event) => setMinimumOutput(event.target.value)} inputMode="decimal" placeholder="0.00" /><select aria-label="Receive token" className="token-select" value={receiveToken.symbol} onChange={(event) => setReceiveSymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div></div><div className="swap-settings"><span>Slippage <b>0.50%</b></span><span>Pool <b>ETH / WETH</b></span><span>Route <b>Single hop</b></span></div>{!supportedDirection && <div className="pair-warning">This deployment currently has a BondMeBro pool only for ETH / WETH. Select that pair for a live test; other token pairs need their own initialized pool and liquidity.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is available in the backend script and remains a browser preview until its quote and max-input UI are wired.</div>}{!routerConfigured && <div className="pair-warning">Set the network&apos;s Universal Router address in the frontend environment before sending transactions.</div>}<button type="button" className="primary-button large-button full-button" disabled={!canSubmit} onClick={isConnected ? submitSwap : onConnect}>{transactionState === "approving" ? "Approving token…" : transactionState === "sending" ? "Sending swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !supportedDirection ? "Pool not configured" : "Review and swap"} <span>→</span></button>{transactionState === "error" && <div className="transaction-message transaction-error">{transactionError}</div>}{transactionState === "success" && transactionHash && <div className="transaction-message transaction-success">Confirmed. <a href={explorerTx(transactionHash)} target="_blank" rel="noreferrer">View transaction ↗</a></div>}<span className="readonly-note">Exact-input uses the audited Universal Router action plan and the BondMeBro 37-byte hook payload.</span></article><aside className="swap-context"><article className="glass-card bond-preview-card"><div className="card-heading"><div><span className="eyebrow">BOND PREVIEW</span><h2>Accountability, up front.</h2></div><span className="preview-lock">⌁</span></div><div className="preview-amount"><span>ESTIMATED BOND</span><strong>{formatToken(estimatedBond, payToken.decimals)} <small>{payToken.symbol}</small></strong></div><div className="preview-rows"><div><span>Gross input</span><strong>{amountIn === undefined ? "—" : `${formatToken(amountIn, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Pool input after bond</span><strong>{amountIn === undefined ? "—" : `${formatToken(effectivePoolInput, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Bond rate</span><strong>{bondBps.toString()} bps</strong></div><div><span>Maturity checkpoint</span><strong>50 blocks</strong></div><div><span>Refund recipient</span><strong>{address ? formatAddress(address) : "Connect wallet"}</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>This is temporary collateral, not a guaranteed refund. Settlement is permissionless and uses the protocol-defined outcome rule.</p></div></article><button type="button" className="learn-link" onClick={onLearn}>Why is there a bond? <span>→</span></button></aside></section>
     </>
   );
+}
+
+const MAX_UINT160 = (1n << 160n) - 1n;
+const MAX_UINT256 = (1n << 256n) - 1n;
+const MAX_UINT48 = 2 ** 48 - 1;
+
+function parseSwapAmount(value: string, decimals: number): bigint | undefined {
+  const normalized = value.replace(/,/g, "").trim();
+  if (!normalized || !/^\d*(\.\d*)?$/.test(normalized)) return undefined;
+  try {
+    return parseUnits(normalized, decimals);
+  } catch {
+    return undefined;
+  }
+}
+
+function bondingEnabledForSwap(config?: ConfigTuple) {
+  return Boolean(config && config[0] > 0n && config[1] > 0n && config[2] > 0n);
+}
+
+function friendlyTransactionError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.toLowerCase().includes("user rejected")) return "The wallet rejected the transaction.";
+  if (message.toLowerCase().includes("insufficient")) return "The wallet does not have enough balance for this swap and gas.";
+  if (message.toLowerCase().includes("bondslippage")) return "The estimated bond exceeded the maximum accepted bond.";
+  return "The transaction could not be completed. Open the browser console for technical details.";
 }
 
 function BondsScreen({ headBond, headId, queueLength, maturityBlock, maturityProgress, currentBlock, headCurrency, onSwap }: { headBond?: BondTuple; headId?: Hex; queueLength: bigint; maturityBlock?: bigint; maturityProgress: number; currentBlock?: bigint; headCurrency: string; onSwap: () => void }) {
