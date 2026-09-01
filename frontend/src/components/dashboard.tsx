@@ -97,12 +97,14 @@ function normalizeBond(value: unknown): BondTuple | undefined {
   return valid ? (result as unknown as BondTuple) : undefined;
 }
 
-function formatToken(value: unknown, decimals = 18, digits = 5) {
+function formatToken(value: unknown, decimals = 18, digits = 8) {
   if (typeof value !== "bigint") return "—";
   const formatted = formatUnits(value, decimals);
   const [whole, fraction = ""] = formatted.split(".");
   const trimmed = fraction.slice(0, digits).replace(/0+$/, "");
-  return trimmed ? `${whole}.${trimmed}` : whole;
+  if (trimmed) return `${whole}.${trimmed}`;
+  if (value > 0n && whole === "0") return `<0.${"0".repeat(Math.max(0, digits - 1))}1`;
+  return whole;
 }
 
 function formatInteger(value: unknown) {

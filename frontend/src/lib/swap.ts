@@ -87,14 +87,6 @@ const takeType = {
   ],
 } as const;
 
-const actionsType = {
-  type: "tuple",
-  components: [
-    { name: "actions", type: "bytes" },
-    { name: "params", type: "bytes[]" },
-  ],
-} as const;
-
 /** The fixed BondMeBro hookData wire format: version, recipient, maximum bond. */
 export function encodeBondHookData(refundRecipient: Address, maxBondAmount: bigint): Hex {
   return encodePacked(["uint8", "address", "uint128"], [1, refundRecipient, maxBondAmount]);
@@ -138,7 +130,12 @@ export function encodeExactInputRouterPlan({
   const settleParams = encodeAbiParameters([settleType], [{ currency: inputCurrency, amount: 0n, payerIsUser: true }]);
   const takeParams = encodeAbiParameters([takeType], [{ currency: outputCurrency, recipient: refundRecipient, amount: 0n }]);
   const actions = "0x060b0e" as Hex;
-  const routerInput = encodeAbiParameters([actionsType], [{ actions, params: [swapParams, settleParams, takeParams] }]);
+  // The Universal Router decodes two top-level values: abi.encode(actions, params).
+  // Encoding them as one tuple adds an extra offset and causes SliceOutOfBounds().
+  const routerInput = encodeAbiParameters(
+    [{ type: "bytes" }, { type: "bytes[]" }],
+    [actions, [swapParams, settleParams, takeParams]],
+  );
 
   return {
     commands: "0x10" as Hex,
