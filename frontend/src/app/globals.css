@@ -264,23 +264,61 @@ button {
   background: #080b0b;
 }
 
-.reference-embed iframe {
-  display: block;
-  width: 100%;
-  height: 150px;
-  border: 0;
-  background: #080b0b;
+.reference-sample {
+  min-height: 150px;
+  padding: 12px;
+  background:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px),
+    #080b0b;
+  background-size: 100% 25px, 25px 100%, auto;
 }
 
-.reference-embed a {
-  display: block;
-  padding: 9px;
-  border-top: 1px solid var(--line);
-  color: var(--acid);
+.reference-sample-top {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 8px;
-  letter-spacing: 0.08em;
+  font-size: 7px;
+  letter-spacing: 0.1em;
 }
+
+.reference-sample-top span:first-child {
+  color: var(--acid);
+}
+
+.reference-sample-title {
+  margin-top: 23px;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.08em;
+  line-height: 0.85;
+}
+
+.reference-sample-title em {
+  color: var(--acid);
+  font-style: normal;
+}
+
+.reference-sample-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 23px;
+}
+
+.reference-sample-line span {
+  display: block;
+  width: 100%;
+  height: 1px;
+  background: var(--acid);
+  transform: rotate(-10deg);
+}
+
+.reference-sample-line span:nth-child(2) { transform: rotate(16deg); background: var(--cyan); }
+.reference-sample-line span:nth-child(3) { transform: rotate(-24deg); }
+.reference-sample-line span:nth-child(4) { transform: rotate(7deg); background: var(--cyan); }
 
 .sidebar-footer,
 .app-footer {

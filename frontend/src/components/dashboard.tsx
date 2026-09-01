@@ -327,24 +327,20 @@ export function Dashboard() {
         <div className="sidebar-spacer" />
 
         <div className="reference-card">
-          <div className="reference-kicker">VISUAL REFERENCE</div>
-          <div className="reference-title">ChainGPT</div>
-          <div className="reference-copy">Neon editorial energy, adapted for BondMeBro monitoring.</div>
+          <div className="reference-kicker">STYLE REFERENCE</div>
+          <div className="reference-title">NEON MODE</div>
+          <div className="reference-copy">High-contrast signal design for focused protocol monitoring.</div>
           <button className="reference-toggle" type="button" onClick={() => setReferenceOpen((current) => !current)}>
             {referenceOpen ? "Hide sample" : "Show sample"}
             <span>↗</span>
           </button>
           {referenceOpen && (
             <div className="reference-embed">
-              <iframe
-                src="https://www.chaingpt.org/"
-                title="ChainGPT visual reference"
-                loading="lazy"
-                referrerPolicy="no-referrer"
-              />
-              <a href="https://www.chaingpt.org/" target="_blank" rel="noreferrer">
-                Open ChainGPT ↗
-              </a>
+              <div className="reference-sample" aria-label="Neon style sample">
+                <div className="reference-sample-top"><span>LIVE / SIGNAL</span><span>01</span></div>
+                <div className="reference-sample-title">DATA<br /><em>IN MOTION.</em></div>
+                <div className="reference-sample-line"><span /><span /><span /><span /></div>
+              </div>
             </div>
           )}
         </div>

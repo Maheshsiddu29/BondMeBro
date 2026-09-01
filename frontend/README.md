@@ -1,9 +1,8 @@
 # BondMeBro dashboard
 
 A Next.js read-only monitoring dashboard for the BondMeBro Uniswap v4 hook.
-The visual direction takes inspiration from the neon, editorial energy of
-[ChainGPT](https://www.chaingpt.org/) without copying its brand assets. The ChainGPT
-site is available as a collapsible visual reference in the left sidebar.
+The visual direction uses a dark, neon, editorial system with high-contrast signal
+cards and a collapsible style sample in the left sidebar.
 
 ## Run locally
 

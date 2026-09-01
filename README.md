@@ -438,8 +438,7 @@ economic risk.
 The first frontend phase lives in [`frontend/`](./frontend). It is a Next.js +
 TypeScript read-only dashboard for the deployed Sepolia hook. It shows pool identity,
 per-pool bond configuration, queue state, accumulator data, insurance pots, and recent
-protocol events. The left rail includes a collapsible ChainGPT visual reference:
-[chaingpt.org](https://www.chaingpt.org/).
+protocol events. The left rail includes a collapsible neon style sample.
 
 Run it with:
 
