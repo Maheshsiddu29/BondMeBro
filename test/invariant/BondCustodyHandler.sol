@@ -15,6 +15,7 @@ import {BondMeBro} from "../../src/BondMeBro.sol";
 import {HookDataCodec} from "../../src/libraries/HookDataCodec.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {ModelLReference} from "../utils/ModelLReference.sol";
+import {ModelL2Reference} from "../utils/ModelL2Reference.sol";
 
 /// @title BondCustodyHandler
 
@@ -183,6 +184,28 @@ contract BondCustodyHandler is Test {
     function refCovers(uint32 atBlock) public view returns (bool) {
         return refPoints.length > 0 && refPoints[0].blockNumber <= atBlock;
     }
+
+    /// @notice The pool's effective tick across `[atBlock, atBlock+1)`, from the observed path.
+    ///
+    /// @dev Lets the campaign rebuild a bond's ten-block observation path and price its settlement
+    ///      through `ModelL2Reference`, which sums per-block displacements rather than differencing
+    ///      the hook's cumulatives. That keeps the settlement differential independent in the same
+    ///      way the checkpoint one is.
+    function refTickDuring(uint32 atBlock) public view returns (int24) {
+        for (uint256 i = refPoints.length; i > 0; i--) {
+            if (refPoints[i - 1].blockNumber <= atBlock) return refPoints[i - 1].tickFrom;
+        }
+
+        revert("reference does not cover a block before initialization");
+    }
+
+    /// @notice Set if any settlement paid an amount Model L2 does not predict.
+    bool public ghostSettlementMismatch;
+
+    /// @notice Settlements whose amounts were actually compared against the reference.
+    /// @dev A non-vacuity counter: a campaign that never settled a bond would satisfy
+    ///      `ghostSettlementMismatch == false` by doing nothing at all.
+    uint256 public settlementsChecked;
 
     /// @notice Number of distinct maturity blocks the campaign has touched.
     function touchedMaturityCount() external view returns (uint256) {
@@ -458,6 +481,13 @@ contract BondCustodyHandler is Test {
                 ghostConservationViolated = true;
             }
 
+            // MODEL L2 DIFFERENTIAL, per settlement. Conservation alone is a weak check -- a hook
+            // that refunded everything, or slashed everything, would satisfy it on every bond. This
+            // prices the same bond through `ModelL2Reference`, from the per-block ticks this
+            // handler observed on the POOL rather than from anything the hook stored, and compares
+            // the amounts that actually moved.
+            _checkSettlementAgainstReference(bond, refund, slash);
+
             // A second settlement of the same bond must be impossible.
             if (bondSettled[bondId]) {
                 ghostDoubleSettlement = true;
@@ -538,6 +568,33 @@ contract BondCustodyHandler is Test {
         }
 
         if (settledIds.length < 16) settledIds.push(bondId);
+    }
+
+    /// @dev Prices one settlement through the independent reference and flags a disagreement.
+    ///
+    ///      Skipped when the reference cannot cover the bond's observation window, which happens
+    ///      only for a bond opened before the campaign's first recorded swap. Skipping is recorded
+    ///      by NOT incrementing `settlementsChecked`, so a campaign in which every settlement was
+    ///      skipped cannot pass as a campaign in which every settlement agreed.
+    function _checkSettlementAgainstReference(BondMeBro.Bond memory bond, uint256 refund, uint256 slash) internal {
+        uint32 openBlock = bond.openBlock;
+
+        if (!refCovers(openBlock)) return;
+
+        int24[10] memory path;
+
+        for (uint256 k = 0; k < 10; k++) {
+            path[k] = refTickDuring(openBlock + uint32(k));
+        }
+
+        (uint128 refCollateral, uint128 refSlash, uint128 refRefund,) =
+            ModelL2Reference.settle(bond.variableLegAmount, bond.tickBefore, bond.tickAfter, path);
+
+        settlementsChecked++;
+
+        if (slash != refSlash || refund != refRefund || refund + slash != refCollateral) {
+            ghostSettlementMismatch = true;
+        }
     }
 
     /// @dev Returns the input and output currencies for the selected swap direction.

@@ -16,7 +16,6 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {BondMeBro, HOOK_FLAGS} from "../src/BondMeBro.sol";
 import {ModelLReference} from "./utils/ModelLReference.sol";
 import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
-import {PersistenceMathLib} from "../src/libraries/PersistenceMathLib.sol";
 import {TickAccumulatorLib} from "../src/libraries/TickAccumulatorLib.sol";
 
 /// @notice T5B — settlement: refund, slash, insurance pot.
@@ -372,7 +371,20 @@ contract SettlementTest is Test, Deployers {
         (, uint32 lastUpdate,) = hook.accumulator(id_);
         assertGt(lastUpdate, m, "fixture: cursor must be past M for this to be unrecoverable");
 
-        vm.expectRevert(abi.encodeWithSelector(BondMeBro.MaturityCheckpointMissing.selector, bondId, m, lastUpdate));
+        // THE NAMED ENDPOINT CHANGED IN P-L2-6, and the change is the point.
+        //
+        // While settlement read C10 alone, the endpoint it could not recover was M itself. Model
+        // L2 needs two late windows, so `settleBond` now resolves C6, then C8, then C10 -- and the
+        // revert names the EARLIEST unrecoverable endpoint, which is the one whose value is
+        // actually lost. For a bucket wiped clean that is C6 at `M - 4`, not M.
+        //
+        // Reporting M here would send an operator looking at the wrong block: C10 is merely the
+        // last casualty, C6 is where the loss began.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BondMeBro.MaturityCheckpointMissing.selector, bondId, m - hook.C6_OFFSET_FROM_MATURITY(), lastUpdate
+            )
+        );
         hook.settleBond(bondId);
     }
 

@@ -20,7 +20,7 @@ import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 
 import {HookDataCodec} from "./libraries/HookDataCodec.sol";
-import {PersistenceMathLib} from "./libraries/PersistenceMathLib.sol";
+import {ModelL2SettlementLib} from "./libraries/ModelL2SettlementLib.sol";
 import {TickAccumulatorLib} from "./libraries/TickAccumulatorLib.sol";
 
 // below constant is important for the hook to work properly. It is the permission bits that the hook's deployed address must encode. It is a single source of truth shared with getHookPermissions() and the test suite.getHookPermissions(), test suite, and the deploy script's miner all three derive from this one constant.
@@ -196,14 +196,30 @@ contract BondMeBro is BaseHook {
 
     /// @param minBondedAmount1 Minimum gross input that requires collateral when  currency1 is the input (`zeroForOne == false`), expressed in raw  currency1 units.
 
-    /// @param bondBps Collateral rate as a fraction of gross input, expressed in  basis points. The rate is direction-independent because only absolute  token thresholds require per-currency scaling.
-
-    /// @param refundToleranceTicks Noise floor for settlement, in TICKS. Price displacement at or
-    ///        below this is never slashed. Passed to `PersistenceMathLib.computeBps`, which
-    ///        subtracts it from both sides of the persistence fraction so the curve rises smoothly
-    ///        from zero rather than stepping — a discontinuity there would be a boundary an
-    ///        attacker could profitably sit on. Widened to `uint24` at the call site to match the
-    ///        frozen library's parameter type.
+    /// @param bondBps VESTIGIAL AS A RATE. It is now only the per-pool ENABLE FLAG.
+    ///
+    ///        P-L2-3/4 replaced amount-proportional sizing with Model L, which derives the
+    ///        collateral rate from the realized tick impact (`_collateralBpsFor`) and never reads
+    ///        this field. It survives because `cfg.bondBps == 0` is the "bonding disabled"
+    ///        sentinel and because the all-or-nothing config rule still requires it to be set.
+    ///
+    ///        An owner setting this to 25 expecting 25 bps will get whatever the tick impact
+    ///        implies. Removing or renaming it changes the storage layout and the owner-facing
+    ///        ABI, so it is deliberately left alone until P-L2-7.
+    ///
+    /// @param refundToleranceTicks VESTIGIAL AFTER P-L2-6. Read by nothing.
+    ///
+    ///        It was Model B's noise floor, subtracted from both sides of the persistence
+    ///        fraction. Model L2 replaced that curve entirely: the noise floor is now the `D = 5`
+    ///        dead zone, which is a FROZEN COMPILE-TIME CONSTANT in `ModelL2SettlementLib`
+    ///        (ADR-0005 § 2.1) rather than per-pool configuration. Nothing on any production path
+    ///        reads this field any more.
+    ///
+    ///        ADR-0005 § 4 anticipates repurposing the two `uint16` fields — `bondBps` to the
+    ///        collateral scale and this one to `D` — but P-L2-6's scope is settlement economics
+    ///        only, and the parameters it implements are frozen rather than configurable. Making
+    ///        them per-pool is a separate decision with its own governance surface, and belongs
+    ///        with the rest of the config cleanup in P-L2-7.
     ///
     ///        `uint16` keeps `PoolConfig` at exactly 128 + 96 + 16 + 16 = 256 bits, ONE slot. That
     ///        matters: the swap path already reads this struct, and a second slot would add a cold
@@ -1508,6 +1524,53 @@ contract BondMeBro is BaseHook {
     ///      transfer. A reentrant token cannot settle the same bond twice: on re-entry the state
     ///      is already SETTLED and `BondNotSettleable` fires. If the transfer reverts, every one of
     ///      those effects reverts with it.
+    /// @notice The Model L2 settlement calculation for one bond.
+    ///
+    /// @dev SPLIT OUT OF `_settleBond` FOR THE STACK, not for style. Resolving three endpoints and
+    ///      carrying a collateral rate alongside the four results puts `_settleBond` past the EVM
+    ///      stack limit under this project's non-viaIR settings. Keeping `c6`, `c8`, `c10` and
+    ///      `collateralBps` inside their own frame means they are dead by the time the caller
+    ///      performs its effects.
+    ///
+    ///      ALL THREE ENDPOINTS NOW, which is what P-L2-5 deliberately deferred. That stage
+    ///      migrated checkpoint STATE and left settlement reading C10 alone, because the curve it
+    ///      still ran took a single maturity reading. Model L2 needs two late windows, so it needs
+    ///      C6 and C8 as well. Each resolves independently: a frozen endpoint is read, an unfrozen
+    ///      but still-derivable one is derived exactly and frozen, and one the cursor has passed
+    ///      without a stored value reverts naming the EARLIEST endpoint actually lost. All three
+    ///      come out of a single already-loaded slot (ADR-0007), so the extra readings cost
+    ///      arithmetic rather than SLOADs.
+    ///
+    ///      `PersistenceMathLib` is not reachable from here, or from anywhere else in this
+    ///      contract. P-L2-7 deletes it; leaving dead Model B behaviour CALLABLE would be worse
+    ///      than leaving it present but unreferenced.
+    ///
+    /// @param bondId Bond being settled, for the resolver's revert diagnostics.
+    /// @param id Pool the bond belongs to.
+    /// @param bond Storage pointer to the record.
+    /// @param maturityBlock The bond's maturity, `M`.
+    function _computeL2Settlement(bytes32 bondId, PoolId id, Bond storage bond, uint32 maturityBlock)
+        private
+        returns (uint128 collateral, uint128 slash, uint128 refund, uint16 slashBps)
+    {
+        (int56 c6, int56 c8, int56 c10) = resolveEndpoints(bondId, id, maturityBlock);
+
+        int24 tickBefore = bond.tickBefore;
+        int24 tickAfter = bond.tickAfter;
+
+        // ONE RATE FUNCTION, SHARED WITH CUSTODY. `_collateralBpsFor` is what `afterSwap` used to
+        // decide how much to take, so recomputing the collateral through it reproduces the amount
+        // physically taken to the wei -- exactly what ADR-0005 § 3.2 requires of a record that
+        // stores the variable leg rather than the collateral.
+        uint256 collateralBps = _collateralBpsFor(tickBefore, tickAfter);
+
+        // MODEL L2: two direction-aligned late windows, the larger clamped at zero, the D = 5
+        // catch-up dead zone, and a token split whose denominator is the VARIABLE LEG rather than
+        // the collateral. `refund` comes back derived by subtraction, which is what makes
+        // INV-L2-3 exact rather than approximate.
+        return ModelL2SettlementLib.settle(bond.variableLegAmount, collateralBps, tickBefore, tickAfter, c6, c8, c10);
+    }
+
     function _settleBond(bytes32 bondId) private {
         Bond storage bond = bonds[bondId];
 
@@ -1525,46 +1588,8 @@ contract BondMeBro is BaseHook {
         PoolRef memory poolRef = poolRefByIndex[bond.poolIndex];
         PoolId id = poolRef.id;
 
-        // The cumulative exactly at M — frozen earlier by a crossing swap, or derived now if the
-        // pool has been quiet since before M.
-        //
-        // C10 ONLY, ON PURPOSE. The bucket now also carries C6 and C8, but P-L2-5 migrates
-        // checkpoint STATE and leaves settlement ECONOMICS alone: the curve below is still the
-        // legacy persistence one, which takes a single maturity reading. Resolving all three here
-        // would pay for two endpoints nothing reads and would let a defect in an unused endpoint
-        // block a settlement that does not depend on it. `resolveEndpoints` is where P-L2-6 picks
-        // up all three.
-        int56 cumulativeAtMaturity = _resolveEndpoint(bondId, id, maturityBlock, maturityBlock, FROZEN_C10);
-
-        // The settlement reference the frozen library expects is a TICK, not a cumulative: the
-        // time-weighted average tick across the bond's own window, [openBlock, maturityBlock].
-        // Two accumulator readings give it — the one recorded when the bond opened and the one
-        // frozen at maturity.
-        int24 settlementRef =
-            TickAccumulatorLib.twaTick(bond.cumulativeAtOpen, cumulativeAtMaturity, maturityBlock - bond.openBlock);
-
-        // The single slash curve. Not reimplemented here and not duplicated: `PersistenceMathLib`
-        // is the only source of a slash result anywhere in the protocol.
-        uint16 persistenceBps = PersistenceMathLib.computeBps(
-            bond.tickBefore, bond.tickAfter, settlementRef, uint24(poolConfig[id].refundToleranceTicks)
-        );
-
-        // TRANSITIONAL, AND IT IS REMOVED IN P-L2-6.
-        //
-        // The record now stores the realized variable leg, so the collateral this settlement
-        // needs is recomputed from the leg and the two frozen ticks. That recomputation is exact
-        // -- same expression, same stored inputs as custody used -- so this stage's settlement
-        // OUTCOME is byte-identical to the previous implementation's for the same bond.
-        //
-        // The slash curve below is still the legacy `PersistenceMathLib` one. P-L2-6 replaces it
-        // with the L2 residual and dead zone, at which point the leg is consumed directly and this
-        // recomputation is no longer a bridge but the intended read.
-        uint128 collateral = _collateralOf(bond);
-
-        // Conservation is exact by construction. `split` computes the slash and derives the refund
-        // by subtraction, so `slash + refund == collateral` with no residual wei — computing both
-        // sides independently from bps would leave rounding dust unaccounted for.
-        (uint128 slash, uint128 refund) = PersistenceMathLib.split(collateral, persistenceBps);
+        (uint128 collateral, uint128 slash, uint128 refund, uint16 slashBps) =
+            _computeL2Settlement(bondId, id, bond, maturityBlock);
 
         Currency currency = bond.collateralIsCurrency0 ? poolRef.currency0 : poolRef.currency1;
         address refundRecipient = bond.refundRecipient;
@@ -1583,7 +1608,7 @@ contract BondMeBro is BaseHook {
             insurancePot[id][currency] += slash;
         }
 
-        emit BondSettled(bondId, id, refundRecipient, currency, collateral, refund, slash, persistenceBps);
+        emit BondSettled(bondId, id, refundRecipient, currency, collateral, refund, slash, slashBps);
 
         // ---- INTERACTION, last ----
 

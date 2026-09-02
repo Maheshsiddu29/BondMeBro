@@ -428,6 +428,25 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     }
 
     /*//////////////////////////////////////////////////////////////
+            MODEL L2 SETTLEMENT — AMOUNTS, NOT JUST CONSERVATION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Every settlement in the campaign paid exactly what Model L2 predicts.
+    ///
+    /// @dev CONSERVATION ALONE IS A WEAK CHECK, and this is the invariant that makes the settlement
+    ///      campaign mean something. `invariant_collateralConservation` asserts
+    ///      `refund + slash == collateral`, which a hook that refunded everything — or slashed
+    ///      everything — would satisfy on every bond it ever touched.
+    ///
+    ///      This prices each settled bond independently, from the per-block pool ticks the handler
+    ///      observed rather than from anything the hook stored, and compares the amounts that
+    ///      actually moved. A dead zone off by a tick, a window read from the wrong endpoint, or a
+    ///      slash computed against the collateral instead of the variable leg all show up here.
+    function invariant_settlementMatchesModelL2() public view {
+        assertFalse(handler.ghostSettlementMismatch(), "a settlement paid an amount Model L2 does not predict");
+    }
+
+    /*//////////////////////////////////////////////////////////////
               INV-L2-8 — THREE ENDPOINTS, EXACT (ADR-0007)
     //////////////////////////////////////////////////////////////*/
 
@@ -747,6 +766,33 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         // The three values must be genuinely distinct, or a scheduler writing one value into all
         // three fields would satisfy every assertion above.
         assertTrue(c6 != c8 && c8 != c10, "the three endpoints are identical; this proves nothing");
+    }
+
+    /// @notice The settlement differential is reachable: the campaign really does settle bonds and
+    ///         really does price them against the reference.
+    ///
+    /// @dev NON-VACUITY for `invariant_settlementMatchesModelL2`. That invariant asserts a sticky
+    ///      flag stays false, which a campaign that never settled anything would satisfy by doing
+    ///      nothing. The `settlementsChecked` counter exists precisely so "no mismatch" can be
+    ///      distinguished from "no comparison", and this drives the handler by hand until at least
+    ///      one settlement has been priced.
+    function test_settlementDifferentialIsReachable() public {
+        // Odd seed puts the amount at or above the threshold, so this bonds.
+        handler.swapExactInput(3, true, false);
+
+        assertEq(handler.settlementsChecked(), 0, "nothing should have settled yet");
+
+        // Past maturity, then flush so the endpoints freeze.
+        handler.advanceBlocks(11);
+        handler.swapExactInput(2, true, false);
+
+        handler.settleABond(0);
+
+        assertGt(handler.settlementsChecked(), 0, "the campaign cannot reach a priced settlement");
+
+        assertFalse(handler.ghostSettlementMismatch(), "the reached settlement disagreed with Model L2");
+
+        assertGt(handler.settledCount(), 0, "no bond actually settled");
     }
 
     function test_rejectedSwapLeavesAccountingUntouched() public {
