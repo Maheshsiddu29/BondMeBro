@@ -24,10 +24,14 @@ key is not exposed in client-side JavaScript.
 2. **Bond opened** — after confirmation, the dashboard refreshes `BondOpened` events
    and filters the recent bond history to the connected wallet.
 3. **Observe** — the bond remains active until the configured observation window has
-   elapsed. The Bonds screen shows the opening block, maturity block, and progress.
+   elapsed. The Bonds screen shows the opening block, maturity block, progress, and a
+   live estimate of the refund if the reference tick has moved back toward the
+   pre-swap tick.
 4. **Settle** — once the FIFO head is mature, any connected Sepolia wallet can call
-   `settleBonds` for one matured FIFO item at a time to keep gas and confirmation latency bounded. The UI shows the settlement transaction and the refund/slash result
-   once `BondSettled` is indexed.
+   `settleBonds` for one matured FIFO item at a time to keep gas and confirmation latency bounded. The hook calculates the outcome automatically: a reference tick that
+   returns toward the pre-swap tick refunds the bond, while persistent impact sends the
+   slash to the insurance pot. The UI shows the settlement transaction and final
+   refund/slash result once `BondSettled` is indexed.
 5. **Claim fallback payments** — if a recipient could not receive an inline refund or
    settler reward, the hook records a pull payment. The connected recipient can retry
    it from **My bonds → Available to claim**.

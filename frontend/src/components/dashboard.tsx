@@ -308,6 +308,24 @@ function mergeUserBonds(previous: UserBond[], fetched: UserBond[]) {
   return merged;
 }
 
+function observedAccumulatorCumulative(accumulator: AccumulatorTuple, currentBlock?: bigint) {
+  if (currentBlock === undefined || currentBlock <= accumulator[1]) return accumulator[2];
+  return accumulator[2] + accumulator[0] * (currentBlock - accumulator[1]);
+}
+
+function previewPersistenceBps(tickBefore: bigint, tickAfter: bigint, referenceTick: bigint, refundTolTicks: bigint) {
+  const impact = tickAfter - tickBefore;
+  if (impact === 0n) return 0n;
+  const impactAbs = impact > 0n ? impact : -impact;
+  if (impactAbs <= refundTolTicks) return 0n;
+  const direction = impact > 0n ? 1n : -1n;
+  const remaining = direction * (referenceTick - tickBefore);
+  const numerator = (remaining - refundTolTicks) * 10_000n;
+  if (numerator <= 0n) return 0n;
+  const raw = numerator / (impactAbs - refundTolTicks);
+  return raw >= 10_000n ? 10_000n : raw;
+}
+
 function formatToken(value: unknown, decimals = 18, digits = 8) {
   if (typeof value !== "bigint") return "—";
   const formatted = formatUnits(value, decimals);
@@ -401,6 +419,12 @@ export function Dashboard() {
     functionName: "observationBlocks",
     query: { refetchInterval: 30_000 },
   });
+  const refundTolRead = useReadContract({
+    address: deployment.hook,
+    abi: bondMeBroAbi,
+    functionName: "refundTolTicks",
+    query: { refetchInterval: 30_000 },
+  });
   const settlerFeeRead = useReadContract({
     address: deployment.hook,
     abi: bondMeBroAbi,
@@ -477,11 +501,13 @@ export function Dashboard() {
   const accumulator = normalizeAccumulator(accumulatorRead.data);
   const headBond = normalizeBond(headBondRead.data);
   const observationValue = (observationRead as unknown as { data?: unknown }).data;
+  const refundTolValue = (refundTolRead as unknown as { data?: unknown }).data;
   const settlerFeeValue = (settlerFeeRead as unknown as { data?: unknown }).data;
   const clampValue = (clampRead as unknown as { data?: unknown }).data;
-  const observationBlocks = typeof observationValue === "bigint" ? observationValue : 50n;
-  const settlerFeeBps = typeof settlerFeeValue === "bigint" ? settlerFeeValue : 500n;
-  const clampTicks = typeof clampValue === "bigint" ? clampValue : 506n;
+  const observationBlocks = asBigInt(observationValue) ?? 50n;
+  const refundTolTicks = asBigInt(refundTolValue) ?? 10n;
+  const settlerFeeBps = asBigInt(settlerFeeValue) ?? 500n;
+  const clampTicks = asBigInt(clampValue) ?? 506n;
   const queueLength = typeof queueRead.data === "bigint" ? queueRead.data : 0n;
   const pot0 = typeof pot0Read.data === "bigint" ? pot0Read.data : 0n;
   const pot1 = typeof pot1Read.data === "bigint" ? pot1Read.data : 0n;
@@ -549,11 +575,19 @@ export function Dashboard() {
         logsByEvent.forEach((logs, index) => {
           const descriptor = eventDescriptors[index];
           logs.slice(-6).forEach((log) => {
+            let detail: string = descriptor.detail;
+            if (descriptor.kind === "OPENED") {
+              const opened = decodeOpenedLog(log);
+              if (opened) detail = `Bond opened · ${formatToken(opened.amount)} ${tokenSymbolForCurrency(opened.currency)}`;
+            } else if (descriptor.kind === "SETTLED") {
+              const settled = decodeSettledLog(log);
+              if (settled) detail = `Bond settled · refund ${formatToken(settled.settlement.refundAmount)} · slash ${formatToken(settled.settlement.slashAmount)}`;
+            }
             nextActivity.push({
               kind: descriptor.kind,
               block: log.blockNumber ? BigInt(log.blockNumber).toString() : "—",
               hash: log.transactionHash,
-              detail: descriptor.detail,
+              detail,
             });
           });
         });
@@ -730,7 +764,7 @@ export function Dashboard() {
           )}
 
           {screen === "swap" && <SwapScreen isConnected={isConnected} address={address} networkCorrect={networkCorrect} poolConfig={config} observationBlocks={observationBlocks} rpcOnline={rpcOnline} poolConfigLoading={poolConfigLoading} poolConfigError={poolConfigError} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} swapMode={swapMode} setSwapMode={setSwapMode} swapAmount={swapAmount} setSwapAmount={setSwapAmount} onConnect={connectWallet} onLearn={() => goTo("learn")} onViewBonds={() => goTo("bonds")} onSwapConfirmed={refreshChainData} />}
-          {screen === "bonds" && <BondsScreen headBond={headBond} headId={headId} queueLength={queueLength} maturityBlock={maturityBlock} maturityProgress={maturityProgress} currentBlock={blockNumber} headCurrency={headCurrency} userBonds={userBonds} isConnected={isConnected} networkCorrect={networkCorrect} claimable0={claimable0} claimable1={claimable1} onRefresh={refreshChainData} onSettlementConfirmed={recordSettlementConfirmation} onConnect={connectWallet} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} onSwap={() => goTo("swap")} />}
+          {screen === "bonds" && <BondsScreen headBond={headBond} headId={headId} queueLength={queueLength} maturityBlock={maturityBlock} maturityProgress={maturityProgress} currentBlock={blockNumber} headCurrency={headCurrency} accumulator={accumulator} refundTolTicks={refundTolTicks} userBonds={userBonds} isConnected={isConnected} networkCorrect={networkCorrect} claimable0={claimable0} claimable1={claimable1} onRefresh={refreshChainData} onSettlementConfirmed={recordSettlementConfirmation} onConnect={connectWallet} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} onSwap={() => goTo("swap")} />}
           {screen === "pools" && <PoolsScreen config={config} accumulator={accumulator} clampTicks={clampTicks} observationBlocks={observationBlocks} settlerFeeBps={settlerFeeBps} queueLength={queueLength} pot0={pot0} pot1={pot1} poolConnected={poolConnected} owner={ownerRead.data} rpcOnline={rpcOnline} isConnected={isConnected} networkCorrect={networkCorrect} onRefresh={refreshChainData} onConnect={connectWallet} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} />}
           {screen === "activity" && <ActivityScreen activity={activity} activityError={activityError} onRefresh={refreshChainData} />}
           {screen === "learn" && <LearnScreen onSwap={() => goTo("swap")} />}
@@ -981,6 +1015,8 @@ function BondsScreen({
   maturityProgress,
   currentBlock,
   headCurrency,
+  accumulator,
+  refundTolTicks,
   userBonds,
   isConnected,
   networkCorrect,
@@ -999,6 +1035,8 @@ function BondsScreen({
   maturityProgress: number;
   currentBlock?: bigint;
   headCurrency: string;
+  accumulator?: AccumulatorTuple;
+  refundTolTicks: bigint;
   userBonds: UserBond[];
   isConnected: boolean;
   networkCorrect: boolean;
@@ -1019,6 +1057,18 @@ function BondsScreen({
   const activeUserBonds = userBonds.filter((bond) => !bond.settlement);
   const settledUserBonds = userBonds.filter((bond) => Boolean(bond.settlement));
   const latestSettled = settledUserBonds[0];
+  const liveReferenceTick = headBond && accumulator && currentBlock !== undefined ? (() => {
+    const elapsed = currentBlock > headBond[1] ? currentBlock - headBond[1] : 0n;
+    if (elapsed === 0n) return undefined;
+    const cumulativeNow = observedAccumulatorCumulative(accumulator, currentBlock);
+    return (cumulativeNow - headBond[5]) / elapsed;
+  })() : undefined;
+  const previewPersistence = headBond && liveReferenceTick !== undefined
+    ? previewPersistenceBps(headBond[2], headBond[3], liveReferenceTick, refundTolTicks)
+    : undefined;
+  const previewRefund = headBond && previewPersistence !== undefined
+    ? (headBond[6] * (10_000n - previewPersistence)) / 10_000n
+    : undefined;
 
   async function settleMaturedBonds() {
     if (!headMatured || !isConnected || !networkCorrect || !publicClient) return;
@@ -1090,6 +1140,7 @@ function BondsScreen({
               <div><span>CURRENT BLOCK</span><strong>{formatBlock(currentBlock)}</strong></div>
               <div><span>IMPACT TICKS</span><strong>{(headBond[3] - headBond[2]).toString()}</strong></div>
             </div>
+            {previewPersistence !== undefined && previewRefund !== undefined && liveReferenceTick !== undefined && <div className={`settlement-preview ${previewPersistence === 0n ? "settlement-preview-refund" : ""}`}><div><span>LIVE REFERENCE TICK</span><strong>{liveReferenceTick.toString()}</strong></div><div><span>EST. REFUND IF SETTLED NOW</span><strong>{formatToken(previewRefund, tokenDecimalsForCurrency(headBond[4]))} {headCurrency}</strong></div><div><span>EST. PERSISTENCE</span><strong>{previewPersistence.toString()} bps</strong></div><p>{headBond[3] > headBond[2] ? "A lower reference tick means the upward move is reverting." : "A higher reference tick means the downward move is reverting."} Final refund is calculated at the settlement block and can change with later swaps.</p></div>}
             <div className="detail-actions">
               {!isConnected ? (
                 <button type="button" className="primary-button large-button" onClick={onConnect}>Connect wallet <span>→</span></button>
@@ -1313,5 +1364,5 @@ function ActivityScreen({ activity, activityError, onRefresh }: { activity: Acti
 }
 
 function LearnScreen({ onSwap }: { onSwap: () => void }) {
-  return <><section className="screen-intro"><div><span className="eyebrow">05 / LEARN</span><h1>Accountable<br /><em>liquidity.</em></h1></div><p>BondMeBro is outcome-linked LP insurance. It does not label intent; it waits for the pool&apos;s price outcome and settles temporary collateral accordingly.</p></section><section className="learn-steps"><article className="learn-step"><span>01</span><div><h2>Swap</h2><p>Submit a normal single-hop swap. If the requested input crosses the pool&apos;s threshold, a bond preview appears before confirmation.</p></div><b>→</b></article><article className="learn-step learn-step-active"><span>02</span><div><h2>Bond</h2><p>A small portion of the input is held as temporary collateral. The trader chooses the maximum bond they accept.</p></div><b>→</b></article><article className="learn-step"><span>03</span><div><h2>Settle</h2><p>At the maturity checkpoint, anyone can settle. Reverted impact refunds the bond; persistent impact supports the LP insurance pot.</p></div><b>✓</b></article></section><section className="learn-bottom"><article className="glass-card learn-example"><span className="eyebrow">SIMPLE EXAMPLE</span><h2>1,000 units in.<br /><em>999 units to the pool.</em></h2><div className="example-list"><div><span>Gross input</span><strong>1,000</strong></div><div><span>Temporary bond</span><strong>1</strong></div><div><span>Effective pool input</span><strong>999</strong></div></div></article><article className="neo-card faq-card"><span className="eyebrow">FAQ / RISK</span><h2>Not a guarantee.<br />A defined checkpoint.</h2><p>Settlement uses the configured maturity rule and pool-local observation data. Market drift and unrelated flow remain economic limitations.</p><button type="button" className="primary-button" onClick={onSwap}>Preview a swap <span>→</span></button></article></section></>;
+  return <><section className="screen-intro"><div><span className="eyebrow">05 / LEARN</span><h1>Accountable<br /><em>liquidity.</em></h1></div><p>BondMeBro is outcome-linked LP insurance. It does not label intent; it waits for the pool&apos;s price outcome and settles temporary collateral accordingly.</p></section><section className="learn-steps"><article className="learn-step"><span>01</span><div><h2>Swap</h2><p>Submit a normal single-hop swap. If the requested input crosses the pool&apos;s threshold, a bond preview appears before confirmation.</p></div><b>→</b></article><article className="learn-step learn-step-active"><span>02</span><div><h2>Bond</h2><p>A small portion of the input is held as temporary collateral. The trader chooses the maximum bond they accept.</p></div><b>→</b></article><article className="learn-step"><span>03</span><div><h2>Settle</h2><p>At maturity, anyone can settle. If the reference tick returns toward the pre-swap tick, the bond is refunded; persistent impact supports the LP insurance pot.</p></div><b>✓</b></article></section><section className="learn-bottom"><article className="glass-card learn-example"><span className="eyebrow">SIMPLE EXAMPLE</span><h2>1,000 units in.<br /><em>999 units to the pool.</em></h2><div className="example-list"><div><span>Gross input</span><strong>1,000</strong></div><div><span>Temporary bond</span><strong>1</strong></div><div><span>Effective pool input</span><strong>999</strong></div></div></article><article className="neo-card faq-card"><span className="eyebrow">FAQ / RISK</span><h2>Not a guarantee.<br />A defined checkpoint.</h2><p>Settlement uses the configured maturity rule and pool-local observation data. Market drift and unrelated flow remain economic limitations.</p><button type="button" className="primary-button" onClick={onSwap}>Preview a swap <span>→</span></button></article></section></>;
 }
