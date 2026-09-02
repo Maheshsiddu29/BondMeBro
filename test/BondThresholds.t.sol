@@ -18,7 +18,10 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+
 import {BondMeBro, HOOK_FLAGS} from "../src/BondMeBro.sol";
+import {ModelLReference} from "./utils/ModelLReference.sol";
 import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 
 /// @title BondThresholdsTest
@@ -28,6 +31,8 @@ import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 /// @dev Each swap direction has a different input currency, so one raw-unit threshold cannot correctly represent both sides of every pool. This suite uses tokens with 6 and 18 decimals so a bug that accidentally uses the same threshold in both directions is easy to detect.
 
 contract BondThresholdsTest is Test, Deployers {
+    using StateLibrary for IPoolManager;
+
     BondMeBro internal hook;
 
     PoolKey internal key_;
@@ -45,12 +50,39 @@ contract BondThresholdsTest is Test, Deployers {
 
     uint16 internal constant BOND_BPS = 25;
 
+    /// @dev Settlement noise floor, in ticks. Displacement at or below this is never slashed.
+    uint16 internal constant REFUND_TOL = 5;
+
     /// @dev Independent raw-unit thresholds for the two input currencies.
+    ///
+    ///      THRESHOLD_1 CAME DOWN FROM 1e18 TO 1e9 IN P-L2-3/4, and the reason is a real new
+    ///      constraint rather than convenience.
+    ///
+    ///      Model L sizes collateral from the realized tick impact, so a swap only bonds if it
+    ///      actually moves the price. That ties every amount in this file to the pool's depth, and
+    ///      the two ends now pull against each other:
+    ///
+    ///        THRESHOLD_0 = 1e6 must MOVE a tick   -> liquidity must be at or below ~2e10
+    ///        THRESHOLD_1 = 1e18 must FILL         -> liquidity must be far above 1e10
+    ///
+    ///      No single pool satisfies both: 1e18 against 2e10 of liquidity is a swap a thousand
+    ///      times the size of the pool. The twelve orders of magnitude between the thresholds were
+    ///      never the point -- the point is that the two currencies have INDEPENDENT thresholds and
+    ///      that direction selects between them. That property is preserved exactly by a narrower
+    ///      spread, and the asymmetric token decimals which give the suite its name are untouched.
     uint128 internal constant THRESHOLD_0 = 1e6;
-    uint96 internal constant THRESHOLD_1 = 1e18;
+    uint96 internal constant THRESHOLD_1 = 1e9;
 
     /// @dev The same raw amount sits above threshold0 but below threshold1, so it should bond in only one direction.
     uint256 internal constant STRADDLING_AMOUNT = 1e7;
+
+    /// @dev Sized so `THRESHOLD_0` (the smallest bonded amount here) still crosses a tick.
+    ///
+    ///      Measured on this fixture: at 1e10 a 1e6 swap moves ~2 ticks and a 1e9 swap moves far
+    ///      past the 397-tick cap, so both ends of the threshold range produce a real, non-zero
+    ///      Model L rate. At the old 1e21 every swap in this file moved zero ticks and therefore
+    ///      bonded nothing, which is how this suite failed after the migration.
+    int128 internal constant POOL_LIQUIDITY = 1e10;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -94,18 +126,25 @@ contract BondThresholdsTest is Test, Deployers {
         // Tick 0 gives a 1:1 raw-unit price. That is not meant to model a real
         // 6-decimal/18-decimal market; it keeps execution symmetric so the tests
         // isolate threshold selection.
-        (key_, id_) =
-            initPoolAndAddLiquidity(currency0, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0));
+        // `initPool`, NOT `initPoolAndAddLiquidity`.
+        //
+        // The convenience helper also installs `Deployers`' default position: 1e18 of liquidity in
+        // a narrow band around tick 0. That is four to eight orders of magnitude deeper than this
+        // suite needs, and it sits exactly where these swaps execute, so it would dominate the
+        // price response completely and hold every swap in this file below one tick of impact --
+        // bonding nothing. The pool is therefore initialized empty and given only the depth
+        // deliberately chosen in `POOL_LIQUIDITY`.
+        (key_, id_) = initPool(currency0, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0));
 
         modifyLiquidityRouter.modifyLiquidity(
             key_,
             ModifyLiquidityParams({
-                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e21, salt: bytes32(uint256(1))
+                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: POOL_LIQUIDITY, salt: bytes32(uint256(1))
             }),
             ""
         );
 
-        hook.setPoolConfig(key_, THRESHOLD_0, THRESHOLD_1, BOND_BPS);
+        hook.setPoolConfig(key_, THRESHOLD_0, THRESHOLD_1, BOND_BPS, REFUND_TOL);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -129,15 +168,60 @@ contract BondThresholdsTest is Test, Deployers {
         return HookDataCodec.encode(TRADER, GENEROUS_CEILING);
     }
 
-    /// @dev Executes a swap and returns the real bond received by BondMeBro in that swap's input currency.
+    /// @dev Executes a swap and returns the real collateral received by BondMeBro, IN WHICHEVER
+    ///      CURRENCY the swap's variable leg is denominated.
+    ///
+    ///      This helper used to watch the INPUT currency unconditionally, which was correct while
+    ///      collateral always came out of the input. Under ADR-0006 the collateral currency depends
+    ///      on the swap KIND as well as its direction, so for an exact-input swap it is the OUTPUT.
+    ///      A helper still watching the input would report zero for every correctly bonded
+    ///      exact-input swap in this file -- indistinguishable from "the threshold rejected it",
+    ///      which is exactly the property the suite exists to measure.
     function _bondTakenBy(int256 amountSpecified, bool zeroForOne, bytes memory hookData) internal returns (uint256) {
-        Currency inputCurrency = zeroForOne ? currency0 : currency1;
+        Currency collateralCurrency =
+            ModelLReference.collateralIsCurrency0(zeroForOne, amountSpecified < 0) ? currency0 : currency1;
 
-        uint256 beforeBalance = inputCurrency.balanceOf(address(hook));
+        Currency variableCurrency = amountSpecified < 0
+            ? (zeroForOne ? currency1 : currency0)  // exact-input: the variable leg is the output
+            : (zeroForOne ? currency0 : currency1); // exact-output: the variable leg is the input
+
+        uint256 beforeBalance = collateralCurrency.balanceOf(address(hook));
+
+        uint256 traderBefore = variableCurrency.balanceOf(address(this));
+        uint256 managerBefore = variableCurrency.balanceOf(address(manager));
+
+        _lastTickBefore = _tick();
 
         _swap(amountSpecified, zeroForOne, hookData);
 
-        return inputCurrency.balanceOf(address(hook)) - beforeBalance;
+        _lastTickAfter = _tick();
+
+        uint256 taken = collateralCurrency.balanceOf(address(hook)) - beforeBalance;
+
+        // The realized variable leg, reconstructed from balances.
+        //
+        //   exact-input  : the pool paid out `traderGain + bond`, since the hook withheld its
+        //                  collateral from the output before the trader saw it.
+        //   exact-output : the pool RECEIVED the leg, so it is the manager's gain.
+        //
+        // Recovering it from measured movement rather than from the hook's own record keeps the
+        // sizing assertions independent of the thing they are checking.
+        _lastLeg = amountSpecified < 0
+            ? (variableCurrency.balanceOf(address(this)) - traderBefore) + taken
+            : (variableCurrency.balanceOf(address(manager)) - managerBefore);
+
+        return taken;
+    }
+
+    /// @dev Set by `_bondTakenBy` so callers can size the expected bond independently.
+    uint256 internal _lastLeg;
+    int24 internal _lastTickBefore;
+    int24 internal _lastTickAfter;
+
+    /// @dev The pool tick.
+    function _tick() internal view returns (int24 tick) {
+        // slither-disable-next-line unused-return
+        (, tick,,) = manager.getSlot0(id_);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -158,7 +242,14 @@ contract BondThresholdsTest is Test, Deployers {
 
         assertGt(bond0, 0, "currency0-in swap above its threshold was not bonded");
 
-        assertEq(bond0, STRADDLING_AMOUNT * BOND_BPS / 10_000, "currency0 bond is not bondBps of gross");
+        // Sizing is asserted through the independent Model L reference rather than against
+        // `bondBps`, which no longer determines the rate. The leg here is the OUTPUT, because
+        // this is an exact-input swap.
+        assertEq(
+            bond0,
+            ModelLReference.collateralFor(_lastLeg, _lastTickBefore, _lastTickAfter),
+            "currency0-in bond does not match the Model L rate on the realized output"
+        );
 
         uint256 bond1 = _bondTakenBy(-int256(STRADDLING_AMOUNT), false, "");
 
@@ -177,16 +268,32 @@ contract BondThresholdsTest is Test, Deployers {
 
         uint256 bond = _bondTakenBy(-int256(uint256(THRESHOLD_0)), true, _validHookData());
 
-        assertEq(bond, uint256(THRESHOLD_0) * BOND_BPS / 10_000, "exactly at threshold0 was not bonded correctly");
+        assertGt(bond, 0, "exactly at threshold0 was not bonded");
+
+        assertEq(
+            bond,
+            ModelLReference.collateralFor(_lastLeg, _lastTickBefore, _lastTickAfter),
+            "the bond at threshold0 does not match the Model L rate"
+        );
     }
 
     /// @notice For oneForZero exact-input swaps, currency1 is the input and `THRESHOLD_1` must be used.
     function test_exactInput_oneForZero_selectsThreshold1() public {
-        assertEq(_bondTakenBy(-1e17, false, ""), 0, "amount below threshold1 was bonded on the currency1 side");
+        assertEq(
+            _bondTakenBy(-int256(uint256(THRESHOLD_1) - 1), false, ""),
+            0,
+            "amount below threshold1 was bonded on the currency1 side"
+        );
 
         uint256 bond = _bondTakenBy(-int256(uint256(THRESHOLD_1)), false, _validHookData());
 
-        assertEq(bond, uint256(THRESHOLD_1) * BOND_BPS / 10_000, "exactly at threshold1 was not bonded correctly");
+        assertGt(bond, 0, "exactly at threshold1 was not bonded");
+
+        assertEq(
+            bond,
+            ModelLReference.collateralFor(_lastLeg, _lastTickBefore, _lastTickAfter),
+            "the bond at threshold1 does not match the Model L rate"
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -222,9 +329,9 @@ contract BondThresholdsTest is Test, Deployers {
 
     /// @notice The maximum `uint96` currency1 threshold can be stored without truncating or corrupting neighbouring packed fields.
     function test_setPoolConfig_acceptsMaxUint96Threshold() public {
-        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, BOND_BPS);
+        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, BOND_BPS, REFUND_TOL);
 
-        (uint128 min0, uint96 min1, uint16 bondBps) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, uint16 bondBps,) = hook.poolConfig(id_);
 
         assertEq(min1, type(uint96).max, "uint96 threshold was truncated");
 
@@ -240,7 +347,7 @@ contract BondThresholdsTest is Test, Deployers {
         uint256 tooBig = uint256(type(uint96).max) + 1;
 
         bytes memory badCalldata = abi.encodeWithSelector(
-            BondMeBro.setPoolConfig.selector, key_, uint256(THRESHOLD_0), tooBig, uint256(BOND_BPS)
+            BondMeBro.setPoolConfig.selector, key_, uint256(THRESHOLD_0), tooBig, uint256(BOND_BPS), uint256(REFUND_TOL)
         );
 
         (bool success,) = address(hook).call(badCalldata);
@@ -248,7 +355,7 @@ contract BondThresholdsTest is Test, Deployers {
         assertFalse(success, "an oversized uint96 threshold was accepted through raw calldata");
 
         // Rejected calldata must leave the existing configuration unchanged.
-        (uint128 min0, uint96 min1, uint16 bondBps) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, uint16 bondBps,) = hook.poolConfig(id_);
 
         assertEq(min0, THRESHOLD_0, "config was mutated by a rejected call");
 
@@ -260,14 +367,19 @@ contract BondThresholdsTest is Test, Deployers {
     /// @notice Equivalent raw calldata with an in-range `uint96` value succeeds.
     function test_setPoolConfig_rawCalldataWithinRangeSucceeds() public {
         bytes memory goodCalldata = abi.encodeWithSelector(
-            BondMeBro.setPoolConfig.selector, key_, uint256(THRESHOLD_0), uint256(type(uint96).max), uint256(BOND_BPS)
+            BondMeBro.setPoolConfig.selector,
+            key_,
+            uint256(THRESHOLD_0),
+            uint256(type(uint96).max),
+            uint256(BOND_BPS),
+            uint256(REFUND_TOL)
         );
 
         (bool success,) = address(hook).call(goodCalldata);
 
         assertTrue(success, "a valid raw-calldata config was rejected");
 
-        (, uint96 min1,) = hook.poolConfig(id_);
+        (, uint96 min1,,) = hook.poolConfig(id_);
 
         assertEq(min1, type(uint96).max, "raw-calldata config did not take effect");
     }
@@ -330,26 +442,35 @@ contract BondThresholdsTest is Test, Deployers {
         uint96 rawAmount,
         bool zeroForOne
     ) public {
-        uint128 min0 = uint128(bound(uint256(raw0), 1, 1e15));
+        uint128 min0 = uint128(bound(uint256(raw0), 1, 1e9));
 
-        uint96 min1 = uint96(bound(uint256(raw1), 1, 1e15));
+        uint96 min1 = uint96(bound(uint256(raw1), 1, 1e9));
 
-        uint256 amount = bound(uint256(rawAmount), 1e6, 1e16);
+        // Ranges narrowed to the band this pool's depth can actually execute -- see the note on
+        // `THRESHOLD_1`. Above ~1e9 the swap exhausts the position and stops at its price limit,
+        // which would make this a partial-fill test rather than a threshold-selection one.
+        uint256 amount = bound(uint256(rawAmount), 1e6, 1e9);
 
-        hook.setPoolConfig(key_, min0, min1, BOND_BPS);
+        hook.setPoolConfig(key_, min0, min1, BOND_BPS, REFUND_TOL);
 
         uint256 applicable = zeroForOne ? uint256(min0) : uint256(min1);
-
-        bool shouldBond = amount >= applicable && (amount * BOND_BPS) / 10_000 > 0;
 
         // Supplying valid hookData is harmless on an unbonded exact-input swap
         // because the hook does not decode it unless the threshold is reached.
         uint256 bond = _bondTakenBy(-int256(amount), zeroForOne, _validHookData());
 
-        if (shouldBond) {
-            assertEq(bond, amount * BOND_BPS / 10_000, "bonded swap took the wrong bond");
-        } else {
+        if (amount < applicable) {
+            // BELOW the threshold the claim is unconditional: eligibility is decided on the input
+            // amount alone, and no impact, however large, can bond a trade that does not qualify.
             assertEq(bond, 0, "swap below its own currency's threshold was bonded");
+        } else {
+            // AT OR ABOVE the threshold the trade participates, but Model L still decides what it
+            // pays -- and a swap that moved no whole tick pays nothing. That is not a threshold
+            // failure, so the two outcomes are asserted separately rather than collapsed into one
+            // expectation.
+            uint256 expected = ModelLReference.collateralFor(_lastLeg, _lastTickBefore, _lastTickAfter);
+
+            assertEq(bond, expected, "eligible swap did not take the Model L collateral");
         }
     }
 }

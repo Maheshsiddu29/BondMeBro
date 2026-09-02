@@ -34,6 +34,11 @@ contract HookDataCodecHarness {
 /// @notice Tests the HookDataCodec wire format, validation rules, fuzz properties, and decode gas cost.
 
 /// @dev The versioned 37-byte payload is part of BondMeBro's integration interface, so these tests verify both semantic roundtrips and the exact byte layout. Malformed payloads must fail closed rather than being partially decoded or silently ignored.
+
+/// VERSION 2. Version 1 had the SAME 37-byte shape and differed only in the unit of
+/// `maxBondAmount`, so no length or structural check can separate the two — only the version
+/// byte can. `test_version1_rejected` is therefore the most security-relevant test in this file
+/// and must never be relaxed into a generic "unsupported version" case.
 contract HookDataCodecTest is Test {
     HookDataCodecHarness internal harness;
 
@@ -63,7 +68,7 @@ contract HookDataCodecTest is Test {
         assertEq(maxBond, MAX_BOND, "maxBondAmount did not survive the roundtrip");
     }
 
-    /// @notice Verifies that version 1 is exactly 37 bytes and places the version byte at offset 0.
+    /// @notice Verifies that version 2 is exactly 37 bytes and places the version byte at offset 0.
 
     /// @dev A roundtrip alone is not enough to protect a wire format because `encode` and `decode` could change together and still pass. These assertions pin the external byte-level format.
     function test_wireFormat_versionByteIsFirst() public pure {
@@ -73,10 +78,12 @@ contract HookDataCodecTest is Test {
 
         assertEq(uint8(data[0]), HookDataCodec.VERSION, "version byte is not at offset 0");
 
+        assertEq(HookDataCodec.VERSION, 2, "VERSION must be 2 after the v2 migration");
+
         assertEq(HookDataCodec.ENCODED_LENGTH, 37, "ENCODED_LENGTH drifted from 1 + 20 + 16");
     }
 
-    /// @notice Verifies the exact packed position of every version 1 field.
+    /// @notice Verifies the exact packed position of every version 2 field.
     function test_wireFormat_fieldOffsets() public view {
         address recipient = address(0x00112233445566778899AABbCCdDeeFf00112233);
 
@@ -84,7 +91,7 @@ contract HookDataCodecTest is Test {
 
         bytes memory data = HookDataCodec.encode(recipient, maxBond);
 
-        assertEq(data, abi.encodePacked(uint8(1), recipient, maxBond), "packed layout changed");
+        assertEq(data, abi.encodePacked(uint8(2), recipient, maxBond), "packed layout changed");
 
         (address decodedRecipient, uint128 decodedMaxBond) = harness.decode(data);
 
@@ -114,6 +121,66 @@ contract HookDataCodecTest is Test {
         assertEq(decodedMaxBond, 1, "maxBondAmount 1 mangled");
     }
 
+    /// @notice Pins each field's byte range independently, by reading the payload directly.
+    ///
+    /// @dev `test_wireFormat_fieldOffsets` compares against `abi.encodePacked`, which would still
+    ///      pass if BOTH the codec and the expectation moved together. This reads the bytes at
+    ///      their documented offsets by hand, so the wire format is pinned against the
+    ///      DOCUMENTATION rather than against another encoder.
+    function test_wireFormat_offsetsReadByHand() public view {
+        address recipient = address(0x00112233445566778899AABbCCdDeeFf00112233);
+        uint128 maxBond = 0x0123456789ABCDEF0123456789ABCDEF;
+
+        bytes memory data = HookDataCodec.encode(recipient, maxBond);
+
+        // byte 0: version
+        assertEq(uint8(data[0]), 2, "offset 0 must hold version 2");
+
+        // bytes 1..20: recipient, big-endian
+        uint160 readRecipient;
+        for (uint256 i = 1; i <= 20; i++) {
+            readRecipient = (readRecipient << 8) | uint160(uint8(data[i]));
+        }
+        assertEq(address(readRecipient), recipient, "recipient is not at bytes 1..20");
+
+        // bytes 21..36: uint128 maxBondAmount, big-endian
+        uint128 readMaxBond;
+        for (uint256 i = 21; i <= 36; i++) {
+            readMaxBond = (readMaxBond << 8) | uint128(uint8(data[i]));
+        }
+        assertEq(readMaxBond, maxBond, "maxBondAmount is not at bytes 21..36");
+
+        assertEq(data.length, 37, "payload is not exactly 37 bytes");
+    }
+
+    /// @notice Neither packed field bleeds into its neighbour at the boundaries.
+    /// @dev An all-ones recipient beside a 1-wei ceiling, and the reverse, are the arrangements
+    ///      an off-by-one offset would corrupt.
+    function test_wireFormat_adjacentFieldsDoNotBleed() public view {
+        (address r1, uint128 m1) = harness.decode(HookDataCodec.encode(address(type(uint160).max), 1));
+        assertEq(r1, address(type(uint160).max), "all-ones recipient bled into maxBondAmount");
+        assertEq(m1, 1, "maxBondAmount corrupted by a full recipient");
+
+        (address r2, uint128 m2) = harness.decode(HookDataCodec.encode(address(1), type(uint128).max));
+        assertEq(r2, address(1), "recipient corrupted by a full maxBondAmount");
+        assertEq(m2, type(uint128).max, "all-ones maxBondAmount bled into the recipient");
+    }
+
+    /// @notice The documented ceiling boundaries survive a roundtrip.
+    /// @dev `maxBondAmount == 0` is deliberately absent here: the codec REJECTS it (see
+    ///      `test_zeroMaxBondAmount_reverts`), and that pre-existing rule is preserved by this
+    ///      migration rather than changed by it.
+    function test_maxBondAmount_boundaries() public view {
+        (, uint128 one) = harness.decode(HookDataCodec.encode(RECIPIENT, 1));
+        assertEq(one, 1, "maxBondAmount of 1 mangled");
+
+        (, uint128 max) = harness.decode(HookDataCodec.encode(RECIPIENT, type(uint128).max));
+        assertEq(max, type(uint128).max, "maxBondAmount of type(uint128).max mangled");
+
+        (, uint128 mid) = harness.decode(HookDataCodec.encode(RECIPIENT, type(uint128).max / 2));
+        assertEq(mid, type(uint128).max / 2, "mid-range maxBondAmount mangled");
+    }
+
     /*//////////////////////////////////////////////////////////////
                          MALFORMED — DECODE
     //////////////////////////////////////////////////////////////*/
@@ -125,7 +192,7 @@ contract HookDataCodecTest is Test {
         harness.decode("");
     }
 
-    /// @notice Every truncated version 1 payload is rejected.
+    /// @notice Every truncated version 2 payload is rejected.
     function test_truncated_reverts() public {
         bytes memory valid = HookDataCodec.encode(RECIPIENT, MAX_BOND);
 
@@ -145,7 +212,7 @@ contract HookDataCodecTest is Test {
         }
     }
 
-    /// @notice Payloads longer than the exact version 1 length are rejected rather than having trailing bytes ignored.
+    /// @notice Payloads longer than the exact version 2 length are rejected rather than having trailing bytes ignored.
     function test_overLong_reverts() public {
         bytes memory valid = HookDataCodec.encode(RECIPIENT, MAX_BOND);
 
@@ -162,9 +229,9 @@ contract HookDataCodecTest is Test {
 
     /// @notice A payload created with normal `abi.encode` instead of the packed codec is rejected as an unsupported version.
 
-    /// @dev `abi.encode(uint8, address, uint128)` produces three 32-byte words. The `uint8` is right-aligned inside the first word, so byte 0 is zero rather than version 1. Because the codec reads the version before checking length, the error clearly identifies the schema mismatch.
+    /// @dev `abi.encode(uint8, address, uint128)` produces three 32-byte words. The `uint8` is right-aligned inside the first word, so byte 0 is zero rather than the version. Because the codec reads the version before checking length, the error clearly identifies the schema mismatch.
     function test_abiEncodedPayload_revertsAsWrongVersion() public {
-        bytes memory abiEncoded = abi.encode(uint8(1), RECIPIENT, MAX_BOND);
+        bytes memory abiEncoded = abi.encode(HookDataCodec.VERSION, RECIPIENT, MAX_BOND);
 
         assertEq(abiEncoded.length, 96, "sanity: abi.encode of these three fields is 96 bytes");
 
@@ -175,13 +242,66 @@ contract HookDataCodecTest is Test {
         harness.decode(abiEncoded);
     }
 
-    /// @notice An unsupported non-zero schema version is rejected.
-    function test_wrongVersion_reverts() public {
-        bytes memory data = abi.encodePacked(uint8(2), RECIPIENT, MAX_BOND);
+    /// @notice An unsupported FUTURE schema version is rejected.
+    /// @dev This probe used version 2 before the migration. Version 2 is now the supported
+    ///      schema, so the probe moved to 3 — had it been left alone it would have silently
+    ///      become a "valid payload is accepted" test wearing this name.
+    function test_futureVersion_reverts() public {
+        bytes memory data = abi.encodePacked(uint8(3), RECIPIENT, MAX_BOND);
 
-        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(2)));
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(3)));
 
         harness.decode(data);
+    }
+
+    /// @notice The maximum representable version byte is rejected.
+    function test_version255_reverts() public {
+        bytes memory data = abi.encodePacked(uint8(255), RECIPIENT, MAX_BOND);
+
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(255)));
+
+        harness.decode(data);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    VERSION 1 REJECTION — THE SECURITY CASE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice A well-formed, previously-valid VERSION 1 payload is rejected.
+    ///
+    /// @dev THE REASON THIS FILE EXISTS IN ITS CURRENT FORM. Version 1 and version 2 have
+    ///      byte-identical shape — same 37 bytes, same field offsets, same types — and differ
+    ///      only in what `maxBondAmount` MEANS. Version 1 denominated it in the swap's INPUT
+    ///      currency; version 2 denominates it in the COLLATERAL currency, which for an
+    ///      exact-input swap is the OUTPUT.
+    ///
+    ///      So a stale version 1 payload replayed unchanged would express the trader's ceiling
+    ///      in the wrong token — potentially with different decimals, making the ceiling orders
+    ///      of magnitude too large or too small. **No length, shape or structural check can
+    ///      detect that.** Only the version byte can, which is why `decode` reads it first and
+    ///      why version 1 must fail loudly rather than be reinterpreted or upgraded.
+    function test_version1_rejected() public {
+        // Byte-for-byte what `encode` produced before the migration.
+        bytes memory v1 = abi.encodePacked(uint8(1), RECIPIENT, MAX_BOND);
+
+        assertEq(v1.length, HookDataCodec.ENCODED_LENGTH, "v1 shares v2 length, so length cannot separate them");
+
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(1)));
+
+        harness.decode(v1);
+    }
+
+    /// @notice Version 1 is rejected on the VERSION byte, not by accident of some other check.
+    /// @dev Pins that the rejection survives even when every other field is perfectly valid —
+    ///      a non-zero recipient, a non-zero ceiling and the exact expected length.
+    function test_version1_rejectedEvenWhenOtherwisePerfect() public {
+        bytes memory v1 = abi.encodePacked(uint8(1), address(0x1234), uint128(1));
+
+        assertEq(v1.length, 37);
+
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(1)));
+
+        harness.decode(v1);
     }
 
     /// @notice Version zero is not treated as a valid version 1 payload.
@@ -193,15 +313,25 @@ contract HookDataCodecTest is Test {
         harness.decode(data);
     }
 
-    /// @notice Version validation happens before version 1 length validation.
+    /// @notice Version validation happens before version 2 length validation.
 
-    /// @dev A future payload with a different version and different size should be reported as unsupported rather than incorrectly reported as malformed version 1 data.
+    /// @dev A future payload with a different version and different size should be reported as unsupported rather than incorrectly reported as malformed version 2 data.
     function test_wrongVersion_isCheckedBeforeLength() public {
-        bytes memory shortV2 = abi.encodePacked(uint8(2), bytes4(0xDEADBEEF));
+        bytes memory shortV3 = abi.encodePacked(uint8(3), bytes4(0xDEADBEEF));
 
-        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(2)));
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(3)));
 
-        harness.decode(shortV2);
+        harness.decode(shortV3);
+    }
+
+    /// @notice A SHORT version 1 payload is reported as an unsupported version, not a bad length.
+    /// @dev Confirms there is no path on which a version 1 payload reaches the field decoders.
+    function test_version1_shortPayload_reportsVersionNotLength() public {
+        bytes memory shortV1 = abi.encodePacked(uint8(1), bytes4(0xDEADBEEF));
+
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(1)));
+
+        harness.decode(shortV1);
     }
 
     /// @notice A zero refund recipient is rejected.
@@ -270,7 +400,7 @@ contract HookDataCodecTest is Test {
         assertEq(decodedMaxBond, maxBondAmount, "maxBondAmount not preserved");
     }
 
-    /// @notice Any payload with version 1 but the wrong total length must revert.
+    /// @notice Any payload with the supported version but the wrong total length must revert.
 
     /// @dev The valid version byte is prepended explicitly so this fuzz test reaches the length check rather than being rejected earlier by version validation.
     function testFuzz_wrongLengthAlwaysReverts(bytes calldata blob) public {
@@ -290,10 +420,33 @@ contract HookDataCodecTest is Test {
     }
 
     /// @notice Any leading version byte other than the supported version is rejected regardless of the remaining bytes.
-    function testFuzz_anyNonOneVersionReverts(uint8 version, bytes calldata tail) public {
+    /// @dev Includes version 1 in its domain, so the v1 rejection is fuzzed as well as pinned.
+    function testFuzz_anyUnsupportedVersionReverts(uint8 version, bytes calldata tail) public {
         vm.assume(version != HookDataCodec.VERSION);
 
         bytes memory data = abi.encodePacked(version, tail);
+
+        vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, version));
+
+        harness.decode(data);
+    }
+
+    /// @notice Fuzzes a full-length payload whose only defect is the version byte.
+    /// @dev Complements `testFuzz_anyUnsupportedVersionReverts`, which fuzzes the tail too: here
+    ///      the payload is otherwise perfectly valid, so the version byte is provably the only
+    ///      reason it is rejected. Version 1 is inside the domain.
+    function testFuzz_wellFormedPayloadWithWrongVersionReverts(
+        uint8 version,
+        address refundRecipient,
+        uint128 maxBondAmount
+    ) public {
+        vm.assume(version != HookDataCodec.VERSION);
+        vm.assume(refundRecipient != address(0));
+        vm.assume(maxBondAmount != 0);
+
+        bytes memory data = abi.encodePacked(version, refundRecipient, maxBondAmount);
+
+        assertEq(data.length, HookDataCodec.ENCODED_LENGTH, "probe must be full length");
 
         vm.expectRevert(abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, version));
 

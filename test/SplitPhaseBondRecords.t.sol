@@ -32,6 +32,9 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
     uint128 internal constant MIN_BONDED = 1e15;
     uint96 internal constant MIN_BONDED_1 = 1e15;
     uint16 internal constant BOND_BPS = 25;
+
+    /// @dev Settlement noise floor, in ticks. Displacement at or below this is never slashed.
+    uint16 internal constant REFUND_TOL = 5;
     uint128 internal constant GENEROUS_CEILING = type(uint128).max;
 
     uint128 internal constant BONDED_OUTPUT = 1e16;
@@ -58,15 +61,18 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         (key_, id_) =
             initPoolAndAddLiquidity(currency0, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0));
 
+        // Reduced from 1e21 in P-L2-3/4. Model L bonds nothing when a swap moves no whole tick,
+        // and at 1e21 the swaps in this file moved one tick at best -- so several of them landed
+        // on zero impact and produced no record at all, which this suite reads as "bond missing".
         modifyLiquidityRouter.modifyLiquidity(
             key_,
             ModifyLiquidityParams({
-                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e21, salt: bytes32(uint256(1))
+                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e19, salt: bytes32(uint256(1))
             }),
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -233,8 +239,17 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         assertEq(bond.refundRecipient, TRADER, "refund recipient not bound");
         assertEq(bond.openBlock, openBlock, "open block not bound");
         assertEq(bond.maturityBlock, m, "maturity not bound");
-        assertEq(uint256(bond.amount), actualBond, "bond amount does not match the collateral taken");
-        assertTrue(bond.inputIsCurrency0, "input currency side not bound");
+        assertEq(
+            uint256(hook.collateralAmountOf(bondId)),
+            actualBond,
+            "recomputed collateral does not match the collateral taken"
+        );
+        // EXACT-OUTPUT zeroForOne. The specified leg is the output, so the VARIABLE leg is the
+        // input -- currency0. This is the half of the migration that did NOT change currencies:
+        // exact-output collateral came from the input before and still does. It changed reason,
+        // not side, and stating the reason is what stops the next reader from "fixing" it to
+        // match the exact-input case two tests below.
+        assertTrue(bond.collateralIsCurrency0, "exact-output zeroForOne collateral must be currency0 (the input)");
         assertGt(bond.poolIndex, 0, "pool identity not bound");
         assertEq(uint8(bond.state), STATE_FINALIZED, "record is not finalized");
 
@@ -257,7 +272,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
 
         BondMeBro.Bond memory afterLater = hook.getBond(bondId);
 
-        assertEq(afterLater.amount, before.amount, "amount changed");
+        assertEq(afterLater.variableLegAmount, before.variableLegAmount, "variable leg changed");
         assertEq(afterLater.maturityBlock, before.maturityBlock, "maturity changed");
         assertEq(afterLater.tickAfter, before.tickAfter, "tickAfter changed");
         assertEq(afterLater.cumulativeAtOpen, before.cumulativeAtOpen, "opening observation changed");
@@ -312,8 +327,8 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         assertEq(pending, 2, "pendingBonds does not reflect both bonds");
 
         // Both records are intact — the second did not overwrite the first.
-        assertGt(hook.getBond(first).amount, 0, "first bond has no amount");
-        assertGt(hook.getBond(second).amount, 0, "second bond has no amount");
+        assertGt(hook.getBond(first).variableLegAmount, 0, "first bond has no variable leg");
+        assertGt(hook.getBond(second).variableLegAmount, 0, "second bond has no variable leg");
     }
 
     /// @notice ID REUSE AFTER AN UNBONDED CLEAR. An unbonded swap writes provisional id N and
@@ -338,7 +353,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         _swap(int256(uint256(BONDED_OUTPUT)), true, _validHookData());
 
         assertEq(_rawState(reusedId), STATE_FINALIZED, "reused id is not finalized");
-        assertGt(hook.getBond(reusedId).amount, 0, "reused record has no amount");
+        assertGt(hook.getBond(reusedId).variableLegAmount, 0, "reused record has no variable leg");
 
         (, uint32 pendingAfterBonded,) = hook.maturity(id_, m);
         assertEq(pendingAfterBonded, 1, "reused id did not register exactly once");

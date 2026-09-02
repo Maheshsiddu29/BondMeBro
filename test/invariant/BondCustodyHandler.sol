@@ -13,6 +13,8 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
 import {BondMeBro} from "../../src/BondMeBro.sol";
 import {HookDataCodec} from "../../src/libraries/HookDataCodec.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {ModelLReference} from "../utils/ModelLReference.sol";
 
 /// @title BondCustodyHandler
 
@@ -23,6 +25,8 @@ import {HookDataCodec} from "../../src/libraries/HookDataCodec.sol";
 /// Reverted swaps are expected during fuzzing. A revert must leave custody accounting unchanged, so ghost totals are updated only after a successful swap.
 
 contract BondCustodyHandler is Test {
+    using StateLibrary for IPoolManager;
+
     IPoolManager internal immutable manager;
     PoolSwapTest internal immutable swapRouter;
     BondMeBro internal immutable hook;
@@ -60,6 +64,52 @@ contract BondCustodyHandler is Test {
 
     /// @notice Number of swap attempts that reverted.
     uint256 public reverted;
+
+    /*//////////////////////////////////////////////////////////////
+                      T5B SETTLEMENT GHOST ACCOUNTING
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Collateral still owed to traders — finalized bonds not yet settled, per currency.
+    /// @dev Decreases when a bond settles, by the full collateral: part leaves as refund, the rest
+    ///      is reclassified into the pot. Both halves are tracked separately below.
+    mapping(Currency => uint256) public ghostUnsettledCollateral;
+
+    /// @notice Slashed collateral retained by the hook, per currency, as the handler models it.
+    mapping(Currency => uint256) public ghostInsurancePot;
+
+    /// @notice Total refunds actually paid out, per currency.
+    mapping(Currency => uint256) public ghostRefundPaid;
+
+    /// @notice Bonds settled by the campaign.
+    uint256 public settledCount;
+
+    /// @notice Bonds whose settlement was attempted too early and correctly reverted.
+    uint256 public earlySettleRejected;
+
+    /// @notice STICKY. Set if any settled bond failed `refund + slash == collateral`.
+    bool public ghostConservationViolated;
+
+    /// @notice STICKY. Set if a bond ever settled twice.
+    bool public ghostDoubleSettlement;
+
+    /// @notice Bond ids the campaign has finalized and not yet settled.
+    /// @dev Bounded the same way the maturity active set is: entries leave on settlement. It holds
+    ///      only live liabilities, never settled history.
+    bytes32[] internal openBondIds;
+
+    /// @notice Whether a bond id is currently in `openBondIds`.
+    mapping(bytes32 => bool) internal bondOpen;
+
+    /// @notice Whether the campaign has already settled this bond, for double-settle detection.
+    mapping(bytes32 => bool) internal bondSettled;
+
+    function openBondCount() external view returns (uint256) {
+        return openBondIds.length;
+    }
+
+    function openBondAt(uint256 index) external view returns (bytes32) {
+        return openBondIds[index];
+    }
 
     /// @notice Every maturity block any swap has plausibly touched, in first-seen order.
     ///
@@ -218,23 +268,28 @@ contract BondCustodyHandler is Test {
     /// @param zeroForOne Swap direction.
     /// @param tightCeiling Whether to deliberately make the bond ceiling too small.
     function swapExactInput(uint256 amountSeed, bool zeroForOne, bool tightCeiling) external {
-        (Currency inputCurrency,) = _currencies(zeroForOne);
-
         uint256 minBondedAmount = _threshold(zeroForOne);
-
-        (,, uint16 bondBps) = hook.poolConfig(key_.toId());
 
         uint256 grossInput = _sizeStraddlingThreshold(amountSeed, minBondedAmount);
 
-        // Independently calculate the bond expected from an exact-input swap.
-        uint256 expectedBond = grossInput < minBondedAmount ? 0 : (grossInput * bondBps) / BPS;
+        // THE EXACT-INPUT BOND CAN NO LONGER BE PREDICTED BEFORE EXECUTION.
+        //
+        // The old model computed it here, from the requested gross input, because that is exactly
+        // what the hook did -- and that shared assumption is precisely the defect INV-L2-13
+        // names. Model L prices collateral from the REALIZED variable leg and the REALIZED tick
+        // impact, neither of which exists until the swap has run.
+        //
+        // So both swap kinds now take the same path: execute, measure, then reconstruct the
+        // expected bond from what actually happened. The ghost model is strictly stronger for it,
+        // because it no longer shares a formula with the code under test -- it shares only the
+        // specification, restated in `ModelLReference`.
+        //
+        // The tight-ceiling path is driven differently for the same reason: without a predicted
+        // bond there is no "one wei below" to aim at, so a ceiling of 1 is used, which is below
+        // any bond this pool can produce and therefore still exercises the rejection path.
+        uint128 ceiling = tightCeiling ? 1 : type(uint128).max;
 
-        uint128 ceiling = _ceiling(expectedBond, tightCeiling);
-
-        // A zero maxBondAmount cannot produce valid hookData.
-        if (ceiling == 0) return;
-
-        _execute(-int256(grossInput), zeroForOne, inputCurrency, expectedBond, ceiling, expectedBond > 0, true);
+        _execute(-int256(grossInput), zeroForOne, ceiling, true);
 
         _resolveDueMaturities();
     }
@@ -249,17 +304,13 @@ contract BondCustodyHandler is Test {
     /// @param zeroForOne Swap direction.
     /// @param tightCeiling Whether to use a deliberately restrictive bond ceiling.
     function swapExactOutput(uint256 amountSeed, bool zeroForOne, bool tightCeiling) external {
-        (Currency inputCurrency,) = _currencies(zeroForOne);
-
         uint256 amountOut = _sizeStraddlingThreshold(amountSeed, _threshold(zeroForOne));
 
-        // The real exact-output bond is unknown until execution.
-        //
         // A value of 1 is intentionally restrictive; otherwise use the maximum
         // uint128 ceiling so normal bonded swaps can succeed.
         uint128 ceiling = tightCeiling ? 1 : type(uint128).max;
 
-        _execute(int256(amountOut), zeroForOne, inputCurrency, 0, ceiling, false, false);
+        _execute(int256(amountOut), zeroForOne, ceiling, false);
 
         _resolveDueMaturities();
     }
@@ -280,9 +331,136 @@ contract BondCustodyHandler is Test {
         _resolveDueMaturities();
     }
 
+    /// @notice Settles one of the campaign's open bonds, if any is mature.
+    ///
+    /// @dev The action that makes the solvency invariants meaningful — before settlement existed,
+    ///      nothing could leave the hook and the old equality held trivially.
+    ///
+    ///      Measures the real refund from the recipient's balance and the real slash from the
+    ///      pot, then checks conservation against the recorded collateral. A mismatch sets a
+    ///      sticky flag rather than reverting, so the campaign continues and the invariant reports
+    ///      it.
+    ///
+    /// @param seed Fuzz value selecting which open bond to try.
+    function settleABond(uint256 seed) external {
+        uint256 count = openBondIds.length;
+        if (count == 0) return;
+
+        bytes32 bondId = openBondIds[seed % count];
+
+        BondMeBro.Bond memory bond = hook.getBond(bondId);
+
+        Currency currency = bond.collateralIsCurrency0 ? currency0 : currency1;
+
+        // Not mature yet: prove early settlement is rejected, then leave it alone.
+        if (block.number < bond.maturityBlock) {
+            try hook.settleBond(bondId) {
+                // Settling before maturity must be impossible.
+                ghostDoubleSettlement = true;
+            } catch {
+                earlySettleRejected++;
+            }
+            return;
+        }
+
+        // Read the collateral BEFORE settling. The record stores the realized variable leg now,
+        // so the collateral is derived (ADR-0005 s3.2); capturing it up front keeps the
+        // conservation check comparing against the amount that was actually held.
+        uint256 collateralHeld = hook.collateralAmountOf(bondId);
+
+        uint256 recipientBefore = currency.balanceOf(bond.refundRecipient);
+        uint256 potBefore = hook.insurancePot(key_.toId(), currency);
+
+        try hook.settleBond(bondId) {
+            uint256 refund = currency.balanceOf(bond.refundRecipient) - recipientBefore;
+            uint256 slash = hook.insurancePot(key_.toId(), currency) - potBefore;
+
+            // INV-COLLATERAL-CONSERVATION, checked per bond at the moment it settles.
+            if (refund + slash != collateralHeld) {
+                ghostConservationViolated = true;
+            }
+
+            // A second settlement of the same bond must be impossible.
+            if (bondSettled[bondId]) {
+                ghostDoubleSettlement = true;
+            }
+            bondSettled[bondId] = true;
+
+            ghostUnsettledCollateral[currency] -= collateralHeld;
+            ghostInsurancePot[currency] += slash;
+            ghostRefundPaid[currency] += refund;
+
+            settledCount++;
+
+            _dropOpenBond(bondId);
+        } catch {
+            reverted++;
+        }
+    }
+
+    /// @notice Attempts to settle an already-settled bond, proving it cannot pay out twice.
+    /// @param seed Fuzz value selecting a settled bond.
+    function attemptDoubleSettle(uint256 seed) external {
+        uint256 count = settledIds.length;
+        if (count == 0) return;
+
+        bytes32 bondId = settledIds[seed % count];
+
+        Currency currency = hook.getBond(bondId).collateralIsCurrency0 ? currency0 : currency1;
+
+        uint256 potBefore = hook.insurancePot(key_.toId(), currency);
+        uint256 hookBefore = currency.balanceOf(address(hook));
+
+        try hook.settleBond(bondId) {
+            // Any success at all is a double settlement.
+            ghostDoubleSettlement = true;
+        } catch {
+            // Expected. Nothing may have moved.
+            if (
+                hook.insurancePot(key_.toId(), currency) != potBefore || currency.balanceOf(address(hook)) != hookBefore
+            ) {
+                ghostDoubleSettlement = true;
+            }
+        }
+    }
+
+    /// @notice Settled bond ids, kept only so `attemptDoubleSettle` has something to aim at.
+    /// @dev Capped so it cannot grow without bound over a long campaign.
+    bytes32[] internal settledIds;
+
     /*//////////////////////////////////////////////////////////////
                                INTERNALS
     //////////////////////////////////////////////////////////////*/
+
+    /// @dev Records the id of the bond just finalized, derived the same way the contract does.
+    function _noteOpenBond(uint32 maturityBlock) internal {
+        // The bond just registered took index `pendingBonds - 1`.
+        (, uint32 pending,) = hook.maturity(key_.toId(), maturityBlock);
+        if (pending == 0) return;
+
+        bytes32 bondId = keccak256(abi.encode(key_.toId(), maturityBlock, pending - 1));
+
+        if (bondOpen[bondId]) return;
+
+        bondOpen[bondId] = true;
+        openBondIds.push(bondId);
+    }
+
+    /// @dev Removes a settled bond from the live-liability set. Swap-and-pop, O(1).
+    function _dropOpenBond(bytes32 bondId) internal {
+        bondOpen[bondId] = false;
+
+        uint256 length = openBondIds.length;
+        for (uint256 i = 0; i < length; i++) {
+            if (openBondIds[i] == bondId) {
+                openBondIds[i] = openBondIds[length - 1];
+                openBondIds.pop();
+                break;
+            }
+        }
+
+        if (settledIds.length < 16) settledIds.push(bondId);
+    }
 
     /// @dev Returns the input and output currencies for the selected swap direction.
     function _currencies(bool zeroForOne) internal view returns (Currency inputCurrency, Currency outputCurrency) {
@@ -291,7 +469,7 @@ contract BondCustodyHandler is Test {
 
     /// @dev Returns the bonding threshold denominated in the input currency for the selected direction.
     function _threshold(bool zeroForOne) internal view returns (uint256) {
-        (uint128 min0, uint96 min1,) = hook.poolConfig(key_.toId());
+        (uint128 min0, uint96 min1,,) = hook.poolConfig(key_.toId());
 
         return zeroForOne ? uint256(min0) : uint256(min1);
     }
@@ -331,27 +509,28 @@ contract BondCustodyHandler is Test {
         return uint128(expectedBond - 1);
     }
 
-    /// @dev Executes a swap, measures the real custody change, and updates the independent ghost accounting only if the swap succeeds.
-
-    /// For exact-input swaps, the expected bond is already known before execution. For exact-output swaps, the expected bond is recomputed from the actual amount consumed by PoolManager.
-
-    function _execute(
-        int256 amountSpecified,
-        bool zeroForOne,
-        Currency inputCurrency,
-        uint256 expectedBondIfExactInput,
-        uint128 ceiling,
-        bool expectBondedExactInput,
-        bool isExactInput
-    ) internal {
+    /// @dev Executes a swap, measures the real custody change, and updates the independent ghost
+    ///      accounting only if the swap succeeds.
+    ///
+    ///      MEASURE-THEN-PREDICT, FOR BOTH SWAP KINDS.
+    ///
+    ///      This function used to take a pre-computed expected bond for exact-input and
+    ///      reconstruct one only for exact-output. Under Model L neither kind can be predicted in
+    ///      advance, so both are now handled identically: run the swap, read the realized legs and
+    ///      the two ticks off actual balance movement and pool state, and only then apply the
+    ///      specification through `ModelLReference`.
+    ///
+    ///      Reconstructing from measurement is what keeps this a genuine cross-check. The ghost
+    ///      model never calls the hook's own sizing function and never reads the hook's own bond
+    ///      record for the amount -- if it did, "bonds taken == bonds predicted" would be a
+    ///      tautology.
+    function _execute(int256 amountSpecified, bool zeroForOne, uint128 ceiling, bool isExactInput) internal {
         // Record the maturity this attempt would use, BEFORE the swap. A reverted or unbonded
         // attempt is exactly the case that could strand a provisional record, so the ghost model
         // must know about the bucket even when nothing is finalized into it.
         _noteMaturity(uint32(block.number) + hook.OBSERVATION_BLOCKS());
 
-        uint256 hookBefore = inputCurrency.balanceOf(address(hook));
-
-        uint256 managerBefore = inputCurrency.balanceOf(address(manager));
+        Legs memory legs = _snapshotLegs(zeroForOne, isExactInput);
 
         try swapRouter.swap(
             key_,
@@ -363,62 +542,96 @@ contract BondCustodyHandler is Test {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             HookDataCodec.encode(REFUND_RECIPIENT, ceiling)
         ) {
-            // Real collateral received by the hook.
-            uint256 bondTaken = inputCurrency.balanceOf(address(hook)) - hookBefore;
-
-            // Real input retained by PoolManager.
-            uint256 poolInput = inputCurrency.balanceOf(address(manager)) - managerBefore;
-
-            measuredBondTotal[inputCurrency] += bondTaken;
-
-            // A bond was finalized exactly when collateral actually moved. Recomputed rather
-            // than held in a local, to stay inside the EVM stack limit.
-            if (bondTaken > 0) {
-                expectedFinalizedAt[uint32(block.number) + hook.OBSERVATION_BLOCKS()] += 1;
-
-                // NO-MISSED-MATURITY ghost. Only REGISTERED maturities are recorded — a bucket a
-                // provisional record merely touched must never appear here, or the invariant would
-                // demand a checkpoint for something ADR-0004 Rule 1 says does not exist.
-                _noteRegisteredMaturity(uint32(block.number) + hook.OBSERVATION_BLOCKS());
-            }
-
-            if (isExactInput) {
-                // Exact-input expected collateral was calculated before execution.
-                expectedBondTotal[inputCurrency] += expectedBondIfExactInput;
-
-                if (expectBondedExactInput) {
-                    exactInputBonded++;
-                } else {
-                    exactInputUnbonded++;
-                }
-
-                return;
-            }
-
-            // Exact-output bond:
-            //
-            // bond = poolInput * bondBps / (BPS - bondBps)
-            //
-            // This independently reconstructs the same gross-input economic rate
-            // from what the pool actually consumed.
-            (,, uint16 bondBps) = hook.poolConfig(key_.toId());
-
-            uint256 candidateBond = FullMath.mulDiv(poolInput, bondBps, BPS - uint256(bondBps));
-
-            uint256 candidateGross = poolInput + candidateBond;
-
-            uint256 expectedBond = candidateGross < _threshold(zeroForOne) ? 0 : candidateBond;
-
-            expectedBondTotal[inputCurrency] += expectedBond;
-
-            if (expectedBond > 0) {
-                exactOutputBonded++;
-            } else {
-                exactOutputUnbonded++;
-            }
+            _recordOutcome(legs, zeroForOne, isExactInput);
         } catch {
             // Failed swaps must not update either ghost accounting total.
             reverted++;
+        }
+    }
+
+    /// @dev The pre-swap readings needed to reconstruct a Model L bond afterwards.
+    struct Legs {
+        Currency collateralCurrency;
+        Currency variableCurrency;
+        Currency inputCurrency;
+        uint256 hookCollateralBefore;
+        uint256 managerInputBefore;
+        uint256 selfVariableBefore;
+        int24 tickBefore;
+    }
+
+    /// @dev Captures everything needed before a swap, choosing currencies by KIND and direction.
+    function _snapshotLegs(bool zeroForOne, bool isExactInput) internal view returns (Legs memory legs) {
+        (Currency inputCurrency, Currency outputCurrency) = _currencies(zeroForOne);
+
+        // ADR-0006's unified rule. The swap KIND decides which side is variable; the direction
+        // decides which currency that side is.
+        legs.inputCurrency = inputCurrency;
+        legs.variableCurrency = isExactInput ? outputCurrency : inputCurrency;
+        legs.collateralCurrency =
+            ModelLReference.collateralIsCurrency0(zeroForOne, isExactInput) ? currency0 : currency1;
+
+        legs.hookCollateralBefore = legs.collateralCurrency.balanceOf(address(hook));
+        legs.managerInputBefore = inputCurrency.balanceOf(address(manager));
+        legs.selfVariableBefore = legs.variableCurrency.balanceOf(address(this));
+
+        // slither-disable-next-line unused-return
+        (, legs.tickBefore,,) = manager.getSlot0(key_.toId());
+    }
+
+    /// @dev Reconstructs the expected bond from realized movement and updates every ghost total.
+    function _recordOutcome(Legs memory legs, bool zeroForOne, bool isExactInput) internal {
+        uint32 maturityBlock = uint32(block.number) + hook.OBSERVATION_BLOCKS();
+
+        // slither-disable-next-line unused-return
+        (, int24 tickAfter,,) = manager.getSlot0(key_.toId());
+
+        uint256 bondTaken = legs.collateralCurrency.balanceOf(address(hook)) - legs.hookCollateralBefore;
+
+        // The input the pool actually consumed. Under variable-leg custody the hook no longer
+        // carves anything out of the input, so this is the whole of it.
+        uint256 actualInput = legs.inputCurrency.balanceOf(address(manager)) - legs.managerInputBefore;
+
+        // The realized variable leg.
+        //
+        //   exact-input  : the pool paid out the OUTPUT, of which the hook withheld the bond
+        //                  before this contract saw it -- so the leg is what arrived plus what
+        //                  was withheld.
+        //   exact-output : the leg IS the pool input.
+        uint256 variableLeg = isExactInput
+            ? (legs.variableCurrency.balanceOf(address(this)) - legs.selfVariableBefore) + bondTaken
+            : actualInput;
+
+        measuredBondTotal[legs.collateralCurrency] += bondTaken;
+
+        if (bondTaken > 0) {
+            expectedFinalizedAt[maturityBlock] += 1;
+
+            // NO-MISSED-MATURITY ghost. Only REGISTERED maturities are recorded -- a bucket a
+            // provisional record merely touched must never appear here, or the invariant would
+            // demand a checkpoint for something ADR-0004 Rule 1 says does not exist.
+            _noteRegisteredMaturity(maturityBlock);
+
+            // The collateral is now a live liability of the hook, in ITS OWN currency.
+            ghostUnsettledCollateral[legs.collateralCurrency] += bondTaken;
+
+            _noteOpenBond(maturityBlock);
+        }
+
+        // ELIGIBILITY IS DECIDED ON THE ACTUAL CONSUMED INPUT (INV-L2-13), not on the requested
+        // amount. A swap that asked for more than the threshold but filled below it is unbonded.
+        uint256 expectedBond = actualInput < _threshold(zeroForOne)
+            ? 0
+            : ModelLReference.collateralFor(variableLeg, legs.tickBefore, tickAfter);
+
+        expectedBondTotal[legs.collateralCurrency] += expectedBond;
+
+        if (isExactInput) {
+            if (expectedBond > 0) exactInputBonded++;
+            else exactInputUnbonded++;
+        } else {
+            if (expectedBond > 0) exactOutputBonded++;
+            else exactOutputUnbonded++;
         }
     }
 }

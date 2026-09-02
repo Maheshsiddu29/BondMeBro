@@ -30,8 +30,32 @@ node_modules/
 .claude/
 skills-lock.json
 tasks/
-AGENTS.md
 
 # Working docs
 Documents/
-docs/*
+
+# Local research and generated simulation outputs
+local_research_archive/
+simulation/
+**/*calibration*.csv
+**/*calibration*.json
+**/*simulation*.csv
+**/*simulation*.json
+**/*_results.csv
+**/*_summary.json
+**/*_manifest.json
+
+
+# Local BondMeBro agent / internal design documentation
+AGENTS.md
+docs/EXPLAINED.md
+docs/INVARIANTS-L2.md
+
+# Internal architecture decision records
+docs/adr/0001-in-hook-custody.md
+docs/adr/0002-exact-output-custody.md
+docs/adr/0003-maturity-checkpoint.md
+docs/adr/0004-split-phase-bond-records.md
+docs/adr/0005-model-l2-economics.md
+docs/adr/0006-variable-leg-custody.md
+docs/adr/0007-observation-checkpoints.md

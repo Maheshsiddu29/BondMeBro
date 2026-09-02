@@ -18,6 +18,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 
 import {BondMeBro, HOOK_FLAGS} from "../../src/BondMeBro.sol";
+import {ModelLReference} from "../utils/ModelLReference.sol";
 import {BondCustodyHandler} from "./BondCustodyHandler.sol";
 
 /// @title BondCustodyInvariantsTest
@@ -54,6 +55,9 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     uint96 internal constant MIN_BONDED_1 = 1e15;
     uint16 internal constant BOND_BPS = 25;
 
+    /// @dev Settlement noise floor, in ticks. Displacement at or below this is never slashed.
+    uint16 internal constant REFUND_TOL = 5;
+
     function setUp() public {
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
@@ -70,15 +74,26 @@ contract BondCustodyInvariantsTest is Test, Deployers {
 
         // Add deep liquidity so the invariant campaign spends most calls testing
         // custody rather than reverting because the liquidity range is exhausted.
+        // DEPTH REDUCED FROM 1e23 TO 1e19 IN P-L2-3/4.
+        //
+        // This is a real new coupling between subsystems, not a test tidy-up. Model L prices
+        // collateral off the REALIZED tick impact, so whether a swap bonds at all now depends on
+        // the pool's depth. At 1e23 the swaps in this file move zero ticks, every one of them is
+        // unbonded, and a suite about maturity buckets ends up asserting properties of an empty
+        // bucket -- passing or failing for reasons that have nothing to do with checkpoints.
+        //
+        // The same retune was needed in the combined research prototype for the same reason, and
+        // it is recorded there too. Any future test that creates bonds must size its liquidity
+        // against its swap amounts deliberately.
         modifyLiquidityRouter.modifyLiquidity(
             key_,
             ModifyLiquidityParams({
-                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e23, salt: bytes32(uint256(1))
+                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e19, salt: bytes32(uint256(1))
             }),
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
 
         handler = new BondCustodyHandler(IPoolManager(address(manager)), swapRouter, hook, key_, currency0, currency1);
 
@@ -130,20 +145,80 @@ contract BondCustodyInvariantsTest is Test, Deployers {
                               INVARIANTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice The hook's real token balance must equal the total bonds it actually received.
+    /// @notice INV-SOLVENCY — the hook physically holds at least everything it owes.
 
-    /// @dev This is checked separately for currency0 and currency1 because every bond must remain denominated in the swap's input currency. In the current custody-only build nothing can leave the hook, so the relationship should be exact.
-    function invariant_hookBalanceEqualsSumOfBondsTaken() public view {
-        assertEq(
+    /// @dev REPLACES THE OLD CUSTODY EQUALITY, which asserted the hook's balance EQUALS the total
+    ///      collateral ever taken. That held only while nothing could leave the hook. Settlement
+    ///      pays refunds out, so the equality is now simply false; keeping it would have meant
+    ///      either a failing suite or a quietly weakened assertion.
+
+    ///      THE AGGREGATION IS THE POINT, and it is where a naive version goes wrong. The hook
+    ///      holds ONE balance per ERC-20, but liabilities are keyed per pool. Comparing each
+    ///      pool's liability separately against that single balance proves nothing:
+
+    ///          hook holds 100 USDC;  pool A owes 80;  pool B owes 80
+    ///          80 <= 100 PASS        80 <= 100 PASS   — yet 160 is owed and the hook is insolvent
+
+    ///      So liabilities are summed across every pool sharing a physical currency FIRST, and the
+    ///      total is compared once. The handler's ghost totals are already per-currency sums.
+
+    ///      `>=` rather than `==`: a direct token donation or dust must not break solvency.
+
+    ///      SCOPE OF THIS CAMPAIGN, STATED HONESTLY. The ghost totals below are keyed by CURRENCY,
+    ///      which is already the aggregated shape — but this campaign drives a single pool, so the
+    ///      aggregation itself is not exercised here: with one pool, "sum across pools" and "read
+    ///      this pool" are the same number. The aggregation is proved deterministically instead by
+    ///      `test/SharedCurrencySolvency.t.sol`, which runs two distinct PoolIds over one ERC-20
+    ///      and includes a negative proof that the per-pool form passes while the hook is
+    ///      genuinely insolvent.
+    function invariant_solvency() public view {
+        assertGe(
             currency0.balanceOf(address(hook)),
-            handler.measuredBondTotal(currency0),
-            "currency0: hook balance != sum of bonds taken"
+            handler.ghostUnsettledCollateral(currency0) + handler.ghostInsurancePot(currency0),
+            "currency0: hook holds less than it owes"
         );
 
-        assertEq(
+        assertGe(
             currency1.balanceOf(address(hook)),
+            handler.ghostUnsettledCollateral(currency1) + handler.ghostInsurancePot(currency1),
+            "currency1: hook holds less than it owes"
+        );
+    }
+
+    /// @notice INV-COLLATERAL-CONSERVATION — every settled bond splits exactly.
+
+    /// @dev `refund + slash == collateral`, no residual wei. Checked by the handler at the instant
+    ///      each bond settles, because the split is only observable then; a violation sets a
+    ///      sticky flag so it survives to be reported here.
+    function invariant_collateralConservation() public view {
+        assertFalse(handler.ghostConservationViolated(), "a settled bond did not conserve collateral exactly");
+    }
+
+    /// @notice INV-NO-DOUBLE-SETTLEMENT — a settled bond can never pay out again.
+
+    /// @dev The sticky flag is set if a second settlement ever succeeds, OR if a correctly
+    ///      rejected attempt still moved the pot or the hook's balance. The CEI ordering in
+    ///      `_settleBond` is what prevents both: the bond is marked SETTLED before the transfer,
+    ///      so a reentrant token sees SETTLED and reverts.
+    function invariant_noDoubleSettlement() public view {
+        assertFalse(handler.ghostDoubleSettlement(), "a bond settled twice, or a rejected settlement moved funds");
+    }
+
+    /// @notice Refunds paid never exceed the collateral ever taken in that currency.
+
+    /// @dev A cheap sentinel against the refund and slash sides being crossed. If a slashed
+    ///      portion were ever refunded by mistake, the excess would surface here.
+    function invariant_refundsNeverExceedCollateralTaken() public view {
+        assertLe(
+            handler.ghostRefundPaid(currency0),
+            handler.measuredBondTotal(currency0),
+            "currency0: refunds exceed collateral ever taken"
+        );
+
+        assertLe(
+            handler.ghostRefundPaid(currency1),
             handler.measuredBondTotal(currency1),
-            "currency1: hook balance != sum of bonds taken"
+            "currency1: refunds exceed collateral ever taken"
         );
     }
 
@@ -181,18 +256,9 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         assertEq(manager.balanceOf(address(hook), currency1.toId()), 0, "hook holds currency1 claims");
     }
 
-    /// @notice Every expected bond must be backed by real tokens held by the hook.
-
-    /// @dev In the current custody-only build, no refund or settlement path can remove tokens, so the hook must always hold at least the collateral represented by the expected bond totals. T5 must replace this simple custody rule with settlement-aware liability accounting.
-    function invariant_hookIsFullyBackedByRealTokens() public view {
-        assertGe(
-            currency0.balanceOf(address(hook)), handler.expectedBondTotal(currency0), "currency0: bonds not backed"
-        );
-
-        assertGe(
-            currency1.balanceOf(address(hook)), handler.expectedBondTotal(currency1), "currency1: bonds not backed"
-        );
-    }
+    // NOTE: `invariant_hookIsFullyBackedByRealTokens` was REMOVED in T5B. It asserted the hook's
+    // balance equals the total collateral ever taken, which stops being true the moment a refund
+    // can leave the hook. `invariant_solvency` above states the property that survives settlement.
 
     /*//////////////////////////////////////////////////////////////
                         ADR-0004 SPLIT-PHASE INVARIANTS
@@ -370,32 +436,61 @@ contract BondCustodyInvariantsTest is Test, Deployers {
 
     /// @notice Proves that the handler can reach all four custody paths.
 
-    /// @dev This prevents a vacuous invariant campaign where every action reverts or does nothing and all accounting totals remain zero. The hand-picked seeds deterministically exercise bonded and unbonded exact-input and exact-output swaps.
+    /// @notice All four custody paths are reachable, and between them they take collateral in
+    ///         BOTH currencies.
+    ///
+    /// @dev THE DIRECTION MATRIX CHANGED IN P-L2-3/4, and the old one silently stopped covering
+    ///      what this test claims to cover.
+    ///
+    ///      Previously collateral always came from the INPUT, so direction alone chose the
+    ///      currency and "one zeroForOne swap plus one oneForZero swap" guaranteed both. Under
+    ///      ADR-0006 the swap KIND participates too:
+    ///
+    ///          exact-input  zeroForOne -> currency1      exact-output zeroForOne -> currency0
+    ///          exact-input  oneForZero -> currency0      exact-output oneForZero -> currency1
+    ///
+    ///      The old pairing -- exact-input zeroForOne with exact-output oneForZero -- now lands in
+    ///      currency1 BOTH times. The test would have kept asserting "both currencies were taken"
+    ///      against a run that only ever touched one.
+    ///
+    ///      So all four combinations are driven explicitly rather than two, and the currency each
+    ///      one is expected to produce is taken from `ModelLReference` rather than written out, so
+    ///      the mapping cannot drift out of step with the specification.
     function test_handlerExercisesAllFourCustodyPaths() public {
-        // Odd seed => amount at or above threshold => bonded exact-input.
+        // Odd seed => amount at or above threshold => bonded. Even seed => below => unbonded.
+
+        // Exact-input, both directions.
         handler.swapExactInput(3, true, false);
+        handler.swapExactInput(3, false, false);
 
-        assertEq(handler.exactInputBonded(), 1, "exact-input bonded path unreachable");
+        assertGe(handler.exactInputBonded(), 1, "exact-input bonded path unreachable");
 
-        // Even seed => amount below threshold => unbonded exact-input.
         handler.swapExactInput(2, true, false);
 
-        assertEq(handler.exactInputUnbonded(), 1, "exact-input unbonded path unreachable");
+        assertGe(handler.exactInputUnbonded(), 1, "exact-input unbonded path unreachable");
 
-        // Exact-output, opposite direction, bonded.
+        // Exact-output, both directions.
+        handler.swapExactOutput(3, true, false);
         handler.swapExactOutput(3, false, false);
 
-        assertEq(handler.exactOutputBonded(), 1, "exact-output bonded path unreachable");
+        assertGe(handler.exactOutputBonded(), 1, "exact-output bonded path unreachable");
 
-        // Exact-output, opposite direction, unbonded.
         handler.swapExactOutput(2, false, false);
 
-        assertEq(handler.exactOutputUnbonded(), 1, "exact-output unbonded path unreachable");
+        assertGe(handler.exactOutputUnbonded(), 1, "exact-output unbonded path unreachable");
 
-        // Confirm that both input currencies were actually taken as collateral.
-        assertGt(handler.measuredBondTotal(currency0), 0, "no currency0 bond was actually taken");
+        // Both collateral currencies were genuinely used.
+        assertGt(handler.measuredBondTotal(currency0), 0, "no currency0 collateral was ever taken");
 
-        assertGt(handler.measuredBondTotal(currency1), 0, "no currency1 bond was actually taken");
+        assertGt(handler.measuredBondTotal(currency1), 0, "no currency1 collateral was ever taken");
+
+        // The mapping the matrix above relies on, asserted rather than assumed.
+        assertFalse(ModelLReference.collateralIsCurrency0(true, true), "exact-input zeroForOne must bond in currency1");
+        assertTrue(ModelLReference.collateralIsCurrency0(false, true), "exact-input oneForZero must bond in currency0");
+        assertTrue(ModelLReference.collateralIsCurrency0(true, false), "exact-output zeroForOne must bond in currency0");
+        assertFalse(
+            ModelLReference.collateralIsCurrency0(false, false), "exact-output oneForZero must bond in currency1"
+        );
 
         // Ghost accounting must match the hook's real ERC-20 balances.
         assertEq(
@@ -418,19 +513,23 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         // First create a successful bond so we have a non-zero baseline.
         handler.swapExactInput(3, true, false);
 
-        uint256 hookBalance = currency0.balanceOf(address(hook));
+        // Exact-input zeroForOne bonds in the OUTPUT currency, which is currency1.
+        Currency collateral =
+            ModelLReference.collateralIsCurrency0({zeroForOne: true, exactInput: true}) ? currency0 : currency1;
 
-        uint256 ghost = handler.measuredBondTotal(currency0);
+        uint256 hookBalance = collateral.balanceOf(address(hook));
+
+        uint256 ghost = handler.measuredBondTotal(collateral);
 
         assertGt(hookBalance, 0, "baseline bond was not taken");
 
-        // Repeat with a bond ceiling one wei below the required amount.
+        // Repeat with a bond ceiling far below the required amount.
         handler.swapExactInput(3, true, true);
 
         assertEq(handler.reverted(), 1, "the tight-ceiling swap did not revert");
 
-        assertEq(currency0.balanceOf(address(hook)), hookBalance, "a reverted swap changed the hook balance");
+        assertEq(collateral.balanceOf(address(hook)), hookBalance, "a reverted swap changed the hook balance");
 
-        assertEq(handler.measuredBondTotal(currency0), ghost, "a reverted swap moved the ghost");
+        assertEq(handler.measuredBondTotal(collateral), ghost, "a reverted swap moved the ghost");
     }
 }

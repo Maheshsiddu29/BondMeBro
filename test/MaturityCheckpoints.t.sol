@@ -33,6 +33,9 @@ contract MaturityCheckpointsTest is Test, Deployers {
     uint128 internal constant MIN_BONDED = 1e15;
     uint96 internal constant MIN_BONDED_1 = 1e15;
     uint16 internal constant BOND_BPS = 25;
+
+    /// @dev Settlement noise floor, in ticks. Displacement at or below this is never slashed.
+    uint16 internal constant REFUND_TOL = 5;
     uint128 internal constant GENEROUS_CEILING = type(uint128).max;
 
     int256 internal constant BONDED_INPUT = -1e16;
@@ -52,15 +55,26 @@ contract MaturityCheckpointsTest is Test, Deployers {
         (key_, id_) =
             initPoolAndAddLiquidity(currency0, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0));
 
+        // DEPTH REDUCED FROM 1e23 TO 1e19 IN P-L2-3/4.
+        //
+        // This is a real new coupling between subsystems, not a test tidy-up. Model L prices
+        // collateral off the REALIZED tick impact, so whether a swap bonds at all now depends on
+        // the pool's depth. At 1e23 the swaps in this file move zero ticks, every one of them is
+        // unbonded, and a suite about maturity buckets ends up asserting properties of an empty
+        // bucket -- passing or failing for reasons that have nothing to do with checkpoints.
+        //
+        // The same retune was needed in the combined research prototype for the same reason, and
+        // it is recorded there too. Any future test that creates bonds must size its liquidity
+        // against its swap amounts deliberately.
         modifyLiquidityRouter.modifyLiquidity(
             key_,
             ModifyLiquidityParams({
-                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e23, salt: bytes32(uint256(1))
+                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e19, salt: bytes32(uint256(1))
             }),
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
     }
 
     /*//////////////////////////////////////////////////////////////

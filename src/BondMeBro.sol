@@ -20,13 +20,24 @@ import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 
 import {HookDataCodec} from "./libraries/HookDataCodec.sol";
+import {PersistenceMathLib} from "./libraries/PersistenceMathLib.sol";
 import {TickAccumulatorLib} from "./libraries/TickAccumulatorLib.sol";
 
 // below constant is important for the hook to work properly. It is the permission bits that the hook's deployed address must encode. It is a single source of truth shared with getHookPermissions() and the test suite.getHookPermissions(), test suite, and the deploy script's miner all three derive from this one constant.
 
+// BEFORE_SWAP_RETURNS_DELTA_FLAG is deliberately ABSENT (ADR-0006 section 4).
+//
+// Under variable-leg custody `beforeSwap` returns `ZERO_DELTA` on every path for both swap kinds,
+// so the permission is unused. Dropping it removes the hook's ABILITY to return a
+// specified-currency delta at all: Uniswap rates `beforeSwapReturnDelta` CRITICAL because it is
+// the NoOp rug vector, and the legacy INV-NOOP existed to bound it. Removing the bit makes that
+// vector unreachable by construction rather than bounded by an invariant, which is strictly
+// stronger.
+//
+// The flags are encoded in the hook ADDRESS, so this value changing means every mined address
+// changes: 0x10CC -> 0x10C4. `test/HookWiring.t.sol` pins the numeric value on purpose.
 uint160 constant HOOK_FLAGS = uint160(
-    Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
-        | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+    Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
 );
 
 /// @title BondMeBro
@@ -51,7 +62,12 @@ contract BondMeBro is BaseHook {
     /*              CONSTANTS            /*/
 
     /// @notice Basis-point denominator.
-    uint256 internal constant BPS = 10_000;
+    /// @dev PUBLIC, because under variable-leg custody it is part of the information a caller
+    ///      needs before it can size `maxBondAmount`. The collateral is
+    ///      `variableLeg * collateralBps / BPS`, so a caller that can read `collateralBpsFor` but
+    ///      not the denominator can still only guess. Exposing it costs no storage and no gas: it
+    ///      is a compile-time constant.
+    uint256 public constant BPS = 10_000;
 
     /// @notice Max bond rate allowed by the contract is 1% of gross input i;e 100 bps.
     /// @dev This is a compile-time constant and cannot be changed by the owner.Keeping Max bond rate at 1% gives large safety margin from INV-NOOP boundary , where bond would equal to trader's full input
@@ -78,6 +94,19 @@ contract BondMeBro is BaseHook {
     ///
     ///      ADR-0003 § 3.1 frames `W` as a per-pool cap; this narrows it to one protocol-wide
     ///      constant because `PoolConfig` is unchanged and per-pool windows are out of scope.
+    /// @notice Largest batch `settleMany` will accept.
+    ///
+    /// @dev Bounds the only loop in the settlement path. Chosen from measurement, not preference:
+    ///      a single settlement costs roughly 60-80k depending on path, so 32 entries land near
+    ///      2.2M — comfortably inside a 30M block while leaving room for the caller's own
+    ///      overhead. Larger batches buy little: the per-entry cost is dominated by the ERC-20
+    ///      transfer and two cold SSTOREs, neither of which amortises across a batch.
+    ///
+    ///      A cap is required rather than merely advisable. Without one a caller could submit an
+    ///      array long enough to exceed the block limit, and the revert would be an out-of-gas
+    ///      rather than a diagnosable error.
+    uint256 public constant MAX_SETTLE_BATCH = 32;
+
     uint32 public constant MAX_OBSERVATION_BLOCKS = 16;
 
     /// @notice The protocol's economic observation period, in blocks.
@@ -111,6 +140,21 @@ contract BondMeBro is BaseHook {
     ///      `_maturityOf` is the single place this is applied.
     uint32 public constant OBSERVATION_BLOCKS = 10;
 
+    /*              MODEL L2 COLLATERAL SIZING (ADR-0005)            /*/
+
+    /// @notice Collateral rate, in bps of the variable leg per tick of REALIZED impact, carried as
+    ///         an integer numerator over 100 so every operation stays integral.
+    ///
+    /// @dev 25 == 0.25 bps/tick, the V7.1 selected value, FROZEN by ADR-0005 section 2.1. It is a
+    ///      calibration choice made against a synthetic population, not a historically validated
+    ///      optimum — see ADR-0005 section 6.4 before changing it, and open a new ADR.
+    uint16 public constant COLLATERAL_SCALE = 25;
+
+    /// @notice Realized impact at which the `MAX_BOND_BPS` cap first binds.
+    /// @dev `ceil(397 * 25 / 100) == 100`, and `ceil(396 * 25 / 100) == 99`. Stated as a constant
+    ///      so the boundary is pinned by name rather than rediscovered.
+    uint32 public constant CAP_ACTIVATION_TICKS = 397;
+
     /*              TYPES            /*/
 
     /// @notice Per-pool bonding parameters. Packs into one storage slot (128 + 96 + 16 = 240 bits).
@@ -130,10 +174,22 @@ contract BondMeBro is BaseHook {
     /// @param minBondedAmount1 Minimum gross input that requires collateral when  currency1 is the input (`zeroForOne == false`), expressed in raw  currency1 units.
 
     /// @param bondBps Collateral rate as a fraction of gross input, expressed in  basis points. The rate is direction-independent because only absolute  token thresholds require per-currency scaling.
+
+    /// @param refundToleranceTicks Noise floor for settlement, in TICKS. Price displacement at or
+    ///        below this is never slashed. Passed to `PersistenceMathLib.computeBps`, which
+    ///        subtracts it from both sides of the persistence fraction so the curve rises smoothly
+    ///        from zero rather than stepping — a discontinuity there would be a boundary an
+    ///        attacker could profitably sit on. Widened to `uint24` at the call site to match the
+    ///        frozen library's parameter type.
+    ///
+    ///        `uint16` keeps `PoolConfig` at exactly 128 + 96 + 16 + 16 = 256 bits, ONE slot. That
+    ///        matters: the swap path already reads this struct, and a second slot would add a cold
+    ///        SLOAD to every swap. Verified with `forge inspect BondMeBro storage-layout`.
     struct PoolConfig {
         uint128 minBondedAmount0;
         uint96 minBondedAmount1;
         uint16 bondBps;
+        uint16 refundToleranceTicks;
     }
 
     /// @notice Compact reference to a pool, written once at initialization.
@@ -166,11 +222,27 @@ contract BondMeBro is BaseHook {
     /// @param openBlock Block the bond opened in.
     /// @param maturityBlock Fixed at open, never recomputed. `openBlock + OBSERVATION_BLOCKS`.
     /// @param poolIndex Index into `poolRefByIndex`, giving the PoolId and both currencies.
-    /// @param amount Collateral held, in raw units of the input currency.
+    /// @param variableLegAmount The realized VARIABLE leg of the swap, in raw units of the
+    ///        collateral currency: the actual output for exact-input, the actual pool input for
+    ///        exact-output. NOT the collateral held.
+    ///
+    ///        WHY THE LEG AND NOT THE COLLATERAL (ADR-0005 section 3.2). The collateral is a pure
+    ///        function of fields this record already holds --
+    ///        `variableLegAmount * collateralBps / BPS`, with `collateralBps` derived from
+    ///        `tickBefore`/`tickAfter` -- so storing the leg costs nothing extra and keeps the
+    ///        leg available to settlement. Storing the collateral instead loses the leg, and the
+    ///        only slash form that preserves INV-L2-4 exactly in integer arithmetic needs it: the
+    ///        ratio form `collateral * slashBps / collateralBps` was measured to lose one wei as
+    ///        the opening impact rises, over 606,000,000 combinations.
+    ///
+    ///        Use `collateralAmountOf` to read the collateral actually held.
     /// @param cumulativeAtOpen Tick accumulator value at `openBlock`; the window's start reading.
     /// @param tickBefore Pool tick immediately before the swap.
     /// @param tickAfter Pool tick immediately after the swap.
-    /// @param inputIsCurrency0 True when the bond is denominated in the pool's currency0.
+    /// @param collateralIsCurrency0 True when the COLLATERAL is the pool's currency0. Under
+    ///        variable-leg custody this is decided by the swap KIND as well as the direction, so
+    ///        it must be read from the record and never re-derived from direction alone
+    ///        (INV-L2-10).
     /// @param state Lifecycle marker. `NONE` / `PROVISIONAL` / `FINALIZED` — see `BondState`.
     ///        Packed into slot 1 deliberately: slot 1 is the slot `_afterSwap` must write anyway
     ///        to record `amount` and `tickAfter`, so finalization is a WARM update to an
@@ -180,11 +252,11 @@ contract BondMeBro is BaseHook {
         uint32 openBlock;
         uint32 maturityBlock;
         uint32 poolIndex;
-        uint128 amount;
+        uint128 variableLegAmount;
         int56 cumulativeAtOpen;
         int24 tickBefore;
         int24 tickAfter;
-        bool inputIsCurrency0;
+        bool collateralIsCurrency0;
         BondState state;
     }
 
@@ -211,7 +283,8 @@ contract BondMeBro is BaseHook {
     enum BondState {
         NONE,
         PROVISIONAL,
-        FINALIZED
+        FINALIZED,
+        SETTLED
     }
 
     /// @notice Pre-swap accumulator observation, passed between callback helpers.
@@ -282,6 +355,18 @@ contract BondMeBro is BaseHook {
     /// @notice Number of pools initialized through this hook. Also the last assigned index.
     uint32 public poolCount;
 
+    /// @notice Slashed collateral held by the hook, per pool and per currency, in raw units.
+    ///
+    /// @dev ACCOUNTING ONLY — slashing moves no tokens. The collateral is already inside the hook
+    ///      from the moment it was taken; settlement merely reclassifies it from "owed back to a
+    ///      trader" to "retained as LP-risk compensation". So a slash decreases unsettled bond
+    ///      liability and increases this, and the hook's physical balance does not change.
+    ///
+    ///      T5B deliberately provides NO withdrawal path. Nothing — not the owner, not an LP, not
+    ///      a settler — can remove pot funds. Distribution policy is a later task, and shipping a
+    ///      withdrawal before that policy exists would be the easiest way to get it wrong.
+    mapping(PoolId => mapping(Currency => uint256)) public insurancePot;
+
     /*//////////////////////////////////////////////////////////////
                               EVENTS & ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -294,7 +379,13 @@ contract BondMeBro is BaseHook {
     /// @param minBondedAmount0 Minimum bonded input when currency0 is the input.
     /// @param minBondedAmount1 Minimum bonded input when currency1 is the input.
     /// @param bondBps Bond rate in basis points of gross input.
-    event PoolConfigured(PoolId indexed id, uint128 minBondedAmount0, uint96 minBondedAmount1, uint16 bondBps);
+    event PoolConfigured(
+        PoolId indexed id,
+        uint128 minBondedAmount0,
+        uint96 minBondedAmount1,
+        uint16 bondBps,
+        uint16 refundToleranceTicks
+    );
 
     /// @notice Emitted when BondMeBro takes collateral from a swap.
     /// @param id Pool where the swap occurred.
@@ -341,26 +432,92 @@ contract BondMeBro is BaseHook {
     ///      A zero threshold does not mean "disable this direction". Because the
     ///      check is `grossInput >= threshold`, a zero threshold would bond every
     ///      positive swap in that direction.
-    error IncompletePoolConfig(uint128 minBondedAmount0, uint96 minBondedAmount1, uint16 bondBps);
+    error IncompletePoolConfig(
+        uint128 minBondedAmount0, uint96 minBondedAmount1, uint16 bondBps, uint16 refundToleranceTicks
+    );
 
-    /// @notice Thrown when an exact-input bond violates the INV-NOOP rule.
-    /// @dev Every bonded exact-input swap must satisfy:
+    /// @notice INV-NOOP-VL. Thrown when the collateral would not sit strictly inside the swap's
+    ///         variable leg.
     ///
-    ///          0 < bond < grossInput
+    /// @dev THE REPLACEMENT FOR INV-NOOP, AND THE HOOK'S OWN RESPONSIBILITY.
     ///
-    ///      A bond equal to the full input would leave nothing for the pool to swap.
-    ///      Uniswap core does not fully protect the hook from creating this case,
-    ///      so BondMeBro checks it directly.
-    error BondViolatesNoOpBound(uint256 bond, uint256 grossInput);
+    ///      `Hooks.sol` bounds `hookDeltaSpecified` at line 277, inside `beforeSwap`. It bounds
+    ///      `hookDeltaUnspecified` NOWHERE: it is read at 296, accumulated at 299 and applied at
+    ///      306-312 without any check. A hook returning an `afterSwap` delta equal to the entire
+    ///      variable leg passes everything v4 does. `V4Router` happens to revert on the resulting
+    ///      negative cast, but a direct `PoolManager.unlock` caller gets no such help, so this
+    ///      bound can never be delegated.
+    ///
+    ///      The lower bound is not decoration either. `bond = leg * bps / BPS` floors, so a leg
+    ///      below `BPS / bps` rounds the collateral away entirely; recording a zero-amount bond
+    ///      would create a maturity obligation with nothing behind it.
+    ///
+    /// @param bond Collateral the hook would have taken.
+    /// @param variableLegAmount Realized variable leg it had to sit strictly inside.
+    error BondViolatesNoOpVLBound(uint256 bond, uint256 variableLegAmount);
 
-    /// @notice Thrown when a swap should be bonded but the calculated bond rounds to zero.
-    /// @dev A bonded swap must never continue with zero collateral.
-    error BondRoundsToZero(uint256 poolInput);
+    /// TWO ERRORS WERE REMOVED HERE BY P-L2-3/4, and their removal is recorded rather than silent
+    /// because both were part of this contract's ABI.
+    ///
+    ///   `BondViolatesNoOpBound(uint256 bond, uint256 grossInput)` -- the exact-input INV-NOOP
+    ///       bound. Superseded by `BondViolatesNoOpVLBound` above: the quantity the collateral
+    ///       must sit inside is now the variable leg, not the gross input, and under a single
+    ///       unified custody path there is no longer a separate exact-input rule to violate.
+    ///
+    ///   `BondRoundsToZero(uint256 poolInput)` -- the exact-output zero-bond guard. Its condition
+    ///       is now the LOWER half of `BondViolatesNoOpVLBound`, which covers both swap kinds and
+    ///       reports the leg alongside the bond instead of the pool input alone.
+    ///
+    /// Neither was reachable after the unified lifecycle landed: the code paths that raised them
+    /// were `_takeExactOutputBond`, `_recordExactInputBond` and `_openBond`, all deleted in this
+    /// stage. Leaving unreachable errors declared would advertise failure modes this contract can
+    /// no longer produce, and integrators decode by selector.
 
     /// @notice Thrown when the calculated bond is larger than the trader allowed.
     /// @dev `maxBondAmount` protects the trader if pool configuration changes between
     ///      quote time and execution time.
     error BondExceedsTraderMax(uint256 bond, uint128 maxBondAmount);
+
+    /// @notice Emitted when a bond is settled.
+    /// @param bondId Bond that was settled.
+    /// @param id Pool the bond belonged to.
+    /// @param refundRecipient Address the refund was sent to, bound at open.
+    /// @param currency Currency the collateral was held in.
+    /// @param collateral Original collateral, in raw units.
+    /// @param refund Portion returned to the recipient.
+    /// @param slash Portion retained in the pool's insurance pot.
+    /// @param persistenceBps Fraction of the original displacement that survived, in bps.
+    event BondSettled(
+        bytes32 indexed bondId,
+        PoolId indexed id,
+        address indexed refundRecipient,
+        Currency currency,
+        uint128 collateral,
+        uint128 refund,
+        uint128 slash,
+        uint16 persistenceBps
+    );
+
+    /// @notice Thrown when settlement is attempted before the bond's maturity block.
+    error BondNotMature(bytes32 bondId, uint32 maturityBlock, uint256 currentBlock);
+
+    /// @notice Thrown when settling a bond that is not FINALIZED.
+    /// @dev Covers NONE, PROVISIONAL and SETTLED alike. A PROVISIONAL bond reports as absent to
+    ///      every supported path, so it must not be settleable — ADR-0004 Rule 1.
+    error BondNotSettleable(bytes32 bondId, BondState state);
+
+    /// @notice Thrown when a matured bond's maturity checkpoint is missing and unrecoverable.
+    ///
+    /// @dev AN INVARIANT VIOLATION, NOT A RECOVERABLE CONDITION. If the accumulator cursor has
+    ///      already advanced past M without the checkpoint being frozen, the exact cumulative at M
+    ///      is gone — no history is kept and none can be reconstructed. Settlement reverts rather
+    ///      than approximating from live state, because an approximation would silently make the
+    ///      outcome depend on when settlement was called, which is exactly what ADR-0003 § 1
+    ///      forbids. Reaching this means NO-MISSED-MATURITY was violated upstream.
+    error MaturityCheckpointMissing(bytes32 bondId, uint32 maturityBlock, uint32 lastUpdate);
+
+    /// @notice Thrown when a settle batch exceeds `MAX_SETTLE_BATCH`.
+    error SettleBatchTooLarge(uint256 length, uint256 cap);
 
     /// @notice Thrown when a bond id does not identify a finalized bond.
     /// @dev A `PROVISIONAL` record is reported as absent, not as "pending" — ADR-0004 Rule 1.
@@ -410,7 +567,7 @@ contract BondMeBro is BaseHook {
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: true,
+            beforeSwapReturnDelta: false,
             afterSwapReturnDelta: true,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -449,29 +606,43 @@ contract BondMeBro is BaseHook {
     /// @param minBondedAmount1 Minimum gross input requiring a bond when currency1
     ///        is the input, in raw currency1 units.
     /// @param bondBps Bond rate in basis points of gross input.
-    function setPoolConfig(PoolKey calldata key, uint128 minBondedAmount0, uint96 minBondedAmount1, uint16 bondBps)
-        external
-        onlyOwner
-    {
+    function setPoolConfig(
+        PoolKey calldata key,
+        uint128 minBondedAmount0,
+        uint96 minBondedAmount1,
+        uint16 bondBps,
+        uint16 refundToleranceTicks
+    ) external onlyOwner {
         if (bondBps > MAX_BOND_BPS) {
             revert BondBpsAboveCap(bondBps, MAX_BOND_BPS);
         }
 
-        // All zero disables bonding. Otherwise all three values must be set.
-        bool anySet = minBondedAmount0 != 0 || minBondedAmount1 != 0 || bondBps != 0;
+        // All zero disables bonding. Otherwise ALL FOUR values must be set.
+        //
+        // `refundToleranceTicks` joins the completeness rule rather than being optional: a zero
+        // tolerance is a real and dangerous setting, not "unset". With no noise floor the
+        // persistence curve slashes on any surviving displacement at all, including a single tick
+        // of ordinary market drift, so a pool configured by omission would slash far more than
+        // intended. Requiring it explicitly keeps the most punitive setting from being the easiest
+        // typo — the same reasoning that made the two thresholds mandatory in T3C.
+        bool anySet = minBondedAmount0 != 0 || minBondedAmount1 != 0 || bondBps != 0 || refundToleranceTicks != 0;
 
-        bool allSet = minBondedAmount0 != 0 && minBondedAmount1 != 0 && bondBps != 0;
+        bool allSet = minBondedAmount0 != 0 && minBondedAmount1 != 0 && bondBps != 0 && refundToleranceTicks != 0;
 
         if (anySet && !allSet) {
-            revert IncompletePoolConfig(minBondedAmount0, minBondedAmount1, bondBps);
+            revert IncompletePoolConfig(minBondedAmount0, minBondedAmount1, bondBps, refundToleranceTicks);
         }
 
         PoolId id = key.toId();
 
-        poolConfig[id] =
-            PoolConfig({minBondedAmount0: minBondedAmount0, minBondedAmount1: minBondedAmount1, bondBps: bondBps});
+        poolConfig[id] = PoolConfig({
+            minBondedAmount0: minBondedAmount0,
+            minBondedAmount1: minBondedAmount1,
+            bondBps: bondBps,
+            refundToleranceTicks: refundToleranceTicks
+        });
 
-        emit PoolConfigured(id, minBondedAmount0, minBondedAmount1, bondBps);
+        emit PoolConfigured(id, minBondedAmount0, minBondedAmount1, bondBps, refundToleranceTicks);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -575,70 +746,63 @@ contract BondMeBro is BaseHook {
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
 
-        // Exact-output:
-        // actual input is unknown until after the pool executes.
+        // ONE LIFECYCLE FOR BOTH SWAP KINDS, AND NO DELTA ON EITHER (ADR-0006 section 7).
         //
-        // Validate hookData now so bad data fails before the swap.
-        // Custody happens in `_afterSwap`.
-        if (params.amountSpecified > 0) {
-            // Validate hookData before the pool executes, then write the PROVISIONAL record
-            // header from everything already knowable. ADR-0004 § 3.
-            //
-            // This pays the record's two cold SSTOREs in the callback with ~140,000 of spare
-            // budget, leaving `_afterSwap` — which must also perform the token transfer — a single
-            // warm update. It takes NO custody, changes NO delta, and does NOT touch
-            // `pendingBonds`; until finalization the record is invisible to every protocol path.
-            // slither-disable-next-line unused-return
-            (address refundRecipient,) = HookDataCodec.decode(hookData);
+        // Collateral is sized from the REALIZED tick impact and taken from the REALIZED variable
+        // leg, and neither exists until the pool has executed. So neither kind can be sized here.
+        // ADR-0002 already reached that conclusion for exact-output, for a different reason; Model
+        // L extends it to exact-input, and the response is to stop having two custody
+        // architectures. `beforeSwap` now does what ADR-0004 already does for exact-output:
+        //
+        //   1. validate `hookData` BEFORE the pool executes, so bad data cannot execute a swap;
+        //   2. write the provisional record header from everything already knowable;
+        //   3. take NO custody and return ZERO delta.
+        //
+        // FINAL eligibility is deliberately NOT decided here -- `_afterSwap` decides it on the
+        // input the pool ACTUALLY consumed, because a partially filled swap was not a big trade.
 
-            TickAccumulatorLib.Accumulator storage acc = accumulator[id];
+        // THE EXACT-INPUT PRE-FILTER, and it is a correctness requirement rather than an
+        // optimisation (ADR-0006 section 7.1).
+        //
+        // `hookData` has to be validated before execution so invalid data reverts rather than
+        // silently degrading to unbonded. If that validation ran on EVERY swap, every small
+        // exact-input swap on a bonded pool would suddenly be required to carry `hookData`, which
+        // today it is not -- a silent product break.
+        //
+        // For exact-input the filter is EXACT, not heuristic: the pool can never consume more than
+        // the requested amount, so
+        //
+        //     requested < minBondedAmount  =>  actual < minBondedAmount  =>  unbonded
+        //
+        // and skipping is sound. For exact-output the input is unknowable here, so every bonded
+        // pool's exact-output swap must carry `hookData` -- which is exactly today's behaviour.
+        if (params.amountSpecified < 0) {
+            uint256 requestedInput = uint256(-params.amountSpecified);
 
-            // slither-disable-next-line unused-return
-            _openProvisionalBond(id, params.zeroForOne, refundRecipient, acc.lastTick, acc.tickCumulative);
-
-            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            if (requestedInput < (params.zeroForOne ? cfg.minBondedAmount0 : cfg.minBondedAmount1)) {
+                return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            }
         }
 
-        // Exact-input amounts are negative in v4.
-        // Convert the magnitude to an unsigned gross input amount.
-        uint256 grossInput = uint256(-params.amountSpecified);
-
-        // Use the threshold belonging to the actual input currency.
-        uint256 minBondedAmount = params.zeroForOne ? cfg.minBondedAmount0 : cfg.minBondedAmount1;
-
-        // Small swaps do not require a bond or hookData.
-        if (grossInput < minBondedAmount) {
-            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-        }
-
-        // From here onward the swap is bonded.
         // Invalid hookData must revert rather than silently falling back to unbonded.
-        (address refundRecipient, uint128 maxBondAmount) = HookDataCodec.decode(hookData);
+        // slither-disable-next-line unused-return
+        (address refundRecipient,) = HookDataCodec.decode(hookData);
 
-        // Bond is calculated from gross input.
-        uint256 bond = (grossInput * cfg.bondBps) / BPS;
+        TickAccumulatorLib.Accumulator storage acc = accumulator[id];
 
-        // INV-NOOP:
-        // the bond must be positive and strictly smaller than gross input.
-        if (bond == 0 || bond >= grossInput) {
-            revert BondViolatesNoOpBound(bond, grossInput);
-        }
+        // The provisional header is now written for exact-INPUT too, which production did not do.
+        // That moves two cold SSTOREs out of `_afterSwap` and into this callback -- deliberately,
+        // because `_afterSwap` must also perform the token transfer and has the tighter ceiling.
+        // ADR-0004 Rule 2's argument, applied to the path ADR-0004 section 6 left alone.
+        //
+        // The currency flag is written provisionally from the DIRECTION and corrected to the
+        // collateral currency at finalization, where the swap kind is what decides it. A
+        // provisional record is invisible to every protocol path (ADR-0004 Rule 1), so the
+        // intermediate value is never observable.
+        // slither-disable-next-line unused-return
+        _openProvisionalBond(id, params.zeroForOne, refundRecipient, acc.lastTick, acc.tickCumulative);
 
-        // Trader-provided limit on collateral.
-        if (bond > maxBondAmount) {
-            revert BondExceedsTraderMax(bond, maxBondAmount);
-        }
-
-        // Exact-input uses the specified/input currency.
-        Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
-
-        emit BondTaken(id, refundRecipient, inputCurrency, bond, grossInput);
-
-        // Move the bond into BondMeBro custody.
-        inputCurrency.take(poolManager, address(this), bond, false);
-
-        // Return the same bond amount to v4's custom-accounting system.
-        return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(bond.toInt128(), 0), 0);
+        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
     /// @notice Records the post-swap tick and handles exact-output bond custody.
@@ -674,16 +838,17 @@ contract BondMeBro is BaseHook {
     ) internal override returns (bytes4, int128) {
         PoolId id = key.toId();
 
-        // Read the pre-swap observation BEFORE moving the accumulator forward.
+        // Read the pre-swap tick BEFORE moving the accumulator forward. `_beforeSwap` advanced
+        // time but left the tick alone, so `lastTick` is still the tick from before this swap:
+        // tickBefore. It must be captured here because `accumulator[id].update` below overwrites
+        // it.
         //
-        //   `lastTick`       — `_beforeSwap` advanced time but left the tick alone, so this is
-        //                      still the tick from before this swap: tickBefore.
-        //   `tickCumulative` — already advanced to this block, so it is the window's opening
-        //                      reading for any bond created here.
-        //
-        // Both are captured here because `accumulator[id].update` below overwrites the tick.
+        // The window's opening accumulator reading is NOT captured here any more. Under the
+        // unified lifecycle it is written into the provisional record by `_beforeSwap`, which
+        // reads it at the only moment it is unambiguously the pre-swap value. Re-reading it here
+        // would be a second source of truth for the same number, and it would cost a stack slot
+        // this frame does not have.
         int24 tickBefore = accumulator[id].lastTick;
-        int56 cumulativeAtOpen = accumulator[id].tickCumulative;
 
         int24 tickAfter;
         {
@@ -700,66 +865,204 @@ contract BondMeBro is BaseHook {
             accumulator[id].update(tick);
         }
 
-        // Exact-input: custody already happened in `_beforeSwap`, but the RECORD is created here,
-        // where `tickAfter` is finally known. The bond amount is recomputed deterministically from
-        // the same inputs `_beforeSwap` used rather than carried across in temporary storage.
-        if (params.amountSpecified < 0) {
-            _recordExactInputBond(id, params, hookData, tickBefore, tickAfter, cumulativeAtOpen);
-
-            return (BaseHook.afterSwap.selector, int128(0));
-        }
-
-        // Resolve the direction-dependent values here so the custody helper stays inside the EVM
-        // stack limit. For exact-output the bond is taken in the INPUT currency (ADR-0002 § 4).
+        // ONE CUSTODY PATH. The swap kind selects the currency; nothing else differs.
+        //
+        //   exact-input  : specified = input  (fixed) -> variable leg is the OUTPUT
+        //   exact-output : specified = output (fixed) -> variable leg is the INPUT
+        //
+        // Verified against installed `Hooks.sol:305-313` by enumerating the four cases of
+        // `params.amountSpecified < 0 == params.zeroForOne`: the unspecified currency is the
+        // variable leg in BOTH kinds. `Hooks.sol:298-303` adds this callback's return to
+        // `hookDeltaUnspecified`, never to `hookDeltaSpecified`, and `PoolManager.sol:224-226`
+        // credits the hook while subtracting from the caller. So a POSITIVE return here is always
+        // a claim on the variable leg.
         return (
             BaseHook.afterSwap.selector,
-            _takeExactOutputBond(
-                id,
-                params.zeroForOne ? key.currency0 : key.currency1,
-                params.zeroForOne,
-                int256(params.zeroForOne ? delta.amount0() : delta.amount1()),
-                hookData,
-                Observation({tickBefore: tickBefore, tickAfter: tickAfter, cumulativeAtOpen: cumulativeAtOpen})
-            )
+            _takeVariableLegBond(id, hookData, _custodyContext(key, params, delta, tickBefore, tickAfter))
         );
     }
 
-    /// @notice Computes and takes the exact-output bond, returning the delta to report to v4.
-    ///
-    /// @dev Split out of `_afterSwap` purely to stay under the EVM stack limit; the logic and the
-    ///      delta behaviour are unchanged from T3B/T3C. Returns `0` when the swap is not bonded.
-    ///
-    /// @return bondDelta Collateral actually taken, as the unspecified-currency delta. For
-    ///         exact-output the unspecified currency IS the input currency in both directions
-    ///         (`Hooks.sol:307`), so a positive value makes the trader owe that much more input.
-    /// @param id Pool the swap ran against.
-    /// @param inputCurrency Currency the trader is spending; the bond is taken in it.
-    /// @param zeroForOne Swap direction, used to pick the per-currency bonding threshold.
-    /// @param inputDelta Raw pool input delta for the input currency, negative when the trader owes
-    ///        the pool. Does NOT include the bond.
-    /// @param hookData The trader's versioned payload, re-decoded rather than carried in storage.
-    /// @param obs Pre-swap observation captured before the accumulator was moved forward.
-    function _takeExactOutputBond(
-        PoolId id,
-        Currency inputCurrency,
-        bool zeroForOne,
-        int256 inputDelta,
-        bytes calldata hookData,
-        Observation memory obs
-    ) private returns (int128 bondDelta) {
-        PoolConfig memory cfg = poolConfig[id];
+    /*//////////////////////////////////////////////////////////////
+                        VARIABLE-LEG CUSTODY (ADR-0006)
+    //////////////////////////////////////////////////////////////*/
 
-        // Bonding disabled for this pool: `_beforeSwap` wrote no provisional record either, so
-        // there is nothing to finalize and nothing to clear.
+    /// @notice Everything the custody path needs, resolved once.
+    ///
+    /// @dev A memory struct rather than seven arguments, and that is a compile-time necessity
+    ///      rather than a style choice: `_afterSwap` plus a seven-argument custody helper is
+    ///      "stack too deep" under this project's non-viaIR settings. One struct pointer costs one
+    ///      stack slot.
+    ///
+    /// @param collateralCurrency The VARIABLE leg's currency: output for exact-input, input for
+    ///        exact-output.
+    /// @param collateralBps Model L rate from the realized tick impact, in bps of the variable leg.
+    /// @param inputDelta Pool delta for the input currency. Negative when the trader owes.
+    /// @param outputDelta Pool delta for the output currency. Positive when the trader receives.
+    /// @param tickAfter Pool tick immediately after the swap.
+    /// @param zeroForOne Swap direction.
+    /// @param exactInput True when `amountSpecified < 0`.
+    struct VLCustody {
+        Currency collateralCurrency;
+        uint256 collateralBps;
+        int256 inputDelta;
+        int256 outputDelta;
+        int24 tickAfter;
+        bool zeroForOne;
+        bool exactInput;
+    }
+
+    /// @notice Resolves the swap's legs, collateral currency and collateral rate into one context.
+    ///
+    /// @dev Split out of `_afterSwap` so neither function carries the other's locals. All four
+    ///      modes reduce to one expression each, because the mapping is a clean mirror:
+    ///
+    ///        exact-input  zeroForOne : input c0, output c1, collateral = c1 (output)
+    ///        exact-input  oneForZero : input c1, output c0, collateral = c0 (output)
+    ///        exact-output zeroForOne : input c0, output c1, collateral = c0 (input)
+    ///        exact-output oneForZero : input c1, output c0, collateral = c1 (input)
+    function _custodyContext(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        int24 tickBefore,
+        int24 tickAfter
+    ) private pure returns (VLCustody memory c) {
+        bool exactInput = params.amountSpecified < 0;
+        bool collateralIsCurrency0 = _collateralIsCurrency0(params.zeroForOne, exactInput);
+
+        c = VLCustody({
+            collateralCurrency: collateralIsCurrency0 ? key.currency0 : key.currency1,
+            collateralBps: _collateralBpsFor(tickBefore, tickAfter),
+            inputDelta: int256(params.zeroForOne ? delta.amount0() : delta.amount1()),
+            outputDelta: int256(params.zeroForOne ? delta.amount1() : delta.amount0()),
+            tickAfter: tickAfter,
+            zeroForOne: params.zeroForOne,
+            exactInput: exactInput
+        });
+    }
+
+    /// @notice The collateral currency, from the swap kind and direction.
+    ///
+    /// @dev The whole unified rule in one expression, and the two kinds are exact mirrors:
+    ///
+    ///          exactInput  -> collateralIsCurrency0 == !zeroForOne     (collateral is the OUTPUT)
+    ///          exactOutput -> collateralIsCurrency0 ==  zeroForOne     (collateral is the INPUT)
+    ///
+    /// @param zeroForOne Swap direction.
+    /// @param exactInput True when `amountSpecified < 0`.
+    function _collateralIsCurrency0(bool zeroForOne, bool exactInput) private pure returns (bool) {
+        return exactInput ? !zeroForOne : zeroForOne;
+    }
+
+    /// @notice Model L collateral rate from the REALIZED tick impact (ADR-0005 section 2.2).
+    ///
+    /// @dev `collateralBps = min(MAX_BOND_BPS, ceil(|tickAfter - tickBefore| * SCALE))`.
+    ///
+    ///      O(1) IN IMPACT, and that is an architectural requirement rather than an optimisation:
+    ///      one subtraction, one absolute value, one multiply, one ceiling division. It never
+    ///      walks ticks, never reads a tick bitmap and never reads liquidity, so a 10,000-tick
+    ///      move costs exactly what a 1-tick move costs. An implementation that had to traverse
+    ///      ticks would be an unbounded loop on the swap path, which `AGENTS.md` forbids outright.
+    ///
+    ///      `ceil` is load-bearing: `floor` yields a ZERO rate for impacts of 1-3 ticks, so a
+    ///      positive impact would post nothing at all.
+    ///
+    ///      Widened to `int256` before subtracting, per the signed-arithmetic rule: `tickAfter`
+    ///      and `tickBefore` are `int24` and their difference is not representable in `int24` at
+    ///      the extremes of the tick range.
+    ///
+    /// @param tickBefore Pool tick immediately before the swap.
+    /// @param tickAfter Pool tick immediately after the swap.
+    /// @return collateralBps Rate in bps of the variable leg. Zero only when the impact is zero.
+    function _collateralBpsFor(int24 tickBefore, int24 tickAfter) private pure returns (uint256 collateralBps) {
+        int256 signedImpact = int256(tickAfter) - int256(tickBefore);
+        uint256 impactTicks = uint256(signedImpact < 0 ? -signedImpact : signedImpact);
+
+        // ceil(impactTicks * COLLATERAL_SCALE / 100), integral throughout.
+        collateralBps = (impactTicks * uint256(COLLATERAL_SCALE) + 99) / 100;
+
+        if (collateralBps > MAX_BOND_BPS) collateralBps = MAX_BOND_BPS;
+    }
+
+    /// @notice The Model L collateral rate for a given realized tick impact, in bps.
+    ///
+    /// @dev A view over the pure rate function, exposed for two distinct reasons.
+    ///
+    ///      FOR CALLERS. Under variable-leg custody the collateral is no longer a fixed fraction
+    ///      of a known input: it depends on the impact the swap turns out to have. A caller
+    ///      choosing `maxBondAmount` needs to be able to price a hypothetical impact BEFORE
+    ///      sending the swap, and quoting the swap gives it the two ticks. Without this, the only
+    ///      safe ceiling is an over-generous one, which defeats the purpose of the ceiling.
+    ///
+    ///      FOR TESTS. It lets the suite compare the hook against `ModelLReference`, an
+    ///      independent restatement of ADR-0005, over the whole curve rather than at the handful
+    ///      of impacts a pool happens to produce. See `test/ModelLReferenceAgreement.t.sol` for
+    ///      why that reference deliberately does not import from this file.
+    ///
+    ///      Pure and O(1): it never walks ticks and never touches storage, so it is safe to call
+    ///      off-chain at any impact, including impacts no pool could reach.
+    ///
+    /// @param tickBefore Pool tick immediately before the swap.
+    /// @param tickAfter Pool tick immediately after the swap.
+    /// @return collateralBps Rate in bps of the variable leg, capped at `MAX_BOND_BPS`.
+    function collateralBpsFor(int24 tickBefore, int24 tickAfter) external pure returns (uint256 collateralBps) {
+        return _collateralBpsFor(tickBefore, tickAfter);
+    }
+
+    /// @notice The collateral actually held for a bond, recomputed from its record.
+    ///
+    /// @dev The record stores the realized VARIABLE LEG, not the collateral (ADR-0005 section
+    ///      3.2). The collateral is recovered by the same expression that took it, from the same
+    ///      stored inputs, so the two are equal by construction and not merely approximately:
+    ///
+    ///          taken at custody : bond      = variableLeg * collateralBps / BPS
+    ///          recomputed here  : collateral = variableLegAmount * collateralBps / BPS
+    ///
+    ///      with `collateralBps` derived from the `tickBefore` / `tickAfter` the record froze.
+    ///      `test_collateral_recomputationIsExact` pins this to the wei.
+    function _collateralOf(Bond memory bond) private pure returns (uint128) {
+        return uint128((uint256(bond.variableLegAmount) * _collateralBpsFor(bond.tickBefore, bond.tickAfter)) / BPS);
+    }
+
+    /// @notice Sizes and takes the variable-leg collateral, returning the delta v4 must apply.
+    ///
+    /// @dev THE ORDER IS THE SAFETY ARGUMENT, and it is checks -> effects -> interactions:
+    ///
+    ///      1. resolve the realized legs from the pool's own `BalanceDelta`;
+    ///      2. decide eligibility on the ACTUAL consumed input;
+    ///      3. size the collateral from the REALIZED impact and the REALIZED variable leg;
+    ///      4. enforce INV-NOOP-VL, then the trader's own `maxBondAmount`;
+    ///      5. finalize the record and register the maturity liability;
+    ///      6. take the tokens;
+    ///      7. return `+bond`.
+    ///
+    ///      Steps 2 and 3 are what removes the requested-gross oversizing: the previous
+    ///      implementation sized the exact-input bond from `uint256(-params.amountSpecified)`, the
+    ///      amount REQUESTED, so a swap filling a tenth still posted a full-size bond. Here both
+    ///      the eligibility test and the collateral come from the `BalanceDelta` the pool actually
+    ///      produced, and the impact term shrinks with the fill as well, so the collateral tracks
+    ///      execution twice over (INV-L2-13).
+    ///
+    /// @param id Pool the swap ran against.
+    /// @param hookData The trader's versioned payload, re-decoded rather than carried in storage.
+    /// @param c Resolved custody context.
+    /// @return bondDelta Collateral taken, as the unspecified-currency delta. Positive makes the
+    ///         trader receive that much less output (exact-input) or owe that much more input
+    ///         (exact-output). Zero when the swap turns out unbonded.
+    function _takeVariableLegBond(PoolId id, bytes calldata hookData, VLCustody memory c)
+        private
+        returns (int128 bondDelta)
+    {
+        // A STORAGE pointer, not a memory copy: `_afterSwap` is at the EVM stack limit on this
+        // path and a four-field `PoolConfig memory` is the difference between compiling and
+        // "stack too deep". Only two of its fields are read here.
+        PoolConfig storage cfg = poolConfig[id];
+
+        // Bonding disabled: `_beforeSwap` wrote no provisional record either.
         if (cfg.bondBps == 0) {
             return int128(0);
         }
 
-        // The provisional record `_beforeSwap` placed. Recomputed, not carried: `pendingBonds` is
-        // incremented only at finalization and one swap's callbacks never interleave with
-        // another's, so both derivations see the same bucket count.
-        // Scoped so `maturityBlock` does not stay live across the custody code below, which is
-        // already at the EVM stack limit.
         bytes32 bondId;
         {
             uint32 maturityBlock = _maturityOf(_blockNumber32());
@@ -767,56 +1070,88 @@ contract BondMeBro is BaseHook {
             bondId = _bondId(id, maturityBlock, maturity[id][maturityBlock].pendingBonds);
         }
 
-        // No positive input was consumed, so there is nothing to bond.
-        if (inputDelta >= 0) {
+        // The realized legs, straight from the pool's own delta. Direction decides which side is
+        // the input; the swap KIND decides which side is variable. Eligibility is settled inside
+        // this scope so `actualInput` does not stay live afterwards.
+        uint256 variableLeg;
+        {
+            int256 inputDelta = c.inputDelta;
+
+            // No input consumed: nothing executed, so nothing to bond and nothing left behind.
+            if (inputDelta >= 0) {
+                _clearProvisionalBond(bondId);
+
+                return int128(0);
+            }
+
+            uint256 actualInput = uint256(-inputDelta);
+
+            // Eligibility on the ACTUAL consumed input (INV-L2-13). The product rule is unchanged
+            // -- a raw-amount ration on which trades are bonded -- but it is measured against what
+            // happened rather than what was asked for. Realized impact is NOT the classifier here
+            // and must not become one: impact SIZES the collateral, the threshold decides whether
+            // the trade participates at all.
+            if (actualInput < (c.zeroForOne ? cfg.minBondedAmount0 : cfg.minBondedAmount1)) {
+                _clearProvisionalBond(bondId);
+
+                return int128(0);
+            }
+
+            variableLeg = c.exactInput ? (c.outputDelta > 0 ? uint256(c.outputDelta) : 0) : actualInput;
+        }
+
+        // A swap that moved the price by less than one tick creates no LP-risk signal to price, so
+        // it is UNBONDED -- not a bonded swap carrying a zero bond. The distinction matters: a
+        // zero-amount record would be a maturity obligation with nothing behind it.
+        // The strict equality is the semantics, not a comparison against a manipulable quantity.
+        // `collateralBps` is a pure function of a tick difference, and ZERO has a specific,
+        // distinct meaning here -- the price did not move a whole tick -- which is exactly the
+        // case being branched on. A tolerance would make sub-tick swaps bond, which is the
+        // behaviour this branch exists to prevent.
+        // slither-disable-next-line incorrect-equality
+        if (c.collateralBps == 0) {
             _clearProvisionalBond(bondId);
 
             return int128(0);
         }
 
-        uint256 poolInput = uint256(-inputDelta);
+        uint256 bond = (variableLeg * c.collateralBps) / BPS;
 
-        // Exact-output `bondBps` still represents a percentage of GROSS input:
-        //
-        //     grossInput = poolInput + bond
-        //     bond       = poolInput * bondBps / (10_000 - bondBps)
-        uint256 candidateBond = FullMath.mulDiv(poolInput, cfg.bondBps, BPS - uint256(cfg.bondBps));
-
-        // Threshold is compared against GROSS input, using this direction's input currency.
-        // Below it the swap is unbonded: discard the provisional record so nothing is left behind.
-        if (poolInput + candidateBond < (zeroForOne ? cfg.minBondedAmount0 : cfg.minBondedAmount1)) {
-            _clearProvisionalBond(bondId);
-
-            return int128(0);
+        // INV-NOOP-VL. Neither half is guaranteed by core -- see `BondViolatesNoOpVLBound`.
+        // `bond == 0` is INV-NOOP-VL's lower bound stated exactly as the invariant states it. The
+        // detector flags strict equality because it is dangerous against values an attacker can
+        // nudge, such as balances or timestamps; `bond` is a truncating division of two values
+        // fixed earlier in this same call, and zero is precisely the forbidden outcome. Widening
+        // it to a tolerance would reject legitimate small bonds and still admit the zero case.
+        // slither-disable-next-line incorrect-equality
+        if (bond == 0 || bond >= variableLeg) {
+            revert BondViolatesNoOpVLBound(bond, variableLeg);
         }
 
-        // A bonded swap must never continue with zero collateral.
-        if (candidateBond == 0) {
-            revert BondRoundsToZero(poolInput);
-        }
-
-        // Scoped to stay within the EVM stack limit. The decode is re-done here rather than
-        // carried from `_beforeSwap` in temporary storage; validity is not at stake because
-        // `_beforeSwap` already rejected malformed exact-output hookData before the pool ran, so
-        // this decode only retrieves the two values.
         {
             (address refundRecipient, uint128 maxBondAmount) = HookDataCodec.decode(hookData);
 
-            // Trader-provided limit on the bond itself.
-            if (candidateBond > maxBondAmount) {
-                revert BondExceedsTraderMax(candidateBond, maxBondAmount);
+            // The trader's own ceiling, independent of the mechanism. Under hookData v2 it is
+            // denominated in the COLLATERAL currency, which for exact-input is the token being
+            // bought. The ceiling is on the COLLATERAL, never on the variable leg.
+            if (bond > maxBondAmount) {
+                revert BondExceedsTraderMax(bond, maxBondAmount);
             }
 
-            emit BondTaken(id, refundRecipient, inputCurrency, candidateBond, poolInput + candidateBond);
+            emit BondTaken(id, refundRecipient, c.collateralCurrency, bond, variableLeg);
         }
 
-        // Finalize the record `_beforeSwap` placed: a WARM update to slot 1, which already holds
-        // `cumulativeAtOpen` and `tickBefore`. This is also where the maturity is registered.
-        _finalizeBond(id, bondId, uint128(candidateBond), obs.tickAfter);
+        // Correct the provisional record's currency flag to the COLLATERAL currency before
+        // finalizing. `_beforeSwap` could not know it: the swap kind decides, and for exact-input
+        // the collateral is the OUTPUT.
+        bonds[bondId].collateralIsCurrency0 = _collateralIsCurrency0(c.zeroForOne, c.exactInput);
 
-        inputCurrency.take(poolManager, address(this), candidateBond, false);
+        // The record stores the realized VARIABLE LEG (ADR-0005 section 3.2), not the collateral.
+        _finalizeBond(id, bondId, uint128(variableLeg), c.tickAfter);
 
-        return candidateBond.toInt128();
+        c.collateralCurrency.take(poolManager, address(this), bond, false);
+
+        return bond.toInt128();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -991,11 +1326,11 @@ contract BondMeBro is BaseHook {
             openBlock: openBlock,
             maturityBlock: maturityBlock,
             poolIndex: poolIndex,
-            amount: 0,
+            variableLegAmount: 0,
             cumulativeAtOpen: cumulativeAtOpen,
             tickBefore: tickBefore,
             tickAfter: 0,
-            inputIsCurrency0: inputIsCurrency0,
+            collateralIsCurrency0: inputIsCurrency0,
             state: BondState.PROVISIONAL
         });
     }
@@ -1018,7 +1353,7 @@ contract BondMeBro is BaseHook {
     function _finalizeBond(PoolId id, bytes32 bondId, uint128 amount, int24 tickAfter) private {
         Bond storage bond = bonds[bondId];
 
-        bond.amount = amount;
+        bond.variableLegAmount = amount;
         bond.tickAfter = tickAfter;
         bond.state = BondState.FINALIZED;
 
@@ -1044,51 +1379,174 @@ contract BondMeBro is BaseHook {
         delete bonds[bondId];
     }
 
-    /// @notice Creates a complete bond record in one step and registers its maturity.
+    /*//////////////////////////////////////////////////////////////
+                                SETTLEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Settles one matured bond: refunds the surviving portion and retains the rest.
     ///
-    /// @dev The EXACT-INPUT path, unchanged in shape from T5.1. Exact-input custody already
-    ///      happens in `_beforeSwap`, so that callback is the expensive one on this path
-    ///      (~43,000) while its `_afterSwap` has ample room. Splitting it would load the busier
-    ///      callback to relieve the quieter one — backwards. The asymmetry with exact-output is
-    ///      deliberate and load-bearing. ADR-0004 § 6.
-    function _openBond(
-        PoolId id,
-        bool inputIsCurrency0,
-        uint128 amount,
-        address refundRecipient,
-        int24 tickBefore,
-        int24 tickAfter,
-        int56 cumulativeAtOpen
-    ) private returns (bytes32 bondId) {
-        uint32 poolIndex = poolIndexOf[id];
+    /// @dev PERMISSIONLESS. Anyone may settle any matured finalized bond, and who calls it cannot
+    ///      affect the outcome. The caller supplies only `bondId`; every economic input —
+    ///      recipient, currency, collateral, maturity, opening observation — was bound when the
+    ///      bond opened and cannot be supplied or influenced now.
+    ///
+    ///      THE GOVERNING GUARANTEE (ADR-0003 § 1):
+    ///
+    ///          settlement at M == settlement at M+1 == settlement at M+10,000
+    ///
+    ///      The settlement reference is derived from the cumulative FROZEN AT MATURITY, never from
+    ///      the current tick, a current `observe()`, or any post-maturity pool state. Settlement
+    ///      is permissionless, so the caller and the timing are adversarially chosen; if the
+    ///      answer moved with the calling block, whoever picked the block would pick the answer.
+    ///
+    /// @param bondId Bond to settle.
+    function settleBond(bytes32 bondId) external {
+        _settleBond(bondId);
+    }
 
-        if (poolIndex == 0) revert PoolNotRegistered();
+    /// @notice Settles several bonds in one transaction.
+    ///
+    /// @dev ATOMIC. Any invalid entry — immature, already settled, provisional, unknown — reverts
+    ///      the WHOLE batch. Skip-and-continue was deliberately not implemented: a caller must be
+    ///      able to read a successful batch as "all of these settled", and partial success would
+    ///      require inspecting per-entry results to learn what actually happened.
+    ///
+    ///      Bounded by `MAX_SETTLE_BATCH`. Both entry points share `_settleBond`, so the single
+    ///      and batch paths cannot drift semantically; no external self-call is used for reuse.
+    ///
+    /// @param bondIds Bonds to settle. At most `MAX_SETTLE_BATCH`.
+    function settleMany(bytes32[] calldata bondIds) external {
+        uint256 length = bondIds.length;
 
-        uint32 openBlock = _blockNumber32();
-        uint32 maturityBlock = _maturityOf(openBlock);
+        if (length > MAX_SETTLE_BATCH) revert SettleBatchTooLarge(length, MAX_SETTLE_BATCH);
 
+        for (uint256 i = 0; i < length; i++) {
+            _settleBond(bondIds[i]);
+        }
+    }
+
+    /// @notice The single settlement implementation, shared by both entry points.
+    ///
+    /// @dev CHECKS -> EFFECTS -> INTERACTIONS, and this is the first path that sends bonded
+    ///      collateral back out of the hook, so the ordering is load-bearing rather than stylistic.
+    ///      The bond is marked SETTLED, `pendingBonds` decremented and the pot credited BEFORE the
+    ///      transfer. A reentrant token cannot settle the same bond twice: on re-entry the state
+    ///      is already SETTLED and `BondNotSettleable` fires. If the transfer reverts, every one of
+    ///      those effects reverts with it.
+    function _settleBond(bytes32 bondId) private {
+        Bond storage bond = bonds[bondId];
+
+        // Only a FINALIZED bond can settle. NONE, PROVISIONAL and SETTLED are all rejected with
+        // the same error, so a provisional record stays indistinguishable from an absent one.
+        BondState state = bond.state;
+        if (state != BondState.FINALIZED) revert BondNotSettleable(bondId, state);
+
+        uint32 maturityBlock = bond.maturityBlock;
+
+        if (block.number < maturityBlock) {
+            revert BondNotMature(bondId, maturityBlock, block.number);
+        }
+
+        PoolRef memory poolRef = poolRefByIndex[bond.poolIndex];
+        PoolId id = poolRef.id;
+
+        // The cumulative exactly at M — frozen earlier by a crossing swap, or derived now if the
+        // pool has been quiet since before M.
+        int56 cumulativeAtMaturity = _cumulativeAtMaturity(bondId, id, maturityBlock);
+
+        // The settlement reference the frozen library expects is a TICK, not a cumulative: the
+        // time-weighted average tick across the bond's own window, [openBlock, maturityBlock].
+        // Two accumulator readings give it — the one recorded when the bond opened and the one
+        // frozen at maturity.
+        int24 settlementRef =
+            TickAccumulatorLib.twaTick(bond.cumulativeAtOpen, cumulativeAtMaturity, maturityBlock - bond.openBlock);
+
+        // The single slash curve. Not reimplemented here and not duplicated: `PersistenceMathLib`
+        // is the only source of a slash result anywhere in the protocol.
+        uint16 persistenceBps = PersistenceMathLib.computeBps(
+            bond.tickBefore, bond.tickAfter, settlementRef, uint24(poolConfig[id].refundToleranceTicks)
+        );
+
+        // TRANSITIONAL, AND IT IS REMOVED IN P-L2-6.
+        //
+        // The record now stores the realized variable leg, so the collateral this settlement
+        // needs is recomputed from the leg and the two frozen ticks. That recomputation is exact
+        // -- same expression, same stored inputs as custody used -- so this stage's settlement
+        // OUTCOME is byte-identical to the previous implementation's for the same bond.
+        //
+        // The slash curve below is still the legacy `PersistenceMathLib` one. P-L2-6 replaces it
+        // with the L2 residual and dead zone, at which point the leg is consumed directly and this
+        // recomputation is no longer a bridge but the intended read.
+        uint128 collateral = _collateralOf(bond);
+
+        // Conservation is exact by construction. `split` computes the slash and derives the refund
+        // by subtraction, so `slash + refund == collateral` with no residual wei — computing both
+        // sides independently from bps would leave rounding dust unaccounted for.
+        (uint128 slash, uint128 refund) = PersistenceMathLib.split(collateral, persistenceBps);
+
+        Currency currency = bond.collateralIsCurrency0 ? poolRef.currency0 : poolRef.currency1;
+        address refundRecipient = bond.refundRecipient;
+
+        // ---- EFFECTS, all before the transfer ----
+
+        bond.state = BondState.SETTLED;
+
+        // ADR-0004 Rule 3: the count tracks FINALIZED, UNSETTLED bonds, so it drops by exactly one
+        // here. Reaching zero does NOT delete the bucket — the checkpoint stays frozen and stored
+        // forever, per ADR-0003 § 5.4.
+        maturity[id][maturityBlock].pendingBonds -= 1;
+
+        // The slash never moves. It was already inside the hook; this reclassifies it.
+        if (slash > 0) {
+            insurancePot[id][currency] += slash;
+        }
+
+        emit BondSettled(bondId, id, refundRecipient, currency, collateral, refund, slash, persistenceBps);
+
+        // ---- INTERACTION, last ----
+
+        if (refund > 0) {
+            currency.transfer(refundRecipient, refund);
+        }
+    }
+
+    /// @notice Returns the cumulative exactly at a bond's maturity, freezing it if still possible.
+    ///
+    /// @dev Three cases, in the order ADR-0003 § 5.3 requires.
+    ///
+    ///      ALREADY FROZEN — the normal path. A swap crossed M and captured it. Return it.
+    ///
+    ///      NOT FROZEN, CURSOR STILL AT OR BEFORE M — the quiet-pool path. Nothing has swapped
+    ///      since before M, so the tick has not changed and the value at M is still exactly
+    ///      derivable from unchanged state. Derive it, freeze it, and use it. The result is
+    ///      identical to what a crossing swap would have frozen, which is what lets a quiet pool
+    ///      settle with no keeper and no transaction at M.
+    ///
+    ///      NOT FROZEN, CURSOR PAST M — revert. The tick has moved since M and the exact value is
+    ///      unrecoverable. Approximating from live state would make the outcome depend on when
+    ///      settlement was called. This is an upstream invariant violation, not a case to paper
+    ///      over.
+    function _cumulativeAtMaturity(bytes32 bondId, PoolId id, uint32 maturityBlock) private returns (int56 cumulative) {
         MaturityCheckpoint storage bucket = maturity[id][maturityBlock];
 
-        uint32 indexInBucket = bucket.pendingBonds;
+        if (bucket.checkpointed) {
+            return bucket.cumulative;
+        }
 
-        bondId = _bondId(id, maturityBlock, indexInBucket);
+        TickAccumulatorLib.Accumulator memory acc = accumulator[id];
 
-        bonds[bondId] = Bond({
-            refundRecipient: refundRecipient,
-            openBlock: openBlock,
-            maturityBlock: maturityBlock,
-            poolIndex: poolIndex,
-            amount: amount,
-            cumulativeAtOpen: cumulativeAtOpen,
-            tickBefore: tickBefore,
-            tickAfter: tickAfter,
-            inputIsCurrency0: inputIsCurrency0,
-            state: BondState.FINALIZED
-        });
+        if (acc.lastUpdate > maturityBlock) {
+            revert MaturityCheckpointMissing(bondId, maturityBlock, acc.lastUpdate);
+        }
 
-        bucket.pendingBonds = indexInBucket + 1;
+        // Quiet path. `cumulativeAt` enforces its own domain, so a block outside
+        // [lastUpdate, block.number] cannot be reconstructed even by accident.
+        cumulative = acc.cumulativeAt(maturityBlock);
 
-        emit BondOpened(bondId, id, refundRecipient, amount, maturityBlock);
+        bucket.cumulative = cumulative;
+        bucket.checkpointed = true;
+
+        emit MaturityCheckpointed(id, maturityBlock, cumulative);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1107,55 +1565,52 @@ contract BondMeBro is BaseHook {
     function getBond(bytes32 bondId) external view returns (Bond memory bond) {
         bond = bonds[bondId];
 
-        if (bond.state != BondState.FINALIZED) revert BondNotFound(bondId);
+        // FINALIZED and SETTLED are both real bonds and both readable — a settled bond is
+        // historical record, and hiding it would make the settlement result unauditable.
+        // Only NONE and PROVISIONAL report as absent, which is exactly what ADR-0004 Rule 1
+        // requires: the rule is about provisional records, not about settled ones.
+        // Strict equality on an enum, same as `bondExists`. Slither's `incorrect-equality`
+        // detector targets `==` on balances and timestamps, where a value can be skipped past;
+        // `state` is a four-valued enum and these are exactly the two values that mean "absent".
+        // slither-disable-next-line incorrect-equality
+        if (bond.state == BondState.NONE || bond.state == BondState.PROVISIONAL) revert BondNotFound(bondId);
     }
 
-    /// @notice Whether a bond id identifies a finalized bond.
+    /// @notice The refundable collateral actually held for a bond, in raw units of its
+    ///         collateral currency.
+    ///
+    /// @dev THE SUPPORTED WAY TO READ THE COLLATERAL. `getBond(...).variableLegAmount` is the
+    ///      realized variable LEG, not the collateral — the field was renamed rather than
+    ///      silently repurposed precisely so that a caller reading the old `amount` fails to
+    ///      compile instead of quietly reading a different quantity (ADR-0005 section 3.2).
+    ///
+    ///      The value is recomputed, not stored, and the recomputation is exact rather than
+    ///      approximate: it is the same expression over the same frozen inputs that custody used.
+    ///
+    ///      Reverts for `NONE` and `PROVISIONAL` exactly as `getBond` does, so a provisional
+    ///      record stays indistinguishable from an absent one (ADR-0004 Rule 1).
+    ///
+    /// @param bondId Bond to read.
+    /// @return collateral Collateral held, in raw units of the bond's collateral currency.
+    function collateralAmountOf(bytes32 bondId) external view returns (uint128 collateral) {
+        Bond memory bond = bonds[bondId];
+
+        // slither-disable-next-line incorrect-equality
+        if (bond.state == BondState.NONE || bond.state == BondState.PROVISIONAL) revert BondNotFound(bondId);
+
+        return _collateralOf(bond);
+    }
+
+    /// @notice Whether a bond id identifies a real bond — FINALIZED or SETTLED.
     /// @dev False for both `NONE` and `PROVISIONAL`, which are indistinguishable to callers.
     function bondExists(bytes32 bondId) external view returns (bool) {
         // Strict equality is correct and intended here. Slither's `incorrect-equality` detector
         // targets `==` on balances and timestamps, where a value can be skipped past. `state` is a
         // three-valued enum and the question is exactly "is it FINALIZED" — an ordered comparison
         // would silently accept any future state added above it.
+        BondState state = bonds[bondId].state;
+
         // slither-disable-next-line incorrect-equality
-        return bonds[bondId].state == BondState.FINALIZED;
-    }
-
-    /// @notice Recreates the exact-input bond's deterministic parameters and records it.
-    ///
-    /// @dev Called from `_afterSwap`. Custody already happened in `_beforeSwap`; this only writes
-    ///      the record, now that `tickAfter` is known. The bond amount is recomputed from exactly
-    ///      the same inputs `_beforeSwap` used — `grossInput`, `bondBps` and the direction's
-    ///      threshold — rather than being carried across in temporary storage. Both callbacks run
-    ///      in one transaction against unchanged configuration, so the two computations agree.
-    ///
-    ///      Returns silently for unbonded swaps: no custody was taken, so there is nothing to
-    ///      record.
-    function _recordExactInputBond(
-        PoolId id,
-        SwapParams calldata params,
-        bytes calldata hookData,
-        int24 tickBefore,
-        int24 tickAfter,
-        int56 cumulativeAtOpen
-    ) private {
-        PoolConfig memory cfg = poolConfig[id];
-
-        if (cfg.bondBps == 0) return;
-
-        uint256 grossInput = uint256(-params.amountSpecified);
-
-        if (grossInput < (params.zeroForOne ? cfg.minBondedAmount0 : cfg.minBondedAmount1)) return;
-
-        // Same expression as `_beforeSwap`, over the same unchanged inputs.
-        uint256 bond = (grossInput * cfg.bondBps) / BPS;
-
-        // Only the recipient is needed here; `maxBondAmount` was already enforced in
-        // `_beforeSwap` before custody was taken.
-        // slither-disable-next-line unused-return
-        (address refundRecipient,) = HookDataCodec.decode(hookData);
-
-        // slither-disable-next-line unused-return
-        _openBond(id, params.zeroForOne, uint128(bond), refundRecipient, tickBefore, tickAfter, cumulativeAtOpen);
+        return state == BondState.FINALIZED || state == BondState.SETTLED;
     }
 }

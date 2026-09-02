@@ -62,12 +62,48 @@ contract HookWiringTest is Test, Deployers {
             HOOK_FLAGS,
             uint160(
                 Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
-                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+                    | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
             ),
             "HOOK_FLAGS is not the intended bit set"
         );
-        // 0x10C8 in T3A; AFTER_SWAP_RETURNS_DELTA (1<<2) added in T3B — see ADR-0002 s12.
-        assertEq(HOOK_FLAGS, 0x10CC, "HOOK_FLAGS drifted from the value recorded in ADR-0002 s12");
+        // 0x10C8 in T3A; AFTER_SWAP_RETURNS_DELTA (1<<2) added in T3B -- see ADR-0002 s12.
+        // P-L2-3/4 REMOVED BEFORE_SWAP_RETURNS_DELTA (1<<3), so 0x10CC -> 0x10C4 (ADR-0006 s4).
+        //
+        // This numeric pin was itself a migration hazard of exactly the kind P-L2-2 hit with the
+        // hookData version byte: it encodes the OLD permission set as a literal, so it survives a
+        // rename of every named constant and fails only at the point of edit. It is kept rather
+        // than deleted -- an independent statement of the bitmap is the whole reason it caught
+        // anything -- but it is now stated as a derivation from the removal so the next reader can
+        // see WHICH bit left and why.
+        assertEq(HOOK_FLAGS, 0x10C4, "HOOK_FLAGS drifted from the value recorded in ADR-0002 s12 / ADR-0006 s4");
+        assertEq(HOOK_FLAGS, 0x10CC & ~uint160(Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG), "0x10C4 is not 0x10CC minus 1<<3");
+    }
+
+    /// @notice The permission removed by P-L2-3/4 must be absent from BOTH sources of truth, and
+    ///         absent is asserted directly rather than inferred from the bitmap equality above.
+    ///
+    /// @dev Two independent statements, because they fail for different reasons:
+    ///
+    ///        - the ADDRESS bit, which is what `PoolManager` actually consults at every callback;
+    ///        - the DECLARED struct, which is what `validateHookPermissions` compares against it.
+    ///
+    ///      Re-adding the flag to `HOOK_FLAGS` alone would mine a new address and fail here on the
+    ///      first assertion; re-adding it to `getHookPermissions` alone would fail on the second.
+    ///      Neither is caught by a test that only checks the two agree with each other.
+    ///
+    ///      This matters beyond tidiness. `beforeSwapReturnDelta` is the permission Uniswap rates
+    ///      CRITICAL, because a hook holding it can return a specified-currency delta and turn a
+    ///      swap into a no-op. ADR-0006 s4's security argument is that BondMeBro cannot do this
+    ///      because it does not hold the bit -- not that it chooses not to. That argument is only
+    ///      true while this test passes.
+    function test_hookFlags_beforeSwapReturnDeltaIsGone() public view {
+        assertEq(
+            uint160(address(hook)) & uint160(Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG),
+            0,
+            "the deployed address still carries BEFORE_SWAP_RETURNS_DELTA"
+        );
+
+        assertFalse(hook.getHookPermissions().beforeSwapReturnDelta, "the hook still declares beforeSwapReturnDelta");
     }
 
     /// @dev The invocation proof has been progressively cheapened as the scaffolding it relied on

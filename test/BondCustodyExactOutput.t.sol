@@ -29,8 +29,11 @@ import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {ActionConstants} from "@uniswap/v4-periphery/src/libraries/ActionConstants.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+
 import {BondMeBro, HOOK_FLAGS} from "../src/BondMeBro.sol";
 import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
+import {ModelLReference} from "./utils/ModelLReference.sol";
 
 /// @title BondCustodyExactOutputTest
 
@@ -41,6 +44,8 @@ import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 /// These tests derive `poolInput` from real token movements instead of hardcoding it. This proves the accounting relationship between the trader, PoolManager, and BondMeBro even if pool liquidity or execution price changes.
 
 contract BondCustodyExactOutputTest is Test, Deployers {
+    using StateLibrary for IPoolManager;
+
     BondMeBro internal hook;
     MockV4Router internal router;
 
@@ -53,6 +58,9 @@ contract BondCustodyExactOutputTest is Test, Deployers {
     uint96 internal constant MIN_BONDED_1 = 1e15;
 
     uint16 internal constant BOND_BPS = 25;
+
+    /// @dev Settlement noise floor, in ticks. Displacement at or below this is never slashed.
+    uint16 internal constant REFUND_TOL = 5;
     uint256 internal constant BPS = 10_000;
 
     /// @dev Large enough for the resulting gross input to exceed the bonding threshold.
@@ -62,6 +70,9 @@ contract BondCustodyExactOutputTest is Test, Deployers {
     uint128 internal constant UNBONDED_OUTPUT = 1e13;
 
     uint128 internal constant GENEROUS_CEILING = type(uint128).max;
+
+    /// @dev See the comment at the `modifyLiquidity` call in `setUp`.
+    int128 internal constant POOL_LIQUIDITY = 1e19;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -77,17 +88,22 @@ contract BondCustodyExactOutputTest is Test, Deployers {
         (key_, id_) =
             initPoolAndAddLiquidity(currency0, currency1, IHooks(address(hook)), 3000, TickMath.getSqrtPriceAtTick(0));
 
-        // Add enough liquidity for the exact-output swaps to fill without
-        // unintentionally stopping at a price limit.
+        // Deep enough that exact-output swaps fill without stopping at a price limit, SHALLOW
+        // enough that they move the price by a measurable number of ticks.
+        //
+        // Reduced from 1e21 in P-L2-3/4 for the reason given at length in `BondCustody.t.sol`:
+        // Model L prices collateral off the realized impact, so at 1e21 a 1e16 swap moved a single
+        // tick and every sizing assertion here would have been testing a 1-bps rounding edge
+        // rather than the rate curve.
         modifyLiquidityRouter.modifyLiquidity(
             key_,
             ModifyLiquidityParams({
-                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 1e21, salt: bytes32(uint256(1))
+                tickLower: -60_000, tickUpper: 60_000, liquidityDelta: POOL_LIQUIDITY, salt: bytes32(uint256(1))
             }),
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
 
         // MockV4Router inherits the real V4Router exact-output and
         // amountInMaximum logic. It only provides the test payment plumbing.
@@ -156,11 +172,42 @@ contract BondCustodyExactOutputTest is Test, Deployers {
         );
     }
 
-    /// @dev Recomputes the exact-output bond from the amount actually consumed by the pool.
+    /// @dev Recomputes the exact-output bond from what the pool actually consumed and how far it
+    ///      actually moved the price.
     ///
-    /// `bond = poolInput * bondBps / (10_000 - bondBps)`
-    function _expectedBond(uint256 poolInput) internal pure returns (uint256) {
-        return FullMath.mulDiv(poolInput, BOND_BPS, BPS - BOND_BPS);
+    ///      THE FORMULA CHANGED SHAPE IN P-L2-3/4, not just its constant, so the old one is worth
+    ///      stating next to the new one:
+    ///
+    ///          before : bond = poolInput * bondBps / (10_000 - bondBps)
+    ///          now    : bond = poolInput * collateralBps / 10_000
+    ///
+    ///      The old expression was a GROSS SOLVE. Because the bond was charged on top of the pool
+    ///      input, dividing by `10_000 - bondBps` made `bondBps` the rate on the trader's TOTAL
+    ///      input, so exact-output and exact-input quoted the same headline rate on comparable
+    ///      quantities. Model L abandons that framing: the rate applies to the VARIABLE LEG, which
+    ///      for exact-output is the pool input itself, and it is derived from impact rather than
+    ///      configured. There is nothing left to solve for, so the closed form is a plain
+    ///      proportion.
+    ///
+    ///      The bond is still charged ON TOP of the pool input -- that part is unchanged, and it
+    ///      is what keeps the requested output exact.
+    function _expectedBond(uint256 poolInput, int24 tickBefore, int24 tickAfter) internal pure returns (uint256) {
+        return ModelLReference.collateralFor(poolInput, tickBefore, tickAfter);
+    }
+
+    /// @dev Balances and tick captured before a swap.
+    struct Snapshot {
+        uint256 traderIn;
+        uint256 traderOut;
+        uint256 hookIn;
+        uint256 managerIn;
+        int24 tick;
+    }
+
+    /// @dev The pool tick, for capturing either side of a swap.
+    function _tick() internal view returns (int24 tick) {
+        // slither-disable-next-line unused-return
+        (, tick,,) = manager.getSlot0(id_);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -181,7 +228,11 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         uint256 managerIn0 = currency0.balanceOf(address(manager));
 
+        int24 tickBefore = _tick();
+
         _swapExactOut(BONDED_OUTPUT, true, _validHookData());
+
+        int24 tickAfter = _tick();
 
         uint256 traderSpent = traderIn0 - currency0.balanceOf(address(this));
 
@@ -196,20 +247,36 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         assertGt(poolInput, 0, "pool consumed no input");
 
-        uint256 expectedBond = _expectedBond(poolInput);
+        uint256 expectedBond = _expectedBond(poolInput, tickBefore, tickAfter);
 
         assertGt(expectedBond, 0, "test is not exercising a bonded swap");
 
-        // Hook receives exactly the calculated bond in the input currency.
+        // Hook receives exactly the calculated bond in the input currency. For exact-output the
+        // INPUT is the variable leg, so unlike exact-input the collateral currency is unchanged
+        // by this migration -- only its size is.
         assertEq(hookGained, expectedBond, "hook did not take exactly the computed bond");
 
-        // Exact-output adds the bond on top of pool input.
+        // Exact-output still adds the bond on top of pool input, which is what keeps the
+        // requested output exactly as requested.
         assertEq(traderSpent, poolInput + hookGained, "gross input is not poolInput + bond");
 
         assertGt(traderSpent, poolInput, "bond was not charged on top of pool input");
 
-        // The solved formula preserves bondBps as the gross-input bond rate.
-        assertEq(hookGained, traderSpent * BOND_BPS / BPS, "bond is not bondBps of gross input");
+        // The rate now applies to the VARIABLE LEG (the pool input), not to the trader's gross
+        // input. The old gross-solve made those two framings coincide; Model L does not, so the
+        // relation is asserted against the leg and the difference from the gross framing is
+        // pinned rather than left ambiguous.
+        assertEq(
+            hookGained,
+            (poolInput * ModelLReference.collateralBps(tickBefore, tickAfter)) / BPS,
+            "bond is not collateralBps of the POOL INPUT"
+        );
+
+        assertLt(
+            hookGained,
+            (traderSpent * ModelLReference.collateralBps(tickBefore, tickAfter)) / BPS + 1,
+            "bond is being computed off the gross input rather than the variable leg"
+        );
 
         // No residual PoolManager claims remain after the accounting cycle.
         assertEq(manager.balanceOf(address(hook), currency0.toId()), 0, "hook holds currency0 claims");
@@ -229,7 +296,11 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         uint256 managerIn1 = currency1.balanceOf(address(manager));
 
+        int24 tickBefore = _tick();
+
         _swapExactOut(BONDED_OUTPUT, false, _validHookData());
+
+        int24 tickAfter = _tick();
 
         uint256 traderSpent = traderIn1 - currency1.balanceOf(address(this));
 
@@ -241,7 +312,17 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         assertEq(traderReceived, BONDED_OUTPUT, "trader did not receive the exact requested output");
 
-        assertEq(hookGained, _expectedBond(poolInput), "bond not taken in currency1");
+        assertEq(hookGained, _expectedBond(poolInput, tickBefore, tickAfter), "bond not taken in currency1");
+
+        assertGt(hookGained, 0, "test is not exercising a bonded swap");
+
+        // The currency predicate, stated independently. Exact-OUTPUT oneForZero keeps collateral
+        // in currency1 -- the same currency as before the migration, but for a different reason:
+        // it is the input, and for exact-output the input is the variable leg.
+        assertFalse(
+            ModelLReference.collateralIsCurrency0({zeroForOne: false, exactInput: false}),
+            "reference disagrees: exact-output oneForZero must bond in currency1"
+        );
 
         assertEq(traderSpent, poolInput + hookGained, "gross input is not poolInput + bond");
 
@@ -283,7 +364,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.revertToState(snap);
 
-        hook.setPoolConfig(key_, uint128(grossProbe + 1), uint96(grossProbe + 1), BOND_BPS);
+        hook.setPoolConfig(key_, uint128(grossProbe + 1), uint96(grossProbe + 1), BOND_BPS, REFUND_TOL);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -292,19 +373,139 @@ contract BondCustodyExactOutputTest is Test, Deployers {
         assertEq(currency0.balanceOf(address(hook)), hookBefore, "threshold was compared against the wrong quantity");
     }
 
-    /// @notice A swap that qualifies for bonding must revert if integer rounding produces a zero bond.
+    /// @notice A swap too small to move a tick is UNBONDED, not reverted.
+    ///
+    /// @dev This replaces the old `test_exactOutput_bondRoundingToZero_reverts`, which expected a
+    ///      `BondRoundsToZero` revert for a 100-unit exact-output swap. That error no longer
+    ///      exists, and more importantly the behaviour it guarded has split in two.
+    ///
+    ///      Under the old model any bonded-but-tiny swap produced a zero bond and had to revert.
+    ///      Under Model L the two causes are distinguished:
+    ///
+    ///        the price did not move a whole tick  -> the swap is UNBONDED (this test).
+    ///                                                There is no LP-risk signal to price, so no
+    ///                                                obligation is created and nothing reverts.
+    ///
+    ///        the price moved but the leg is tiny  -> INV-NOOP-VL rejects it (the next test).
+    ///
+    ///      Collapsing these would be wrong in the expensive direction: reverting every sub-tick
+    ///      swap would make the hook fail closed on ordinary dust trades that pose no risk at all.
+    function test_exactOutput_subTickSwap_isUnbondedNotReverted() public {
+        // NUDGE THE POOL OFF THE TICK BOUNDARY FIRST, and this is not incidental setup.
+        //
+        // The fixture initializes at exactly tick 0. Sitting on a boundary, ANY downward price
+        // movement -- even one of a few wei -- lands in tick -1, so the impact is 1 tick and the
+        // rate is 1 bps no matter how small the trade. A "sub-tick" swap is therefore impossible
+        // at a boundary, and without this warm-up the dust swap below reverts on INV-NOOP-VL
+        // rather than passing unbonded.
+        //
+        // That edge is real, not an artifact: on a pool configured with a threshold of 1, a dust
+        // trade executed while the price sits exactly on a boundary WILL revert, because it owes
+        // a bond that truncates to zero. It is unreachable in any realistic deployment, where
+        // `minBondedAmount` is many orders of magnitude above dust and such a trade is unbonded
+        // long before it reaches the rate. `test_exactOutput_bondTruncatingToZero_reverts` covers
+        // the case deliberately; here it is only in the way.
+        _swapExactOut(1e16, true, _validHookData());
 
-    /// @dev At 25 bps, a sufficiently small `poolInput` produces zero after integer division. The threshold is lowered to 1 so the tiny swap reaches the bonded path.
-    function test_exactOutput_bondRoundingToZero_reverts() public {
-        hook.setPoolConfig(key_, 1, 1, BOND_BPS);
+        hook.setPoolConfig(key_, 1, 1, BOND_BPS, REFUND_TOL);
+
+        uint256 hookBefore = currency0.balanceOf(address(hook));
+        uint256 traderBefore1 = currency1.balanceOf(address(this));
+
+        int24 tickBefore = _tick();
+
+        _swapExactOut(100, true, _validHookData());
+
+        assertEq(ModelLReference.collateralBps(tickBefore, _tick()), 0, "fixture DID move a tick; test is misaimed");
+
+        assertEq(currency0.balanceOf(address(hook)), hookBefore, "a sub-tick swap took collateral");
+
+        assertEq(currency1.balanceOf(address(this)) - traderBefore1, 100, "the swap did not deliver its output");
+    }
+
+    /// @notice INV-NOOP-VL on the exact-output path: a moved tick with a leg too small to charge
+    ///         must revert rather than finalize a zero-collateral bond.
+    ///
+    /// @dev Mirrors the exact-input case in `BondCustody.t.sol`, and needs the same construction:
+    ///      a pool thin enough that a few hundred units still cross a tick. On the fixture's
+    ///      liquidity no amount small enough to truncate could ever move the price, so the case
+    ///      would be unreachable and the test would silently prove nothing.
+    ///
+    ///      The search runs with bonding DISABLED so probe swaps cannot revert with the very error
+    ///      being provoked, then the state is rewound and the chosen amount replayed with bonding
+    ///      on. Rewinding restores the price exactly, so the replay reproduces the same leg.
+    function test_exactOutput_bondTruncatingToZero_reverts() public {
+        (PoolKey memory thinKey, PoolId thinId) =
+            initPool(currency0, currency1, IHooks(address(hook)), 500, TickMath.getSqrtPriceAtTick(0));
+
+        modifyLiquidityRouter.modifyLiquidity(
+            thinKey,
+            ModifyLiquidityParams({tickLower: -60_000, tickUpper: 60_000, liquidityDelta: 4e6, salt: bytes32(0)}),
+            ""
+        );
+
+        uint256 baseline = vm.snapshotState();
+
+        uint256 chosenOut;
+        uint256 observedLeg;
+
+        for (uint256 amountOut = 100; amountOut <= 9_000; amountOut += 100) {
+            uint256 snapshot = vm.snapshotState();
+
+            // slither-disable-next-line unused-return
+            (, int24 before_,,) = manager.getSlot0(thinId);
+
+            uint256 managerBefore0 = currency0.balanceOf(address(manager));
+
+            swapRouter.swap(
+                thinKey,
+                SwapParams({
+                    zeroForOne: true, amountSpecified: int256(amountOut), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                }),
+                PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+                ""
+            );
+
+            // slither-disable-next-line unused-return
+            (, int24 after_,,) = manager.getSlot0(thinId);
+
+            // For exact-output the variable leg is the POOL INPUT.
+            uint256 leg = currency0.balanceOf(address(manager)) - managerBefore0;
+
+            bool movedATick = ModelLReference.collateralBps(before_, after_) > 0;
+
+            bool truncatesToZero = leg > 0 && ModelLReference.collateralFor(leg, before_, after_) == 0;
+
+            vm.revertToState(snapshot);
+
+            if (movedATick && truncatesToZero) {
+                chosenOut = amountOut;
+                observedLeg = leg;
+                break;
+            }
+        }
+
+        assertGt(chosenOut, 0, "could not construct a moved-a-tick-but-truncates-to-zero exact-output swap");
+
+        vm.revertToState(baseline);
+
+        hook.setPoolConfig(thinKey, 1, 1, BOND_BPS, REFUND_TOL);
 
         vm.expectRevert(
             _wrapped(
-                IHooks.afterSwap.selector, abi.encodeWithSelector(BondMeBro.BondRoundsToZero.selector, uint256(102))
+                IHooks.afterSwap.selector,
+                abi.encodeWithSelector(BondMeBro.BondViolatesNoOpVLBound.selector, uint256(0), observedLeg)
             )
         );
 
-        _swapExactOut(100, true, _validHookData());
+        swapRouter.swap(
+            thinKey,
+            SwapParams({
+                zeroForOne: true, amountSpecified: int256(chosenOut), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            _validHookData()
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -337,13 +538,16 @@ contract BondCustodyExactOutputTest is Test, Deployers {
     }
 
     /// @notice Unsupported hookData versions are rejected before execution.
+    /// @dev Probed with a well-formed VERSION 1 payload — see the note on the exact-input
+    ///      equivalent in `BondCustody.t.sol`. v1 and v2 differ only in the unit of
+    ///      `maxBondAmount`, so only the version byte can separate them.
     function test_exactOutput_unsupportedHookDataVersion_reverts() public {
-        bytes memory wrongVersion = abi.encodePacked(uint8(2), TRADER, GENEROUS_CEILING);
+        bytes memory wrongVersion = abi.encodePacked(uint8(1), TRADER, GENEROUS_CEILING);
 
         vm.expectRevert(
             _wrapped(
                 IHooks.beforeSwap.selector,
-                abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(2))
+                abi.encodeWithSelector(HookDataCodec.UnsupportedHookDataVersion.selector, uint8(1))
             )
         );
 
@@ -560,7 +764,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         manager.initialize(emptyKey, TickMath.getSqrtPriceAtTick(0));
 
-        hook.setPoolConfig(emptyKey, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(emptyKey, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -602,9 +806,9 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.expectRevert(BondMeBro.NotOwner.selector);
 
-        hook.setPoolConfig(hostileKey, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(hostileKey, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
 
-        (uint128 minBonded0, uint96 minBonded1, uint16 bondBps) = hook.poolConfig(hostileKey.toId());
+        (uint128 minBonded0, uint96 minBonded1, uint16 bondBps,) = hook.poolConfig(hostileKey.toId());
 
         assertEq(minBonded0, 0, "hostile pool has a currency0 threshold");
 
@@ -634,37 +838,66 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
     /// @dev Every successful bonded swap must deliver the exact requested output, take the expected input-currency bond, satisfy `grossInput = poolInput + bond`, and leave no PoolManager claim balance.
     function testFuzz_exactOutput_accountingHolds(uint96 rawAmountOut, bool zeroForOne) public {
-        uint128 amountOut = uint128(bound(uint256(rawAmountOut), 1e16, 1e19));
+        // Upper bound lowered from 1e19 to 1e18 in P-L2-3/4, because `POOL_LIQUIDITY` came down to
+        // 1e19 in the same stage. Requesting an output of the same order as the pool's liquidity
+        // makes the swap stop at its price limit, so the assertion that fails is "trader did not
+        // receive the exact requested output" -- a partial fill, not an accounting defect. 1e18
+        // still spans roughly 2% to 20% price impact, which crosses the 397-tick cap and so
+        // exercises both sides of the rate curve.
+        uint128 amountOut = uint128(bound(uint256(rawAmountOut), 1e16, 1e18));
 
         (Currency inputCurrency, Currency outputCurrency) = zeroForOne ? (currency0, currency1) : (currency1, currency0);
 
-        uint256 traderInBefore = inputCurrency.balanceOf(address(this));
-
-        uint256 traderOutBefore = outputCurrency.balanceOf(address(this));
-
-        uint256 hookBefore = inputCurrency.balanceOf(address(hook));
-
-        uint256 managerBefore = inputCurrency.balanceOf(address(manager));
+        // Grouped into a struct rather than held as separate locals: adding the two tick readings
+        // that Model L needs pushes this frame past the EVM stack limit under the project's
+        // non-viaIR settings.
+        Snapshot memory before = Snapshot({
+            traderIn: inputCurrency.balanceOf(address(this)),
+            traderOut: outputCurrency.balanceOf(address(this)),
+            hookIn: inputCurrency.balanceOf(address(hook)),
+            managerIn: inputCurrency.balanceOf(address(manager)),
+            tick: _tick()
+        });
 
         _swapExactOut(amountOut, zeroForOne, _validHookData());
 
-        uint256 traderSpent = traderInBefore - inputCurrency.balanceOf(address(this));
+        int24 tickAfter = _tick();
 
-        uint256 traderReceived = outputCurrency.balanceOf(address(this)) - traderOutBefore;
+        uint256 bond = inputCurrency.balanceOf(address(hook)) - before.hookIn;
 
-        uint256 bond = inputCurrency.balanceOf(address(hook)) - hookBefore;
+        uint256 poolInput = inputCurrency.balanceOf(address(manager)) - before.managerIn;
 
-        uint256 poolInput = inputCurrency.balanceOf(address(manager)) - managerBefore;
+        assertEq(
+            outputCurrency.balanceOf(address(this)) - before.traderOut,
+            amountOut,
+            "trader did not receive the exact requested output"
+        );
 
-        assertEq(traderReceived, amountOut, "trader did not receive the exact requested output");
-
-        assertEq(bond, _expectedBond(poolInput), "bond does not match the gross-solved formula");
+        assertEq(
+            bond,
+            _expectedBond(poolInput, before.tick, tickAfter),
+            "bond does not match the Model L rate on the realized pool input"
+        );
 
         assertGt(bond, 0, "a bonded swap took no bond");
 
-        assertEq(traderSpent, poolInput + bond, "gross input is not poolInput + bond");
+        assertEq(
+            before.traderIn - inputCurrency.balanceOf(address(this)),
+            poolInput + bond,
+            "gross input is not poolInput + bond"
+        );
 
         assertEq(manager.balanceOf(address(hook), inputCurrency.toId()), 0, "hook left an unresolved claim");
+
+        // INV-NOOP-VL, observed on every fuzz draw: the collateral sits strictly inside the leg.
+        assertLt(bond, poolInput, "INV-NOOP-VL: bond reached or exceeded the variable leg");
+
+        // And the cap holds end to end, whatever impact the draw happened to produce.
+        assertLe(
+            bond,
+            (poolInput * ModelLReference.MAX_BOND_BPS) / BPS,
+            "INV-L2-2: realized bond exceeded the 1% cap on the variable leg"
+        );
     }
 
     /// @notice Fuzzes `maxBondAmount` enforcement across sizes and both swap directions.

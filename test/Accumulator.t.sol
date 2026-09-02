@@ -42,6 +42,9 @@ contract AccumulatorTest is Test, Deployers {
     uint128 internal constant MIN_BONDED = 1e15;
     uint96 internal constant MIN_BONDED_1 = 1e15;
     uint16 internal constant BOND_BPS = 25;
+
+    /// @dev Settlement noise floor, in ticks. Displacement at or below this is never slashed.
+    uint16 internal constant REFUND_TOL = 5;
     uint128 internal constant GENEROUS_CEILING = type(uint128).max;
 
     function setUp() public {
@@ -69,7 +72,7 @@ contract AccumulatorTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -241,7 +244,7 @@ contract AccumulatorTest is Test, Deployers {
     /// @notice An unconfigured pool — which can never bond — must still advance its accumulator.
     /// @dev The cheapest path in the contract, and the one most likely to acquire an early return.
     function test_unconfiguredPool_stillAdvancesAccumulator() public {
-        hook.setPoolConfig(key_, 0, 0, 0);
+        hook.setPoolConfig(key_, 0, 0, 0, 0);
         _assertSwapAdvances(-1e16, true, "");
     }
 
