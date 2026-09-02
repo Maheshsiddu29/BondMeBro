@@ -268,7 +268,8 @@ contract MaturityCheckpointGasTest is Test, Deployers {
 
         // All ten maturities are ahead of the cursor and still unfrozen.
         for (uint32 i = 0; i < ob; i++) {
-            (, uint32 pending, bool frozen) = hook.maturity(id_, firstMaturity + i);
+            (,,, uint32 pending, uint8 frozenMask) = hook.maturity(id_, firstMaturity + i);
+            bool frozen = frozenMask & hook.FROZEN_C10() != 0;
             assertEq(pending, 1, "a maturity did not register");
             assertFalse(frozen, "a maturity froze before it was crossed");
             assertGt(firstMaturity + i, l, "fixture did not leave the maturities ahead of the cursor");
@@ -284,7 +285,8 @@ contract MaturityCheckpointGasTest is Test, Deployers {
         // Every occupied position inside the horizon froze.
         uint32 frozenCount;
         for (uint32 m = l + 1; m <= l + w; m++) {
-            (, uint32 pending, bool frozen) = hook.maturity(id_, m);
+            (,,, uint32 pending, uint8 frozenMask) = hook.maturity(id_, m);
+            bool frozen = frozenMask & hook.FROZEN_C10() != 0;
 
             if (pending > 0) {
                 assertTrue(frozen, "an occupied position inside the horizon was not frozen");

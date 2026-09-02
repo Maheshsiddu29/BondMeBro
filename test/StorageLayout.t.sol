@@ -328,10 +328,28 @@ contract StorageLayoutTest is Test, Deployers {
         assertEq(uint16(word >> 240), tol, "refundToleranceTicks offset");
     }
 
-    /// @notice `MaturityCheckpoint` occupies exactly one slot.
+    /// @notice `MaturityCheckpoint` occupies exactly one slot, with all FIVE fields at the offsets
+    ///         ADR-0007 § 3.1 states.
     ///
-    /// @dev The checkpoint is written on the settlement path and read on every swap that crosses a
-    ///      maturity, so its single-slot packing is the premise of ADR-0007's cost argument.
+    /// @dev THIS IS THE HARD FAILURE CONDITION OF P-L2-5. The struct grew from one endpoint to
+    ///      three — 56*3 + 32 + 8 = 208 bits — and the entire cost argument for Design 3 rests on
+    ///      that still fitting in one word.
+    ///
+    ///      Why it matters more than tidiness: `pendingBonds` makes the slot non-zero when a bond
+    ///      registers, so every later endpoint freeze is an `SSTORE_RESET` (2,900) on an
+    ///      already-loaded slot rather than an `SSTORE_SET` (22,100). If the struct spilled, an
+    ///      interior freeze could land on a fresh second slot, and ADR-0007 § 4 brute-forced that
+    ///      arrangement to ~217,000 gas against a 150,000 ceiling — reachable with four cheap
+    ///      swaps and paid by an unrelated later trader. A griefing vector, not a tail case.
+    ///
+    ///      The offsets are read back from a RAW WORD after a real bonded swap and decoded by hand
+    ///      at each stated position, so this asserts what the EVM actually wrote rather than
+    ///      restating the compiler's own layout table back to itself.
+    ///
+    ///      Offsets changed in P-L2-5 and the old ones are recorded so the diff is legible:
+    ///
+    ///          before: cumulative 0, pendingBonds 7, checkpointed 11        (96 bits used)
+    ///          after:  C6 0, C8 7, C10 14, pendingBonds 21, frozenMask 25   (208 bits used)
     function test_maturityCheckpoint_packsIntoExactlyOneSlot() public {
         uint32 m = uint32(block.number) + hook.OBSERVATION_BLOCKS();
 
@@ -339,20 +357,63 @@ contract StorageLayoutTest is Test, Deployers {
 
         bytes32 base = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, SLOT_MATURITY))));
 
-        (int56 cumulative, uint32 pending, bool checkpointed) = hook.maturity(id_, m);
+        (int56 c6, int56 c8, int56 c10, uint32 pending, uint8 mask) = hook.maturity(id_, m);
 
         uint256 word = uint256(vm.load(address(hook), base));
 
-        assertEq(int56(uint56(word)), cumulative, "MaturityCheckpoint.cumulative is not at offset 0");
-        assertEq(uint32(word >> 56), pending, "MaturityCheckpoint.pendingBonds is not at offset 7");
-        assertEq((uint8(word >> 88) & 0xFF) != 0, checkpointed, "MaturityCheckpoint.checkpointed is not at offset 11");
+        assertEq(int56(uint56(word)), c6, "cumulativeMinus4 (C6) is not at offset 0");
+        assertEq(int56(uint56(word >> 56)), c8, "cumulativeMinus2 (C8) is not at offset 7");
+        assertEq(int56(uint56(word >> 112)), c10, "cumulativeAtM (C10) is not at offset 14");
+        assertEq(uint32(word >> 168), pending, "pendingBonds is not at offset 21");
+        assertEq(uint8(word >> 200), mask, "frozenMask is not at offset 25");
 
+        // THE COMMITMENT: 208 bits used, so the next word must be untouched.
         assertEq(
             uint256(vm.load(address(hook), bytes32(uint256(base) + 1))),
             0,
-            "MaturityCheckpoint spilled into a second slot"
+            "MaturityCheckpoint spilled into a SECOND slot: interior freezes can now hit a fresh slot"
         );
 
         assertGt(pending, 0, "the fixture registered no bond, so nothing was actually read back");
+    }
+
+    /// @notice Freezing one endpoint does not disturb any other field in the shared word.
+    ///
+    /// @dev The specific hazard of packing five fields into one slot: a write to `cumulativeAtM`
+    ///      that got its shift wrong would silently corrupt `pendingBonds` or the mask sitting
+    ///      beside it, and every balance-based test would still pass.
+    ///
+    ///      Driven through the real scheduler rather than by `vm.store`: a bond is opened, the
+    ///      word is captured, then the chain is advanced so the endpoints freeze one at a time,
+    ///      and after each advancement every OTHER field is compared against what it was.
+    function test_endpointFreezes_doNotDisturbNeighbouringFields() public {
+        uint32 m = uint32(block.number) + hook.OBSERVATION_BLOCKS();
+
+        _swap(-1e16, true, HookDataCodec.encode(TRADER, type(uint128).max));
+
+        (,,, uint32 pendingAtOpen,) = hook.maturity(id_, m);
+
+        assertEq(pendingAtOpen, 1, "fixture did not register the bond");
+
+        uint8 previousMask;
+
+        // Walk past every endpoint, one block at a time, nudging the pool so the scan runs.
+        for (uint32 i = 0; i < hook.OBSERVATION_BLOCKS() + 2; i++) {
+            vm.roll(block.number + 1);
+
+            _swap(-1e13, true, "");
+
+            (,,, uint32 pending, uint8 mask) = hook.maturity(id_, m);
+
+            // The neighbour that shares the word and must never move.
+            assertEq(pending, 1, "an endpoint freeze corrupted pendingBonds in the shared slot");
+
+            // IMMUTABILITY: a set bit is never cleared.
+            assertEq(mask & previousMask, previousMask, "a frozen endpoint bit was cleared");
+
+            previousMask = mask;
+        }
+
+        assertEq(previousMask, hook.FROZEN_ALL(), "not every endpoint froze across the walk");
     }
 }

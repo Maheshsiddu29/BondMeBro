@@ -130,6 +130,60 @@ contract BondCustodyHandler is Test {
     ///      against a number derived from observed behaviour rather than from itself.
     mapping(uint32 => uint32) public expectedFinalizedAt;
 
+    /*//////////////////////////////////////////////////////////////
+              THE INDEPENDENT CUMULATIVE REFERENCE (ADR-0007)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev One observation of the POOL: from `blockNumber` onward the tick is `tickFrom`, and the
+    ///      integral up to `blockNumber` is `cumulative`.
+    ///
+    ///      ADR-0007 section 6 requires the checkpoint invariants to be checked against a reference
+    ///      the test builds itself, never against the hook's own accumulator -- that would be
+    ///      circular and would pass unchanged if every endpoint were off by a block.
+    ///
+    ///      This integrates `PoolManager.getSlot0`'s tick block by block. It never reads
+    ///      `hook.accumulator`. It is exact because the pool tick can only change in a swap, and
+    ///      the handler performs every swap in this campaign through one call site.
+    struct RefPoint {
+        uint32 blockNumber;
+        int56 cumulative;
+        int24 tickFrom;
+    }
+
+    RefPoint[] public refPoints;
+
+    /// @dev Extends the reference to the current block. Called after every successful swap.
+    function _noteRef() internal {
+        RefPoint memory last = refPoints[refPoints.length - 1];
+
+        uint32 nowBlock = uint32(block.number);
+
+        int56 cumulative = last.cumulative + int56(last.tickFrom) * int56(uint56(nowBlock - last.blockNumber));
+
+        // slither-disable-next-line unused-return
+        (, int24 tick,,) = manager.getSlot0(key_.toId());
+
+        refPoints.push(RefPoint({blockNumber: nowBlock, cumulative: cumulative, tickFrom: tick}));
+    }
+
+    /// @notice The independently integrated cumulative at an arbitrary block.
+    function refCumulativeAt(uint32 atBlock) public view returns (int56) {
+        for (uint256 i = refPoints.length; i > 0; i--) {
+            RefPoint memory p = refPoints[i - 1];
+
+            if (p.blockNumber <= atBlock) {
+                return p.cumulative + int56(p.tickFrom) * int56(uint56(atBlock - p.blockNumber));
+            }
+        }
+
+        revert("reference does not cover a block before initialization");
+    }
+
+    /// @notice Whether the reference can answer for a block at all.
+    function refCovers(uint32 atBlock) public view returns (bool) {
+        return refPoints.length > 0 && refPoints[0].blockNumber <= atBlock;
+    }
+
     /// @notice Number of distinct maturity blocks the campaign has touched.
     function touchedMaturityCount() external view returns (uint256) {
         return touchedMaturities.length;
@@ -193,8 +247,23 @@ contract BondCustodyHandler is Test {
         return activeMaturities[index];
     }
 
+    /// @notice Whether a bond was EVER registered into this bucket, over the whole campaign.
+    ///
+    /// @dev Distinct from the live `pendingBonds`, which drops back to zero as bonds settle, and
+    ///      distinct from `maturityActive`, which is cleared when a maturity is resolved and
+    ///      dropped from the bounded active set.
+    ///
+    ///      `invariant_noPhantomBucket` needs the permanent fact: a bucket carrying frozen
+    ///      endpoints must have had a real bond at some point. Buckets are never deleted
+    ///      (ADR-0003 § 5.4), so the live counter cannot answer that question.
+    mapping(uint32 => bool) public everRegisteredAt;
+
     /// @dev Adds a maturity to the active set once, when a bond finalizes into it.
     function _noteRegisteredMaturity(uint32 maturityBlock) internal {
+        // Permanent, and set before the early return so a second bond into the same bucket does
+        // not skip it.
+        everRegisteredAt[maturityBlock] = true;
+
         if (maturityActive[maturityBlock]) return;
 
         maturityActive[maturityBlock] = true;
@@ -223,7 +292,9 @@ contract BondCustodyHandler is Test {
                 continue;
             }
 
-            (,, bool checkpointed) = hook.maturity(key_.toId(), m);
+            (,,,, uint8 checkpointedMask) = hook.maturity(key_.toId(), m);
+
+            bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
 
             // THE DETECTION POINT. A due maturity without a checkpoint is a miss, and the record
             // of it survives this entry's removal.
@@ -252,6 +323,13 @@ contract BondCustodyHandler is Test {
         key_ = _key;
         currency0 = _currency0;
         currency1 = _currency1;
+
+        // Seed the independent reference where the hook seeded its accumulator: at the pool's
+        // current state, with a cumulative of zero.
+        // slither-disable-next-line unused-return
+        (, int24 tick,,) = _manager.getSlot0(_key.toId());
+
+        refPoints.push(RefPoint({blockNumber: uint32(block.number), cumulative: 0, tickFrom: tick}));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -435,7 +513,7 @@ contract BondCustodyHandler is Test {
     /// @dev Records the id of the bond just finalized, derived the same way the contract does.
     function _noteOpenBond(uint32 maturityBlock) internal {
         // The bond just registered took index `pendingBonds - 1`.
-        (, uint32 pending,) = hook.maturity(key_.toId(), maturityBlock);
+        (,,, uint32 pending,) = hook.maturity(key_.toId(), maturityBlock);
         if (pending == 0) return;
 
         bytes32 bondId = keccak256(abi.encode(key_.toId(), maturityBlock, pending - 1));
@@ -542,6 +620,10 @@ contract BondCustodyHandler is Test {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             HookDataCodec.encode(REFUND_RECIPIENT, ceiling)
         ) {
+            // The reference must be extended before anything reads it, and only on success -- a
+            // reverted swap leaves the pool untouched, so it contributes no interval.
+            _noteRef();
+
             _recordOutcome(legs, zeroForOne, isExactInput);
         } catch {
             // Failed swaps must not update either ghost accounting total.

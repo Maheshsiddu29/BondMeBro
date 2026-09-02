@@ -617,7 +617,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
 
         if (!ok) {
             // A reverted swap must leave the bucket exactly as it found it.
-            (, uint32 pendingAfterRevert,) = hook.maturity(id_, m);
+            (,,, uint32 pendingAfterRevert,) = hook.maturity(id_, m);
 
             assertEq(pendingAfterRevert, 0, string.concat(label, ": a reverted swap left a pending bond"));
         }
@@ -658,7 +658,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
 
         assertEq(finalized, expectedFinalized, string.concat(label, ": wrong number of finalized bonds"));
 
-        (, uint32 pending,) = hook.maturity(id_, m);
+        (,,, uint32 pending,) = hook.maturity(id_, m);
 
         assertEq(pending, expectedFinalized, string.concat(label, ": pendingBonds disagrees with the swept bucket"));
 
@@ -874,7 +874,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
             // Unbonded: below threshold, or moved no whole tick. Either way, no trace.
             assertFalse(hook.bondExists(bondId), "an unbonded swap left a record");
 
-            (, uint32 pending,) = hook.maturity(id_, _maturityOfNow());
+            (,,, uint32 pending,) = hook.maturity(id_, _maturityOfNow());
 
             assertEq(pending, 0, "an unbonded swap registered a maturity liability");
 
@@ -882,7 +882,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
         }
 
         // INV-L2-7: exactly one liability per finalized bond.
-        (, uint32 pendingAfter,) = hook.maturity(id_, _maturityOfNow());
+        (,,, uint32 pendingAfter,) = hook.maturity(id_, _maturityOfNow());
 
         assertEq(pendingAfter, 1, "INV-L2-7: a finalized bond did not register exactly one liability");
 

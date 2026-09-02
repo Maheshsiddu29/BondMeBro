@@ -340,18 +340,32 @@ contract SettlementTest is Test, Deployers {
         vm.roll(uint256(m) + 5);
         _swap(-1e13, true, ""); // freezes M and advances the cursor past it
 
-        (, uint32 pending, bool frozen) = hook.maturity(id_, m);
+        (,,, uint32 pending, uint8 frozenMask) = hook.maturity(id_, m);
+
+        bool frozen = frozenMask & hook.FROZEN_C10() != 0;
         assertTrue(frozen, "fixture precondition: M should have frozen");
 
-        // Corrupt only the checkpoint: keep pendingBonds, clear cumulative and the frozen flag.
+        // Corrupt only the checkpoint: keep pendingBonds, clear every endpoint and the whole mask.
         // `maturity` is at slot 3; the inner mapping key is the maturity block.
-        // Layout from `forge inspect BondMeBro storage-layout`: cumulative at byte 0,
-        // pendingBonds at byte 7, checkpointed at byte 11. Writing only pendingBonds back leaves
-        // cumulative zero and `checkpointed` false.
+        //
+        // OFFSETS UPDATED IN P-L2-5. The bucket carries three endpoints now, so the field this
+        // test has to preserve moved:
+        //
+        //     before: cumulative 0, pendingBonds 7, checkpointed 11
+        //     after:  C6 0, C8 7, C10 14, pendingBonds 21, frozenMask 25
+        //
+        // Writing `pending << 168` puts `pendingBonds` back at byte 21 and leaves all three
+        // cumulatives and the mask zero — the bucket still counts a live liability but has no
+        // frozen value for any endpoint, which is the state this test needs.
+        //
+        // The shift is derived from `test/StorageLayout.t.sol`, which fails first and by name if
+        // these offsets ever move again.
         bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(3)))));
-        vm.store(address(hook), slot, bytes32(uint256(pending) << 56));
+        vm.store(address(hook), slot, bytes32(uint256(pending) << 168));
 
-        (, uint32 pendingAfter, bool frozenAfter) = hook.maturity(id_, m);
+        (,,, uint32 pendingAfter, uint8 frozenAfterMask) = hook.maturity(id_, m);
+
+        bool frozenAfter = frozenAfterMask & hook.FROZEN_C10() != 0;
         assertEq(pendingAfter, pending, "fixture: pendingBonds must survive the corruption");
         assertFalse(frozenAfter, "fixture: checkpoint should now read unfrozen");
 
@@ -461,12 +475,16 @@ contract SettlementTest is Test, Deployers {
         // Nothing happens at all, well past maturity.
         vm.roll(uint256(m) + 3_000);
 
-        (,, bool frozenBefore) = hook.maturity(id_, m);
+        (,,,, uint8 frozenBeforeMask) = hook.maturity(id_, m);
+
+        bool frozenBefore = frozenBeforeMask & hook.FROZEN_C10() != 0;
         assertFalse(frozenBefore, "nothing should have frozen M");
 
         hook.settleBond(bondId);
 
-        (int56 frozen,, bool frozenAfter) = hook.maturity(id_, m);
+        (,, int56 frozen,, uint8 frozenAfterMask) = hook.maturity(id_, m);
+
+        bool frozenAfter = frozenAfterMask & hook.FROZEN_C10() != 0;
 
         assertTrue(frozenAfter, "settlement did not freeze M on the quiet path");
         assertEq(
@@ -541,7 +559,7 @@ contract SettlementTest is Test, Deployers {
             assertEq(uint8(hook.getBond(ids[i]).state), 3, "a batched bond is not SETTLED");
         }
 
-        (, uint32 pending,) = hook.maturity(id_, m);
+        (,,, uint32 pending,) = hook.maturity(id_, m);
         assertEq(pending, 0, "batch did not decrement pendingBonds to zero");
     }
 
@@ -592,7 +610,7 @@ contract SettlementTest is Test, Deployers {
 
         hook.settleMany(ids);
 
-        (, uint32 pending,) = hook.maturity(id_, m);
+        (,,, uint32 pending,) = hook.maturity(id_, m);
         assertEq(pending, 0, "cap-sized batch did not settle every bond");
     }
 
@@ -669,19 +687,22 @@ contract SettlementTest is Test, Deployers {
         vm.roll(uint256(m) + 1);
         _swap(-1e13, true, "");
 
-        (int56 frozenCumulative, uint32 pending, bool checkpointed) = hook.maturity(id_, m);
+        (,, int56 frozenCumulative, uint32 pending, uint8 checkpointedMask) = hook.maturity(id_, m);
+
+        bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
         assertEq(pending, 3, "three bonds should be pending");
         assertTrue(checkpointed);
 
         for (uint256 i = 0; i < 3; i++) {
             hook.settleBond(ids[i]);
 
-            (, uint32 remaining,) = hook.maturity(id_, m);
+            (,,, uint32 remaining,) = hook.maturity(id_, m);
             assertEq(remaining, 3 - (i + 1), "pendingBonds did not decrement exactly once");
         }
 
         // Zero pending, and the checkpoint is untouched.
-        (int56 stillFrozen, uint32 zero, bool stillCheckpointed) = hook.maturity(id_, m);
+        (,, int56 stillFrozen, uint32 zero, uint8 stillCheckpointedMask) = hook.maturity(id_, m);
+        bool stillCheckpointed = stillCheckpointedMask & hook.FROZEN_C10() != 0;
         assertEq(zero, 0);
         assertTrue(stillCheckpointed, "checkpoint was deleted at zero pending");
         assertEq(stillFrozen, frozenCumulative, "checkpoint changed at zero pending");
@@ -690,7 +711,9 @@ contract SettlementTest is Test, Deployers {
         vm.roll(block.number + 50);
         _swap(-5e15, true, _hookData());
 
-        (int56 afterMore,, bool stillThere) = hook.maturity(id_, m);
+        (,, int56 afterMore,, uint8 stillThereMask) = hook.maturity(id_, m);
+
+        bool stillThere = stillThereMask & hook.FROZEN_C10() != 0;
         assertTrue(stillThere, "checkpoint lost after later swaps");
         assertEq(afterMore, frozenCumulative, "checkpoint changed after later swaps");
     }
@@ -729,7 +752,9 @@ contract SettlementTest is Test, Deployers {
         vm.roll(uint256(maturityBlock) + 1);
         _swap(-1e13, true, "");
 
-        (,, bool checkpointed) = hook.maturity(id_, maturityBlock);
+        (,,,, uint8 checkpointedMask) = hook.maturity(id_, maturityBlock);
+
+        bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
         assertTrue(checkpointed, "the maturity checkpoint never froze");
 
         // 5. A completely unrelated address settles it.
@@ -779,7 +804,8 @@ contract SettlementTest is Test, Deployers {
         _swap(-1e13, true, "");
 
         // 4.
-        (,, bool checkpointed) = hook.maturity(id_, maturityBlock);
+        (,,,, uint8 checkpointedMask) = hook.maturity(id_, maturityBlock);
+        bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
         assertTrue(checkpointed, "the maturity checkpoint never froze");
 
         // 5.

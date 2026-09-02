@@ -49,6 +49,14 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     /// @dev First cumulative the invariant ever observed for a frozen bucket, used to prove
     ///      immutability across the campaign.
     mapping(uint32 => bool) internal seenCheckpoint;
+
+    /// @dev First-observed endpoint values and the union of every mask bit ever seen, per bucket.
+    ///      Used by `invariant_frozenEndpointsNeverChange` so a rewrite is caught even if a later
+    ///      advancement happens to restore the original value.
+    mapping(uint32 => int56) internal firstSeenC6;
+    mapping(uint32 => int56) internal firstSeenC8;
+    mapping(uint32 => int56) internal firstSeenC10;
+    mapping(uint32 => uint8) internal seenMask;
     mapping(uint32 => int56) internal firstSeenCumulative;
 
     uint128 internal constant MIN_BONDED = 1e15;
@@ -281,7 +289,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         for (uint256 i = 0; i < maturityCount; i++) {
             uint32 m = handler.touchedMaturityAt(i);
 
-            (, uint32 pending,) = hook.maturity(id_, m);
+            (,,, uint32 pending,) = hook.maturity(id_, m);
 
             // Indices [0, pending) hold finalized bonds; index `pending` is where the next
             // provisional record would sit. Checking one past the end is the point.
@@ -306,7 +314,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         for (uint256 i = 0; i < maturityCount; i++) {
             uint32 m = handler.touchedMaturityAt(i);
 
-            (, uint32 pending,) = hook.maturity(id_, m);
+            (,,, uint32 pending,) = hook.maturity(id_, m);
 
             assertEq(pending, handler.expectedFinalizedAt(m), "pendingBonds does not equal the finalized bond count");
         }
@@ -321,7 +329,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         for (uint256 i = 0; i < maturityCount; i++) {
             uint32 m = handler.touchedMaturityAt(i);
 
-            (, uint32 pending,) = hook.maturity(id_, m);
+            (,,, uint32 pending,) = hook.maturity(id_, m);
 
             for (uint32 index = 0; index < pending; index++) {
                 assertTrue(hook.bondExists(_bondId(m, index)), "a counted bond is not finalized");
@@ -375,7 +383,9 @@ contract BondCustodyInvariantsTest is Test, Deployers {
 
             if (m > lastUpdate) continue;
 
-            (, uint32 pending, bool checkpointed) = hook.maturity(id_, m);
+            (,,, uint32 pending, uint8 checkpointedMask) = hook.maturity(id_, m);
+
+            bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
 
             assertGt(pending, 0, "a registered maturity lost its bonds");
             assertTrue(checkpointed, "a due registered maturity was never checkpointed");
@@ -402,7 +412,9 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         for (uint256 i = 0; i < count; i++) {
             uint32 m = handler.activeMaturityAt(i);
 
-            (int56 cumulative,, bool checkpointed) = hook.maturity(id_, m);
+            (,, int56 cumulative,, uint8 checkpointedMask) = hook.maturity(id_, m);
+
+            bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
 
             if (!checkpointed) continue;
 
@@ -412,6 +424,176 @@ contract BondCustodyInvariantsTest is Test, Deployers {
                 seenCheckpoint[m] = true;
                 firstSeenCumulative[m] = cumulative;
             }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              INV-L2-8 — THREE ENDPOINTS, EXACT (ADR-0007)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice NO-MISSED-C6 / C8 / C10, each checked independently, each against the reference.
+    ///
+    /// @dev THE INVARIANT P-L2-5 ACTIVATES. ADR-0003's single NO-MISSED-MATURITY becomes three,
+    ///      because the three endpoints freeze at three different blocks:
+    ///
+    ///          open+6  <= lastUpdate  =>  bit 0 set, and the value is exact
+    ///          open+8  <= lastUpdate  =>  bit 1 set, and the value is exact
+    ///          M       <= lastUpdate  =>  bit 2 set, and the value is exact
+    ///
+    ///      Each condition is separate on purpose. A bucket at `lastUpdate == open+7` is legally
+    ///      half-frozen, and a check that demanded all-or-nothing would either reject a correct
+    ///      state or accept a stranded endpoint.
+    ///
+    ///      EXACTNESS IS CHECKED AGAINST `handler.refCumulativeAt`, which integrates the POOL's
+    ///      tick block by block and never touches the hook's accumulator. Comparing the hook to its
+    ///      own accumulator would be circular — ADR-0007 § 6 names this specifically.
+    ///
+    ///      A stranded endpoint is not cosmetic: once `lastUpdate` passes it the value is
+    ///      unrecoverable, `cumulativeAt` reverts rather than guessing, and every bond in that
+    ///      cohort becomes unsettleable.
+    function invariant_inv_L2_8_everyDueEndpointIsFrozenAndExact() public view {
+        (, uint32 lastUpdate,) = hook.accumulator(id_);
+
+        uint32 obs = hook.OBSERVATION_BLOCKS();
+
+        uint256 count = handler.activeMaturityCount();
+
+        for (uint256 i = 0; i < count; i++) {
+            uint32 m = handler.activeMaturityAt(i);
+
+            (int56 c6, int56 c8, int56 c10, uint32 pending, uint8 mask) = hook.maturity(id_, m);
+
+            if (pending == 0) continue;
+
+            uint32 open = m - obs;
+
+            if (open + 6 <= lastUpdate) {
+                assertTrue(mask & hook.FROZEN_C6() != 0, "NO-MISSED-C6: a due C6 was never frozen");
+
+                if (handler.refCovers(open + 6)) {
+                    assertEq(c6, handler.refCumulativeAt(open + 6), "C6 does not match the independent reference");
+                }
+            }
+
+            if (open + 8 <= lastUpdate) {
+                assertTrue(mask & hook.FROZEN_C8() != 0, "NO-MISSED-C8: a due C8 was never frozen");
+
+                if (handler.refCovers(open + 8)) {
+                    assertEq(c8, handler.refCumulativeAt(open + 8), "C8 does not match the independent reference");
+                }
+            }
+
+            if (m <= lastUpdate) {
+                assertTrue(mask & hook.FROZEN_C10() != 0, "NO-MISSED-C10: a due C10 was never frozen");
+
+                if (handler.refCovers(m)) {
+                    assertEq(c10, handler.refCumulativeAt(m), "C10 does not match the independent reference");
+                }
+            }
+        }
+    }
+
+    /// @notice No frozen endpoint value ever changes, and no set mask bit is ever cleared.
+    ///
+    /// @dev IMMUTABLE, extended from one endpoint to three. Each value is compared against the
+    ///      FIRST value this invariant ever observed for it, so a rewrite anywhere in the campaign
+    ///      is caught even if a later advancement restores the original.
+    ///
+    ///      Immutability is what makes settlement independent of when it is called, which is
+    ///      ADR-0003's governing invariant and the reason the whole checkpoint mechanism exists.
+    function invariant_frozenEndpointsNeverChange() public {
+        uint256 count = handler.activeMaturityCount();
+
+        for (uint256 i = 0; i < count; i++) {
+            uint32 m = handler.activeMaturityAt(i);
+
+            (int56 c6, int56 c8, int56 c10,, uint8 mask) = hook.maturity(id_, m);
+
+            // A set bit is never cleared.
+            assertEq(mask & seenMask[m], seenMask[m], "IMMUTABLE: a frozen endpoint bit was cleared");
+
+            if (mask & hook.FROZEN_C6() != 0) {
+                if (seenMask[m] & hook.FROZEN_C6() != 0) {
+                    assertEq(c6, firstSeenC6[m], "IMMUTABLE: a frozen C6 changed");
+                } else {
+                    firstSeenC6[m] = c6;
+                }
+            }
+
+            if (mask & hook.FROZEN_C8() != 0) {
+                if (seenMask[m] & hook.FROZEN_C8() != 0) {
+                    assertEq(c8, firstSeenC8[m], "IMMUTABLE: a frozen C8 changed");
+                } else {
+                    firstSeenC8[m] = c8;
+                }
+            }
+
+            if (mask & hook.FROZEN_C10() != 0) {
+                if (seenMask[m] & hook.FROZEN_C10() != 0) {
+                    assertEq(c10, firstSeenC10[m], "IMMUTABLE: a frozen C10 changed");
+                } else {
+                    firstSeenC10[m] = c10;
+                }
+            }
+
+            seenMask[m] = mask | seenMask[m];
+        }
+    }
+
+    /// @notice BOUNDED — no occupied, partly unfrozen bucket sits outside the scan horizon.
+    ///
+    /// @dev This is what keeps the loop bound honest. The scheduler scans only
+    ///      `(lastUpdate, lastUpdate + OBSERVATION_BLOCKS]`. If an occupied bucket could sit above
+    ///      that and still be waiting for endpoints, the loop would have to grow to reach it — and
+    ///      until it did, those endpoints would be silently stranded.
+    ///
+    ///      Note the direction of the claim: buckets BELOW the cursor are fine to be unfrozen only
+    ///      if their endpoints are not yet due, which
+    ///      `invariant_inv_L2_8_everyDueEndpointIsFrozenAndExact` covers. This one is about the
+    ///      upper edge.
+    function invariant_noOccupiedUnfrozenBucketAboveTheHorizon() public view {
+        (, uint32 lastUpdate,) = hook.accumulator(id_);
+
+        uint32 horizon = lastUpdate + hook.OBSERVATION_BLOCKS();
+
+        uint256 count = handler.activeMaturityCount();
+
+        for (uint256 i = 0; i < count; i++) {
+            uint32 m = handler.activeMaturityAt(i);
+
+            (,,, uint32 pending, uint8 mask) = hook.maturity(id_, m);
+
+            if (pending == 0) continue;
+
+            if (mask == hook.FROZEN_ALL()) continue;
+
+            assertLe(m, horizon, "BOUNDED: an occupied, unfrozen bucket sits above the scan horizon");
+        }
+    }
+
+    /// @notice NO-PHANTOM — a bucket carries checkpoint data only where a bond was registered.
+    ///
+    /// @dev The guarantee that makes the scheduler's FORWARD writes safe. It writes into buckets
+    ///      ahead of the cursor, so without the `pendingBonds == 0` early return a scan could
+    ///      conjure a cohort for a bond that never existed.
+    ///
+    ///      Stated as: a frozen mask implies the bucket was registered at some point. Because
+    ///      buckets are never deleted (ADR-0003 § 5.4), "registered at some point" is the handler's
+    ///      ghost record rather than the live `pendingBonds`, which drops back to zero as bonds
+    ///      settle.
+    function invariant_noPhantomBucket() public view {
+        uint256 count = handler.touchedMaturityCount();
+
+        for (uint256 i = 0; i < count; i++) {
+            uint32 m = handler.touchedMaturityAt(i);
+
+            (,,,, uint8 mask) = hook.maturity(id_, m);
+
+            if (mask == 0) continue;
+
+            assertTrue(
+                handler.everRegisteredAt(m), "NO-PHANTOM: a bucket froze endpoints without a bond ever registering"
+            );
         }
     }
 
@@ -509,6 +691,64 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     /// @notice A reverted swap must not change the hook's custody accounting.
 
     /// @dev The handler's `tightCeiling` mode sets `maxBondAmount` one wei below the required bond, forcing the hook to revert. The hook balance and ghost accounting must remain unchanged.
+    /// @notice The checkpoint invariants are reachable: the handler really does drive buckets to
+    ///         due endpoints, and the reference really does get compared.
+    ///
+    /// @dev NON-VACUITY, and it is not a formality here.
+    ///
+    ///      `invariant_inv_L2_8_everyDueEndpointIsFrozenAndExact` is written as a set of
+    ///      conditionals — "if this endpoint is due, it must be frozen and exact". Every one of
+    ///      those conditions is false on a campaign that never registers a bond or never advances
+    ///      far enough, and the invariant would then pass by doing nothing at all. P-L2-3/4 already
+    ///      caught one harness bug of exactly this shape.
+    ///
+    ///      So this drives the handler by hand into the state the invariant is meant to police —
+    ///      a registered bucket with all three endpoints behind the cursor — and asserts the
+    ///      endpoints are both frozen and equal to the INDEPENDENT reference. If the campaign could
+    ///      not reach that state, this fails while the invariant would have stayed green.
+    function test_checkpointInvariantsAreReachable() public {
+        // Odd seed puts the amount at or above the threshold, so this bonds.
+        handler.swapExactInput(3, true, false);
+
+        uint32 obs = hook.OBSERVATION_BLOCKS();
+
+        // Find the bucket the handler just registered.
+        uint256 count = handler.activeMaturityCount();
+
+        assertGt(count, 0, "the handler registered no maturity at all");
+
+        uint32 m = handler.activeMaturityAt(count - 1);
+
+        (,,, uint32 pending,) = hook.maturity(id_, m);
+
+        assertEq(pending, 1, "the handler did not register exactly one bond");
+
+        // Advance past every endpoint and flush.
+        handler.advanceBlocks(11);
+        handler.swapExactInput(2, true, false);
+
+        (, uint32 lastUpdate,) = hook.accumulator(id_);
+
+        uint32 open = m - obs;
+
+        assertGe(lastUpdate, m, "the campaign cannot reach a fully due bucket");
+
+        (int56 c6, int56 c8, int56 c10,, uint8 mask) = hook.maturity(id_, m);
+
+        assertEq(mask, hook.FROZEN_ALL(), "a fully due bucket was not fully frozen");
+
+        // And the reference comparison the invariant performs is actually meaningful here.
+        assertTrue(handler.refCovers(open + 6), "the reference cannot answer for C6");
+
+        assertEq(c6, handler.refCumulativeAt(open + 6), "C6 disagrees with the independent reference");
+        assertEq(c8, handler.refCumulativeAt(open + 8), "C8 disagrees with the independent reference");
+        assertEq(c10, handler.refCumulativeAt(m), "C10 disagrees with the independent reference");
+
+        // The three values must be genuinely distinct, or a scheduler writing one value into all
+        // three fields would satisfy every assertion above.
+        assertTrue(c6 != c8 && c8 != c10, "the three endpoints are identical; this proves nothing");
+    }
+
     function test_rejectedSwapLeavesAccountingUntouched() public {
         // First create a successful bond so we have a non-zero baseline.
         handler.swapExactInput(3, true, false);

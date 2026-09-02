@@ -259,7 +259,8 @@ contract VariableLegGasTest is Test, Deployers {
         uint256 frozen;
 
         for (uint32 i = 0; i < hook.OBSERVATION_BLOCKS(); i++) {
-            (, uint32 pending, bool checkpointed) = hook.maturity(id_, firstMaturity + i);
+            (,,, uint32 pending, uint8 checkpointedMask) = hook.maturity(id_, firstMaturity + i);
+            bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
 
             if (pending > 0) occupied++;
             if (checkpointed) frozen++;
@@ -338,7 +339,7 @@ contract VariableLegGasTest is Test, Deployers {
             _swap(-int256(BONDED_SIZE), true, _hookData());
         }
 
-        (, uint32 pending,) = hook.maturity(id_, uint32(block.number) + hook.OBSERVATION_BLOCKS());
+        (,,, uint32 pending,) = hook.maturity(id_, uint32(block.number) + hook.OBSERVATION_BLOCKS());
 
         assertEq(pending, n, "the fixture did not accumulate the expected number of pending bonds");
 

@@ -140,6 +140,29 @@ contract BondMeBro is BaseHook {
     ///      `_maturityOf` is the single place this is applied.
     uint32 public constant OBSERVATION_BLOCKS = 10;
 
+    /*              OBSERVATION CHECKPOINTS (ADR-0007)               /*/
+
+    /// @notice `frozenMask` bit for C6, the endpoint at `M - 4`.
+    uint8 public constant FROZEN_C6 = 1;
+
+    /// @notice `frozenMask` bit for C8, the endpoint at `M - 2`.
+    uint8 public constant FROZEN_C8 = 2;
+
+    /// @notice `frozenMask` bit for C10, the endpoint at `M`. The previous sole checkpoint.
+    uint8 public constant FROZEN_C10 = 4;
+
+    /// @notice All three endpoints frozen. Used as an early-out, never as a lifecycle state.
+    uint8 public constant FROZEN_ALL = 7;
+
+    /// @notice Blocks between a bucket's earliest endpoint (C6) and its maturity block.
+    /// @dev `M - C6 = 4`. Named because it appears in the scheduler's `dueEnd` and in every
+    ///      endpoint derivation, and an off-by-one here silently shifts the whole observation
+    ///      window.
+    uint32 public constant C6_OFFSET_FROM_MATURITY = 4;
+
+    /// @notice Blocks between C8 and the maturity block. `M - C8 = 2`.
+    uint32 public constant C8_OFFSET_FROM_MATURITY = 2;
+
     /*              MODEL L2 COLLATERAL SIZING (ADR-0005)            /*/
 
     /// @notice Collateral rate, in bps of the variable leg per tick of REALIZED impact, carried as
@@ -260,17 +283,47 @@ contract BondMeBro is BaseHook {
         BondState state;
     }
 
-    /// @notice One maturity bucket, shared by every bond maturing in the same block. One slot.
+    /// @notice One maturity bucket, shared by every bond maturing in the same block, carrying all
+    ///         THREE observation endpoints. Still exactly one slot.
     ///
-    /// @dev THREE LIFECYCLE STATES, NOT ONE FLAG (ADR-0003 § 4). `registered` is
-    ///      `pendingBonds > 0`; `checkpointed` is this struct's boolean; `settled` is per-bond and
-    ///      belongs to T5B. They are independent: a bond can be unsettled long after its checkpoint
-    ///      froze, and a bond can be mature with its checkpoint still unfrozen after a quiet gap.
+    /// @dev ADR-0007. Model L2's residual is `max(TWA(6,8), TWA(8,10))`, which needs the pool's
+    ///      tick cumulative at three blocks per bond rather than one:
     ///
-    /// @param cumulative Accumulator value exactly at this maturity block. Immutable once frozen.
+    ///          C6  = cumulative at open+6  = M - 4     (frozenMask bit 0)
+    ///          C8  = cumulative at open+8  = M - 2     (bit 1)
+    ///          C10 = cumulative at open+10 = M         (bit 2)  <- the previous sole endpoint
+    ///
+    ///      WHY ONE BUCKET SUFFICES, and it is not a packing trick. Maturity is
+    ///      `openBlock + OBSERVATION_BLOCKS`, an injective map, so every bond in bucket `M` opened
+    ///      at exactly `M - 10`. One bucket therefore describes one opening block, and its three
+    ///      endpoints are shared by every bond in it. A thousand bonds opened in the same block
+    ///      still need one bucket and one freeze per endpoint.
+    ///
+    ///      WHY A MASK RATHER THAN A BOOLEAN. The three endpoints become frozen at three different
+    ///      blocks, so a single flag could not express the state at, say, `lastUpdate == open+7` --
+    ///      where C6 is already frozen while C8 and C10 are still exactly derivable. ADR-0003
+    ///      section 4's "three lifecycle states, not one flag" argument is unchanged; it simply has
+    ///      three of the middle state now.
+    ///
+    ///      PACKING IS LOAD-BEARING: 56*3 + 32 + 8 = 208 bits, one slot, at offsets
+    ///      0 / 7 / 14 / 21 / 25. `test/StorageLayout.t.sol` proves this from the compiler's own
+    ///      layout AND by decoding a raw `vm.load` word field by field. A spill to a second slot
+    ///      would put a cold SSTORE on the swap path and is a hard failure, not a regression.
+    ///
+    ///      That the slot is already non-zero when an endpoint freezes is the whole cost argument
+    ///      (ADR-0007 section 4): `pendingBonds` made it non-zero at bond registration, so every
+    ///      freeze is an `SSTORE_RESET` on an already-loaded slot rather than an `SSTORE_SET`.
+    ///      Giving interior endpoints their own buckets would have allowed a fresh-slot write and
+    ///      projected ~217,000 gas against a 150,000 ceiling, reachable with four cheap swaps.
+    ///
+    /// @param cumulativeMinus4 C6 -- accumulator value exactly at `M - 4`. Immutable once frozen.
+    /// @param cumulativeMinus2 C8 -- accumulator value exactly at `M - 2`. Immutable once frozen.
+    /// @param cumulativeAtM C10 -- accumulator value exactly at `M`. Immutable once frozen.
     /// @param pendingBonds Registered-but-unsettled bonds depending on this bucket. A liability
-    ///        count only — it must NEVER decide whether the bucket needs checkpointing.
-    /// @param checkpointed Whether `cumulative` has been permanently written.
+    ///        count only — it must NEVER decide whether the bucket needs checkpointing. It is also
+    ///        the SOLE occupancy signal (ADR-0004 Rule 3).
+    /// @param frozenMask Which endpoints have been permanently written. Three independent bits;
+    ///        a set bit is never cleared.
     /// @notice Lifecycle marker stored inside a `Bond`.
     ///
     /// @dev ADR-0004 Rule 1. `NONE == 0` matters: an untouched or cleared mapping entry reads as
@@ -296,9 +349,11 @@ contract BondMeBro is BaseHook {
     }
 
     struct MaturityCheckpoint {
-        int56 cumulative;
+        int56 cumulativeMinus4;
+        int56 cumulativeMinus2;
+        int56 cumulativeAtM;
         uint32 pendingBonds;
-        bool checkpointed;
+        uint8 frozenMask;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1212,31 +1267,51 @@ contract BondMeBro is BaseHook {
         // Freeze before advancing. Skipped entirely when no block has elapsed, which is the
         // common case of a second swap in the same block.
         if (nowBlock > lastUpdate) {
-            // The clamp. `scanEnd` never exceeds `lastUpdate + W`, so the loop below runs at most
-            // W times however long the pool was quiet.
-            uint32 horizon = lastUpdate + MAX_OBSERVATION_BLOCKS;
-            uint32 scanEnd = nowBlock < horizon ? nowBlock : horizon;
+            // THE SCAN IS BUCKET-CENTRIC, AND THAT IS A MEASURED DECISION (ADR-0007 section 3.2).
+            //
+            // The obvious shape is block-centric: walk blocks, and for each block ask "does a bond
+            // mature here, or two blocks from here, or four". That needs THREE mapping lookups per
+            // block. It was built and measured: +22,548 gas on a scan with nothing registered at
+            // all, and 158,313 in the worst case -- over the 150,000 ceiling. The lookups, not the
+            // writes, dominated.
+            //
+            // This loop inverts it: walk candidate maturity BUCKETS, and for each one ask which of
+            // its own three endpoints have been reached. One lookup per candidate, and up to three
+            // fields written into the single warm slot it has already loaded.
+            //
+            // Do not reintroduce the block-centric form. It is recorded as a measured failure.
+            //
+            // TWO DIFFERENT BOUNDS MEET HERE, and conflating them is how the loop gets too big or
+            // too small:
+            //
+            //   occupancyEnd -- no bucket ABOVE this can be occupied. A bucket at `m` needs a bond
+            //       opened at `m - OBSERVATION_BLOCKS`, and opening a bond is a swap, which sets
+            //       `lastUpdate` to its own block. So `m <= lastUpdate + OBSERVATION_BLOCKS` for
+            //       every bucket that exists.
+            //
+            //   dueEnd -- no bucket ABOVE this has any work yet. A bucket's earliest endpoint is
+            //       `m - 4`, so it acquires its first due endpoint only once `nowBlock >= m - 4`.
+            //
+            // `OBSERVATION_BLOCKS` (10), not `MAX_OBSERVATION_BLOCKS` (16), is the right bound for
+            // occupancy. The two constants are not the same concept and must not be swapped:
+            // `MAX_OBSERVATION_BLOCKS` is the accumulator's supported domain and the hard maximum
+            // `OBSERVATION_BLOCKS` may ever be raised to; `OBSERVATION_BLOCKS` is how far ahead an
+            // occupied maturity bucket can actually sit. Scanning to the former would pay for six
+            // positions that provably cannot be occupied -- ADR-0007 measured that at 14,794 gas
+            // of wasted work per full-horizon scan, at 2,466 gas per scanned position.
+            uint32 occupancyEnd = lastUpdate + OBSERVATION_BLOCKS;
+            uint32 dueEnd = nowBlock + C6_OFFSET_FROM_MATURITY;
 
-            // Read once into memory: the loop must not re-read storage per candidate block.
+            uint32 bucketEnd = dueEnd < occupancyEnd ? dueEnd : occupancyEnd;
+
+            // Read once into memory: the loop must not re-read accumulator storage per candidate.
+            // Every endpoint is derived from this PRE-ADVANCE snapshot, which is valid because the
+            // tick cannot have changed inside `(lastUpdate, nowBlock)` -- a change needs a swap,
+            // and a swap would have moved `lastUpdate`.
             TickAccumulatorLib.Accumulator memory snapshot = acc;
 
-            for (uint32 m = lastUpdate + 1; m <= scanEnd; m++) {
-                MaturityCheckpoint storage bucket = maturity[id][m];
-
-                // Unoccupied, or already frozen by an earlier advancement. Either way, nothing to
-                // do. `checkpointed` is the sole authority on whether the checkpoint exists, and a
-                // frozen one is never rewritten.
-                if (bucket.pendingBonds == 0 || bucket.checkpointed) continue;
-
-                // The cumulative exactly at `m`, from PRE-ADVANCE state. Valid because the tick
-                // cannot have changed inside `(lastUpdate, nowBlock)` — a change needs a swap, and
-                // a swap would have moved `lastUpdate`.
-                int56 cumulative = snapshot.cumulativeAt(m);
-
-                bucket.cumulative = cumulative;
-                bucket.checkpointed = true;
-
-                emit MaturityCheckpointed(id, m, cumulative);
+            for (uint32 m = lastUpdate + 1; m <= bucketEnd; m++) {
+                _freezeDueEndpoints(id, m, snapshot, lastUpdate, nowBlock);
             }
         }
 
@@ -1452,7 +1527,14 @@ contract BondMeBro is BaseHook {
 
         // The cumulative exactly at M — frozen earlier by a crossing swap, or derived now if the
         // pool has been quiet since before M.
-        int56 cumulativeAtMaturity = _cumulativeAtMaturity(bondId, id, maturityBlock);
+        //
+        // C10 ONLY, ON PURPOSE. The bucket now also carries C6 and C8, but P-L2-5 migrates
+        // checkpoint STATE and leaves settlement ECONOMICS alone: the curve below is still the
+        // legacy persistence one, which takes a single maturity reading. Resolving all three here
+        // would pay for two endpoints nothing reads and would let a defect in an unused endpoint
+        // block a settlement that does not depend on it. `resolveEndpoints` is where P-L2-6 picks
+        // up all three.
+        int56 cumulativeAtMaturity = _resolveEndpoint(bondId, id, maturityBlock, maturityBlock, FROZEN_C10);
 
         // The settlement reference the frozen library expects is a TICK, not a cumulative: the
         // time-weighted average tick across the bond's own window, [openBlock, maturityBlock].
@@ -1510,43 +1592,188 @@ contract BondMeBro is BaseHook {
         }
     }
 
-    /// @notice Returns the cumulative exactly at a bond's maturity, freezing it if still possible.
+    /// @notice Freezes whichever of one bucket's three endpoints have just become due.
     ///
-    /// @dev Three cases, in the order ADR-0003 § 5.3 requires.
+    /// @dev THE THREE GUARANTEES (ADR-0007 section 3.3), each of which is a test in
+    ///      `test/MaturityCheckpoints.t.sol`:
     ///
-    ///      ALREADY FROZEN — the normal path. A swap crossed M and captured it. Return it.
+    ///      1. IT NEVER CREATES A BUCKET. `pendingBonds == 0` returns before any write. This is
+    ///         not a mere optimisation: the loop writes into buckets AHEAD of the accumulator
+    ///         cursor, so without this guard a scan could conjure a maturity cohort for a bond
+    ///         that never existed, and `pendingBonds` is the sole occupancy signal (ADR-0004
+    ///         Rule 3) that everything else keys off.
     ///
-    ///      NOT FROZEN, CURSOR STILL AT OR BEFORE M — the quiet-pool path. Nothing has swapped
-    ///      since before M, so the tick has not changed and the value at M is still exactly
-    ///      derivable from unchanged state. Derive it, freeze it, and use it. The result is
-    ///      identical to what a crossing swap would have frozen, which is what lets a quiet pool
-    ///      settle with no keeper and no transaction at M.
+    ///      2. IT NEVER REWRITES AND NEVER REACHES BACK. A set mask bit is final. An endpoint at
+    ///         or below `lastUpdate` is SKIPPED rather than recomputed -- below `lastUpdate` the
+    ///         accumulator cannot answer and `cumulativeAt` would revert rather than guess.
     ///
-    ///      NOT FROZEN, CURSOR PAST M — revert. The tick has moved since M and the exact value is
-    ///      unrecoverable. Approximating from live state would make the outcome depend on when
-    ///      settlement was called. This is an upstream invariant violation, not a case to paper
+    ///      3. ONE EVENT PER BUCKET, emitted when the MATURITY endpoint freezes. The two interior
+    ///         freezes are deliberately silent: three events per bucket measured as the single
+    ///         largest avoidable cost in the scheduler.
+    ///
+    ///      WHY FORWARD WRITES ARE SAFE. Writing bucket `m` while the cursor sits at `lastUpdate`
+    ///      can reach up to four blocks past `nowBlock`. That bucket needs a bond opened at
+    ///      `m - OBSERVATION_BLOCKS`, which is strictly in the past. A bond cannot be registered
+    ///      for a maturity whose C6 has already been scanned, because registration happens in the
+    ///      bond's own opening block and that block is six blocks before its own C6. Combined with
+    ///      guarantee (1), a forward write can only ever land on a cohort that already exists, and
+    ///      a bond opening later cannot inherit anything.
+    ///
+    ///      THE MASK IS WRITTEN ONCE, after all three checks, so a bucket that freezes two
+    ///      endpoints in one advancement pays one mask write rather than two.
+    ///
+    /// @param id Pool the bucket belongs to.
+    /// @param m Candidate maturity block, i.e. the bucket's key.
+    /// @param snapshot PRE-ADVANCE accumulator state; the only valid source for these values.
+    /// @param lastUpdate Cursor before this advancement. Endpoints at or below it are not ours.
+    /// @param nowBlock Current block. Endpoints above it are not due yet.
+    function _freezeDueEndpoints(
+        PoolId id,
+        uint32 m,
+        TickAccumulatorLib.Accumulator memory snapshot,
+        uint32 lastUpdate,
+        uint32 nowBlock
+    ) private {
+        MaturityCheckpoint storage bucket = maturity[id][m];
+
+        // GUARANTEE 1 -- occupancy first, before anything can be written.
+        if (bucket.pendingBonds == 0) return;
+
+        uint8 mask = bucket.frozenMask;
+
+        // Nothing left to do. Checked before the endpoint arithmetic so a fully frozen bucket
+        // crossed repeatedly costs one SLOAD and no more.
+        if (mask == FROZEN_ALL) return;
+
+        // `pendingBonds > 0` means a bond was registered for this bucket, so
+        // `m == openBlock + OBSERVATION_BLOCKS >= OBSERVATION_BLOCKS`, and the subtractions below
+        // cannot underflow. The guard is kept anyway: an underflow here would revert inside a swap
+        // callback and brick the pool, which is far worse than the comparison it costs.
+        if (m < C6_OFFSET_FROM_MATURITY) return;
+
+        uint8 startingMask = mask;
+
+        // C6 at M - 4.
+        uint32 c6Block = m - C6_OFFSET_FROM_MATURITY;
+
+        if (mask & FROZEN_C6 == 0 && c6Block > lastUpdate && c6Block <= nowBlock) {
+            bucket.cumulativeMinus4 = snapshot.cumulativeAt(c6Block);
+            mask |= FROZEN_C6;
+        }
+
+        // C8 at M - 2.
+        uint32 c8Block = m - C8_OFFSET_FROM_MATURITY;
+
+        if (mask & FROZEN_C8 == 0 && c8Block > lastUpdate && c8Block <= nowBlock) {
+            bucket.cumulativeMinus2 = snapshot.cumulativeAt(c8Block);
+            mask |= FROZEN_C8;
+        }
+
+        // C10 at M.
+        if (mask & FROZEN_C10 == 0 && m > lastUpdate && m <= nowBlock) {
+            int56 cumulative = snapshot.cumulativeAt(m);
+
+            bucket.cumulativeAtM = cumulative;
+            mask |= FROZEN_C10;
+
+            // GUARANTEE 3 -- the one event, with production's existing name and signature.
+            emit MaturityCheckpointed(id, m, cumulative);
+        }
+
+        // One mask write, and only if something actually changed.
+        if (mask != startingMask) {
+            bucket.frozenMask = mask;
+        }
+    }
+
+    /// @notice Resolves ONE endpoint of a maturity bucket, freezing it if that is still possible.
+    ///
+    /// @dev ADR-0003 section 5.3's three cases, now applied PER ENDPOINT rather than once per bond
+    ///      (ADR-0007 section 3.5). The interesting case the single-boolean design could not
+    ///      express: at `lastUpdate == open+7`, C6 must already be frozen while C8 and C10 are
+    ///      still exactly derivable. A per-bond flag would have had to choose one answer.
+    ///
+    ///      ALREADY FROZEN — the normal path. A swap crossed this endpoint and captured it.
+    ///
+    ///      NOT FROZEN, CURSOR STILL AT OR BEFORE IT — the quiet-pool path. Nothing has swapped
+    ///      since before the endpoint, so the tick has not changed and the value is still exactly
+    ///      derivable from unchanged state. Derive it, freeze it, use it. The result is identical
+    ///      to what a crossing swap would have frozen, which is what lets a quiet pool settle with
+    ///      no keeper and no transaction at the endpoint.
+    ///
+    ///      NOT FROZEN, CURSOR PAST IT — revert. The tick has moved since and the exact value is
+    ///      unrecoverable. Approximating from live state would make the outcome depend on WHEN
+    ///      settlement was called, which is precisely what ADR-0003's governing invariant forbids:
+    ///      settlement is permissionless, so whoever picked the block would be picking the answer.
+    ///      This is an upstream invariant violation (a missed NO-MISSED-Cx), not a case to paper
     ///      over.
-    function _cumulativeAtMaturity(bytes32 bondId, PoolId id, uint32 maturityBlock) private returns (int56 cumulative) {
+    ///
+    ///      A QUIET DERIVATION EMITS ONLY FOR C10, matching the scheduler's event policy so the
+    ///      per-bucket event count is one whichever path froze it.
+    ///
+    /// @param bondId Bond being settled, for the revert's diagnostics.
+    /// @param id Pool the bucket belongs to.
+    /// @param maturityBlock The bucket key, `M`.
+    /// @param endpointBlock The block whose cumulative is wanted: `M-4`, `M-2` or `M`.
+    /// @param bit The `frozenMask` bit that governs this endpoint.
+    function _resolveEndpoint(bytes32 bondId, PoolId id, uint32 maturityBlock, uint32 endpointBlock, uint8 bit)
+        private
+        returns (int56 cumulative)
+    {
         MaturityCheckpoint storage bucket = maturity[id][maturityBlock];
 
-        if (bucket.checkpointed) {
-            return bucket.cumulative;
+        uint8 mask = bucket.frozenMask;
+
+        if (mask & bit != 0) {
+            if (bit == FROZEN_C6) return bucket.cumulativeMinus4;
+            if (bit == FROZEN_C8) return bucket.cumulativeMinus2;
+
+            return bucket.cumulativeAtM;
         }
 
         TickAccumulatorLib.Accumulator memory acc = accumulator[id];
 
-        if (acc.lastUpdate > maturityBlock) {
-            revert MaturityCheckpointMissing(bondId, maturityBlock, acc.lastUpdate);
+        if (acc.lastUpdate > endpointBlock) {
+            revert MaturityCheckpointMissing(bondId, endpointBlock, acc.lastUpdate);
         }
 
-        // Quiet path. `cumulativeAt` enforces its own domain, so a block outside
-        // [lastUpdate, block.number] cannot be reconstructed even by accident.
-        cumulative = acc.cumulativeAt(maturityBlock);
+        // `cumulativeAt` enforces its own domain, so a block outside `[lastUpdate, block.number]`
+        // cannot be reconstructed even by accident.
+        cumulative = acc.cumulativeAt(endpointBlock);
 
-        bucket.cumulative = cumulative;
-        bucket.checkpointed = true;
+        if (bit == FROZEN_C6) {
+            bucket.cumulativeMinus4 = cumulative;
+        } else if (bit == FROZEN_C8) {
+            bucket.cumulativeMinus2 = cumulative;
+        } else {
+            bucket.cumulativeAtM = cumulative;
 
-        emit MaturityCheckpointed(id, maturityBlock, cumulative);
+            emit MaturityCheckpointed(id, maturityBlock, cumulative);
+        }
+
+        bucket.frozenMask = mask | bit;
+    }
+
+    /// @notice Resolves all three endpoints of a bucket, in the order that names the earliest loss.
+    ///
+    /// @dev NOT ON THE P-L2-5 SETTLEMENT PATH, and that is deliberate staging. Settlement still
+    ///      runs the previous persistence curve, which needs C10 alone, so `settleBond` resolves
+    ///      only C10 and pays for only what it uses. C6 and C8 are frozen and stored from this
+    ///      stage onward so that P-L2-6 has them, but nothing consumes them economically yet.
+    ///
+    ///      Resolution order is C6, then C8, then C10, so a revert names the EARLIEST unrecoverable
+    ///      endpoint — the one whose value is actually lost. Reporting a later one would send an
+    ///      operator looking in the wrong place.
+    ///
+    ///      Exposed for tests and for P-L2-6. It is `public` rather than `external` only so the
+    ///      settlement path could adopt it without an external call when the economics land.
+    function resolveEndpoints(bytes32 bondId, PoolId id, uint32 maturityBlock)
+        public
+        returns (int56 c6, int56 c8, int56 c10)
+    {
+        c6 = _resolveEndpoint(bondId, id, maturityBlock, maturityBlock - C6_OFFSET_FROM_MATURITY, FROZEN_C6);
+        c8 = _resolveEndpoint(bondId, id, maturityBlock, maturityBlock - C8_OFFSET_FROM_MATURITY, FROZEN_C8);
+        c10 = _resolveEndpoint(bondId, id, maturityBlock, maturityBlock, FROZEN_C10);
     }
 
     /*//////////////////////////////////////////////////////////////

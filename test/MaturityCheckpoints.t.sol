@@ -102,8 +102,30 @@ contract MaturityCheckpointsTest is Test, Deployers {
         return hook.accumulator(id_);
     }
 
+    /// @dev The C10 view of a bucket, in the shape this suite used before ADR-0007 landed.
+    ///
+    ///      P-L2-5 widened `MaturityCheckpoint` from one endpoint to three, so the generated getter
+    ///      now returns five components. This wrapper keeps the OLD three-component shape --
+    ///      `cumulative` is C10, `checkpointed` is the C10 mask bit -- so every existing assertion
+    ///      in this file goes on asking exactly the question it asked before, against exactly the
+    ///      endpoint it was written for. The new endpoints get their own accessor below rather
+    ///      than being smuggled into these tests.
     function _bucket(uint32 m) internal view returns (int56 cumulative, uint32 pending, bool checkpointed) {
-        return hook.maturity(id_, m);
+        (,, int56 c10, uint32 pendingBonds, uint8 mask) = hook.maturity(id_, m);
+
+        return (c10, pendingBonds, mask & hook.FROZEN_C10() != 0);
+    }
+
+    /// @dev All three endpoints and the raw mask, for the ADR-0007 tests.
+    function _endpoints(uint32 m) internal view returns (int56 c6, int56 c8, int56 c10, uint8 mask) {
+        (c6, c8, c10,, mask) = hook.maturity(id_, m);
+    }
+
+    /// @dev Whether a specific endpoint bit is set.
+    function _frozen(uint32 m, uint8 bit) internal view returns (bool) {
+        (,,,, uint8 mask) = hook.maturity(id_, m);
+
+        return mask & bit != 0;
     }
 
     /*//////////////////////////////////////////////////////////////

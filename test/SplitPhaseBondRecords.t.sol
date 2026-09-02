@@ -190,19 +190,19 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
     function test_rule3_pendingBondsCountsFinalizedOnly() public {
         uint32 m = _maturityOfNow();
 
-        (, uint32 pendingBefore,) = hook.maturity(id_, m);
+        (,,, uint32 pendingBefore,) = hook.maturity(id_, m);
         assertEq(pendingBefore, 0, "bucket did not start empty");
 
         // Unbonded: provisional written and cleared. Counter must not move.
         _swap(int256(uint256(UNBONDED_OUTPUT)), true, _validHookData());
 
-        (, uint32 pendingAfterUnbonded,) = hook.maturity(id_, m);
+        (,,, uint32 pendingAfterUnbonded,) = hook.maturity(id_, m);
         assertEq(pendingAfterUnbonded, 0, "an unbonded swap incremented pendingBonds");
 
         // Bonded: finalized. Counter moves by exactly one.
         _swap(int256(uint256(BONDED_OUTPUT)), true, _validHookData());
 
-        (, uint32 pendingAfterBonded,) = hook.maturity(id_, m);
+        (,,, uint32 pendingAfterBonded,) = hook.maturity(id_, m);
         assertEq(pendingAfterBonded, 1, "a finalized bond did not increment pendingBonds by one");
     }
 
@@ -212,7 +212,9 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
 
         _swap(int256(uint256(BONDED_OUTPUT)), true, _validHookData());
 
-        (int56 cumulative, uint32 pending, bool checkpointed) = hook.maturity(id_, m);
+        (,, int56 cumulative, uint32 pending, uint8 checkpointedMask) = hook.maturity(id_, m);
+
+        bool checkpointed = checkpointedMask & hook.FROZEN_C10() != 0;
 
         assertEq(pending, 1, "bond was not registered");
         assertFalse(checkpointed, "registration marked the checkpoint frozen");
@@ -323,7 +325,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         assertTrue(hook.bondExists(second), "second bond missing");
         assertTrue(first != second, "two same-block bonds share an id");
 
-        (, uint32 pending,) = hook.maturity(id_, m);
+        (,,, uint32 pending,) = hook.maturity(id_, m);
         assertEq(pending, 2, "pendingBonds does not reflect both bonds");
 
         // Both records are intact — the second did not overwrite the first.
@@ -346,7 +348,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         _swap(int256(uint256(UNBONDED_OUTPUT)), true, _validHookData());
 
         assertEq(_rawState(reusedId), STATE_NONE, "unbonded swap left id 0 occupied");
-        (, uint32 pendingAfterUnbonded,) = hook.maturity(id_, m);
+        (,,, uint32 pendingAfterUnbonded,) = hook.maturity(id_, m);
         assertEq(pendingAfterUnbonded, 0, "unbonded swap moved the counter");
 
         // Bonded second, same block: takes the same index 0, and must own it cleanly.
@@ -355,7 +357,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         assertEq(_rawState(reusedId), STATE_FINALIZED, "reused id is not finalized");
         assertGt(hook.getBond(reusedId).variableLegAmount, 0, "reused record has no variable leg");
 
-        (, uint32 pendingAfterBonded,) = hook.maturity(id_, m);
+        (,,, uint32 pendingAfterBonded,) = hook.maturity(id_, m);
         assertEq(pendingAfterBonded, 1, "reused id did not register exactly once");
     }
 
@@ -369,7 +371,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         assertTrue(hook.bondExists(_expectedBondId(m, 0)), "exact-input bond missing");
         assertTrue(hook.bondExists(_expectedBondId(m, 1)), "exact-output bond missing");
 
-        (, uint32 pending,) = hook.maturity(id_, m);
+        (,,, uint32 pending,) = hook.maturity(id_, m);
         assertEq(pending, 2, "mixed same-block bonds did not both register");
     }
 
