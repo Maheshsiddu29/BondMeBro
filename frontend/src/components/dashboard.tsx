@@ -759,6 +759,14 @@ export function Dashboard() {
           </div>
         </header>
 
+        <section className="protocol-status-bar" aria-label="Protocol status" aria-live="polite">
+          <div className="protocol-status-intro"><span className={`protocol-pulse ${rpcOnline ? "protocol-pulse-live" : ""}`} /><div><strong>BondMeBro protocol</strong><small>{rpcOnline ? "Live on Sepolia" : "Waiting for RPC"}</small></div></div>
+          <div className="protocol-status-item"><span>Pool</span><strong>ETH / WETH</strong></div>
+          <div className="protocol-status-item"><span>Bond rate</span><strong>{config?.[2]?.toString() ?? "—"} bps</strong></div>
+          <div className="protocol-status-item"><span>Observation</span><strong>{observationBlocks.toString()} blocks</strong></div>
+          <button type="button" className="protocol-refresh" onClick={refreshChainData}>Sync <span>↻</span></button>
+        </section>
+
         <main className="page-content">
           {screen === "overview" && (
             <>

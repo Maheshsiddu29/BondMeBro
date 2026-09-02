@@ -3529,3 +3529,205 @@ h2 {
   background: color-mix(in srgb, var(--orange-soft) 60%, transparent);
   font-size: 10px;
 }
+
+/* Interface refresh: a compact protocol rail gives every screen a clear live context. */
+.protocol-status-bar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(120px, 0.75fr)) auto;
+  gap: 16px;
+  align-items: center;
+  max-width: 1380px;
+  min-height: 76px;
+  padding: 0 5.2vw;
+  margin: 0 auto;
+  border-bottom: 1px solid var(--app-border);
+  background: color-mix(in srgb, var(--app-bg) 92%, transparent);
+}
+
+.protocol-status-intro,
+.protocol-status-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.protocol-status-intro > div {
+  display: grid;
+  gap: 4px;
+}
+
+.protocol-status-intro strong {
+  color: var(--app-ink);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.protocol-status-intro small,
+.protocol-status-item span {
+  color: var(--app-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.protocol-status-item {
+  display: grid;
+  gap: 6px;
+  padding-left: 16px;
+  border-left: 1px solid var(--app-border);
+}
+
+.protocol-status-item strong {
+  overflow: hidden;
+  color: var(--app-ink-soft);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.protocol-pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--warning);
+  box-shadow: 0 0 0 5px rgba(168, 106, 32, 0.12);
+}
+
+.protocol-pulse-live {
+  background: var(--green);
+  box-shadow: 0 0 0 5px var(--green-soft), 0 0 16px rgba(66, 139, 104, 0.24);
+}
+
+.protocol-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid var(--app-border);
+  border-radius: 11px;
+  background: var(--app-surface);
+  color: var(--orange-deep);
+  cursor: pointer;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.protocol-refresh:hover {
+  border-color: rgba(255, 107, 26, 0.4);
+  background: var(--orange-soft);
+}
+
+.protocol-refresh span {
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* Larger readable type for the main application surfaces. */
+body {
+  font-size: 17px;
+}
+
+.eyebrow {
+  font-size: 12px;
+}
+
+.sidebar-nav-item {
+  font-size: 16px;
+}
+
+h2 {
+  font-size: 30px;
+}
+
+.welcome-copy > p,
+.screen-intro > p {
+  font-size: 18px;
+}
+
+.metric-card-top,
+.metric-detail,
+.card-footer,
+.panel-footnote,
+.bond-table-head,
+.activity-table-head {
+  font-size: 11px;
+}
+
+.metric-card strong {
+  font-size: 33px;
+}
+
+.field-label,
+.swap-settings,
+.preview-amount > span,
+.preview-rows span {
+  font-size: 11px;
+}
+
+.amount-line input {
+  font-size: 34px;
+}
+
+.token-select,
+.segmented-control button {
+  font-size: 12px;
+}
+
+.card-copy,
+.section-heading p,
+.risk-callout p,
+.faq-card p {
+  font-size: 15px;
+}
+
+@media (max-width: 900px) {
+  .protocol-status-bar {
+    grid-template-columns: 1fr 1fr;
+    gap: 13px;
+    padding-top: 13px;
+    padding-bottom: 13px;
+  }
+
+  .protocol-status-intro {
+    grid-column: 1 / -1;
+  }
+
+  .protocol-status-item {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .protocol-refresh {
+    justify-self: start;
+  }
+}
+
+@media (max-width: 760px) {
+  .protocol-status-bar {
+    grid-template-columns: 1fr 1fr;
+    padding-right: 19px;
+    padding-left: 19px;
+  }
+
+  h2 {
+    font-size: 25px;
+  }
+
+  .welcome-copy > p,
+  .screen-intro > p {
+    font-size: 15px;
+  }
+
+  .amount-line input {
+    font-size: 27px;
+  }
+}
