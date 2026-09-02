@@ -3406,3 +3406,112 @@ h2 {
     gap: 13px;
   }
 }
+
+.rpc-chip {
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--app-border);
+  border-radius: 11px;
+  background: var(--app-surface);
+  cursor: pointer;
+  transition: border-color 180ms ease, color 180ms ease, transform 180ms ease;
+}
+
+.rpc-chip:hover {
+  border-color: rgba(255, 107, 26, 0.4);
+  transform: translateY(-1px);
+}
+
+@media (max-width: 760px) {
+  .rpc-chip {
+    min-height: 30px;
+    padding: 0 8px;
+    font-size: 9px;
+  }
+}
+
+.settlement-preview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  padding: 17px;
+  margin: 2px 0 0;
+  border: 1px solid rgba(255, 107, 26, 0.18);
+  border-radius: 15px;
+  background: color-mix(in srgb, var(--orange-soft) 66%, var(--app-surface));
+}
+
+.settlement-preview > div {
+  display: grid;
+  gap: 8px;
+}
+
+.settlement-preview span,
+.settlement-preview p {
+  color: var(--app-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settlement-preview strong {
+  color: var(--app-ink-soft);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settlement-preview-refund {
+  border-color: rgba(66, 139, 104, 0.24);
+  background: var(--green-soft);
+}
+
+.settlement-preview-refund strong {
+  color: var(--green);
+}
+
+.settlement-preview p {
+  grid-column: 1 / -1;
+  padding-top: 12px;
+  margin: 0;
+  border-top: 1px solid var(--app-border);
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0;
+  line-height: 1.5;
+  text-transform: none;
+}
+
+.theme-dark .settlement-preview {
+  background: rgba(255, 107, 26, 0.1);
+}
+
+.theme-dark .settlement-preview-refund {
+  background: rgba(66, 139, 104, 0.13);
+}
+
+@media (max-width: 760px) {
+  .settlement-preview {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .settlement-preview > div:last-of-type {
+    grid-column: 1 / -1;
+  }
+
+  .settlement-preview p {
+    font-size: 10px;
+  }
+}
+
+.activity-cache-note {
+  min-height: 45px;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12px 0;
+  margin-top: 15px;
+  border: 1px solid rgba(168, 106, 32, 0.18);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--orange-soft) 60%, transparent);
+  font-size: 10px;
+}
