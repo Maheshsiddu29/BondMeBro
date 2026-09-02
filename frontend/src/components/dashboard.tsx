@@ -732,6 +732,15 @@ export function Dashboard() {
           ))}
         </nav>
 
+        <div className="sidebar-section-label sidebar-flow-label">PROTOCOL FLOW</div>
+        <div className="sidebar-flow-card" aria-label="BondMeBro protocol flow">
+          <div className={`sidebar-flow-step ${screen === "swap" ? "sidebar-flow-step-active" : ""}`}><span>01</span><div><strong>Swap</strong><small>Trade with context</small></div><i>↕</i></div>
+          <div className={`sidebar-flow-step ${screen === "bonds" ? "sidebar-flow-step-active" : ""}`}><span>02</span><div><strong>Bond</strong><small>Temporary collateral</small></div><i>◈</i></div>
+          <div className={`sidebar-flow-step ${screen === "bonds" ? "sidebar-flow-step-active" : ""}`}><span>03</span><div><strong>Settle</strong><small>Checkpoint outcome</small></div><i>✓</i></div>
+          <div className="sidebar-flow-step"><span>04</span><div><strong>Refund</strong><small>Paid automatically</small></div><i>↗</i></div>
+          <div className={`sidebar-flow-step ${screen === "pools" ? "sidebar-flow-step-active" : ""}`}><span>05</span><div><strong>Donate</strong><small>Support in-range LPs</small></div><i>♢</i></div>
+        </div>
+
         <div className="sidebar-spacer" />
         <div className="sidebar-section-label">NETWORK</div>
         <div className="network-card"><StatusDot live={rpcOnline} /><div><strong>Sepolia</strong><span>Chain {deployment.chainId}</span></div><span className="network-check">{rpcOnline ? "✓" : "!"}</span></div>
