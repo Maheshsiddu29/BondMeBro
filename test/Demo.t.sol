@@ -163,7 +163,7 @@ contract DemoTest is Test, Deployers {
         _line();
         console2.log("  settled by a stranger (permissionless)");
         console2.log("  refunded to Alice      ", refund);
-        console2.log("  slashed to LPs         ", slash);
+        console2.log("  insurance pot credited", slash);
         _line();
 
         assertEq(refund + slash, collateral, "settlement did not conserve");
@@ -172,12 +172,12 @@ contract DemoTest is Test, Deployers {
     }
 
     /*//////////////////////////////////////////////////////////////
-     SCENARIO 2 -- PERSISTENT DISPLACEMENT: LPs ARE PAID
+     SCENARIO 2 -- PERSISTENT DISPLACEMENT: INSURANCE POT IS CREDITED
     //////////////////////////////////////////////////////////////*/
 
     function test_demo2_persistentDisplacementPaysTheInsurancePot() public {
         _line();
-        console2.log("SCENARIO 2  Persistent move -- the price stays, LPs are compensated");
+        console2.log("SCENARIO 2  Persistent move -- the price stays, insurance pot increased");
         _line();
 
         uint32 openBlock = uint32(block.number);
@@ -221,7 +221,7 @@ contract DemoTest is Test, Deployers {
 
         _line();
         console2.log("  refunded to Alice      ", refund);
-        console2.log("  slashed to LPs         ", slash);
+        console2.log("  insurance pot credited", slash);
         console2.log("  LP insurance pot now   ", hook.insurancePot(id_, currency1));
         _line();
 

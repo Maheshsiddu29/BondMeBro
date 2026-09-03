@@ -17,8 +17,8 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {BondMeBro, HOOK_FLAGS} from "../src/BondMeBro.sol";
 import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 
-/// @notice T5.1 Stage 1 — the per-pool tick accumulator that replaced the `lastTickBefore` /
-///         `lastTickAfter` diagnostics.
+/// @notice Regression tests for the per-pool tick accumulator, including non-zero starting ticks.
+/// @dev Historical origin: T5.1 Stage 1 replaced the `lastTickBefore` / `lastTickAfter` diagnostics.
 ///
 /// @dev DEDICATED NON-ZERO-TICK FIXTURE, ON PURPOSE. Every other suite starts its pool at tick 0,
 ///      which is right for those suites — it keeps both swap directions symmetric so threshold
@@ -26,8 +26,9 @@ import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 ///      at tick 0, an accumulator that wrongly initialised from Solidity's default `0` is
 ///      indistinguishable from one that correctly read the pool's real tick. Both look identical.
 ///
-///      This pool starts at a large non-zero tick so the two are distinguishable. The T3C tick-0
-///      fixtures are deliberately left alone.
+///      This pool starts at a large non-zero tick so the two are distinguishable. Historical T3C
+///      tick-0 fixtures remain in the threshold suite to pin threshold selection; they do not
+///      describe a separate current custody architecture.
 contract AccumulatorTest is Test, Deployers {
     using StateLibrary for IPoolManager;
 

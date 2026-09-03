@@ -9,9 +9,7 @@ crytic-export/
 *.sarif
 
 # Env & secrets — never commit a deployer key
-.env
-.env.*
-.env.example
+.env*
 
 # OS / editor
 .DS_Store
@@ -59,7 +57,6 @@ docs/adr/0005-model-l2-economics.md
 docs/adr/0006-variable-leg-custody.md
 docs/adr/0007-observation-checkpoints.md
 docs/adr/0008-block-cumulative-impact-collateral.md
-P_L2_5_MIGRATION_REPORT.mdgit 
 P_L2_5_MIGRATION_REPORT.md
 P_L2_6_MIGRATION_REPORT.md
 P_L2_7_MIGRATION_REPORT.md
@@ -67,8 +64,7 @@ P_L2_8_1_SPLIT_RESISTANCE_RESEARCH_REPORT.md
 P_L2_8_1B_BLOCK_IMPACT_INVARIANT_REVIEW.md
 P_L2_8_2_MIGRATION_REPORT.md
 P_L2_8_ADVERSARIAL_REPORT.md
-INTEGRATION.md
-P_L2_9_RELEASE_GATE_REPORT.md
-
+# Local migration, research and release review reports (including P-L2-9.1/9.2).
+P_L2_*_REPORT.md
 
 

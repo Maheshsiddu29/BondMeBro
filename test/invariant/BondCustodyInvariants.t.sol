@@ -23,13 +23,15 @@ import {BondCustodyHandler} from "./BondCustodyHandler.sol";
 
 /// @title BondCustodyInvariantsTest
 
-/// @notice Stateful invariant tests for BondMeBro's current bond-custody implementation.
+/// @notice Tests custody, frozen observations and settlement over many swaps and block advances.
 
 /// @dev Unit tests verify individual swaps. These invariants verify that custody remains correct across sequences of exact-input and exact-output swaps, both directions, including reverted transactions.
 
-/// T3/T3B/T3C only implement custody. Bonds cannot yet be settled or refunded, so every bond ever taken should still be physically held by the hook. T5 will introduce bond records and outflows, so these accounting invariants must be updated when settlement is implemented.
+/// Settlement and refunds are implemented. The hook must hold enough tokens for unsettled bonds
+/// and the insurance pot; tokens already refunded belong to the recipient, not to the hook.
 
-/// Maturity and settlement invariants are intentionally not tested here because maturity checkpoints do not exist yet. T5 must add tests proving that the settlement result is fixed at maturity and cannot be changed by later swaps.
+/// These tests also check that C6, C8 and C10 stay fixed once frozen, that settlement agrees with
+/// the independent Model L2 calculation, and that a bond cannot be settled twice.
 
 contract BondCustodyInvariantsTest is Test, Deployers {
     BondMeBro internal hook;

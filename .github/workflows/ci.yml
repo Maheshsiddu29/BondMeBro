@@ -96,12 +96,11 @@ jobs:
         with:
           version: stable
 
-      # Pattern is ANCHORED — unanchored "lib" also matches src/libraries/ and silently
-      # drops every library from the report. Keep in sync with the Makefile.
+      # Share the exact coverage-only gas-test exclusion with the local gate.
+      # The optimized test job still runs that assertion, with its original ceiling.
       - name: Run coverage
         run: |
-          forge coverage --no-match-coverage "^(lib|test|script)/" --report summary \
-            | tee coverage.txt
+          make coverage | tee coverage.txt
 
       # Surface the table directly in the PR page — reviewers shouldn't dig through logs.
       - name: Publish coverage summary

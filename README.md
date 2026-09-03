@@ -2,10 +2,10 @@
 
 **Refundable, outcome-linked collateral for Uniswap v4 liquidity providers.**
 
-A swap that moves the price and leaves it moved has cost liquidity providers something. A swap whose
-price impact bounces straight back has not. You cannot tell those apart at the moment of the trade —
-so BondMeBro doesn't try. It takes a **refundable deposit** from large swaps, waits ten blocks, looks
-at what the price actually did, and returns whatever the price did not keep.
+BondMeBro takes a **refundable deposit** from eligible swaps and observes the pool for ten blocks.
+If the price stays displaced in the trade's direction, some or all of the deposit goes into an LP
+insurance pot. The rest goes back to the named refund recipient. This shares risk using an observed
+pool outcome; it does not tell us what the trader knew or intended. LP means liquidity provider.
 
 Contract: `BondMeBro` · Built for UHI10 (Atrium Academy) · Solidity 0.8.26 · Foundry
 
@@ -21,31 +21,29 @@ A Uniswap v4 hook. It sits on a pool, watches swaps, and for swaps large enough 
 4. **refunds** the collateral if the move reverted, or moves part of it into an **LP insurance pot**
    if the move stuck.
 
-No external oracle. No keeper bot. No off-chain service. No wallet scoring. The hook reads the
-pool's own price history and settles from it.
+No external oracle, off-chain classifier or wallet scoring is used. The hook reads the pool's own
+price history. Anyone can call settlement after maturity; refunds are not sent automatically just
+because ten blocks have passed.
 
 ## 2. The problem
 
-When a large swap moves the pool price, one of two things happens next:
+After a price-moving trade, the pool price may move back, stay displaced, or move further. LPs face
+different risks along those paths, but a pool's price history alone does not prove who caused a loss
+or why someone traded.
 
-- **The price bounces back.** The trade was noise. Nobody was really harmed.
-- **The price stays there.** The trader knew something the pool didn't. They traded against LPs who
-  had no way to react — this is *adverse selection*, and it quietly eats LP returns.
-
-These look **identical at execution time**. A big trade is a big trade. The difference only shows up
-afterwards. Fee-based approaches have to guess up front, so they charge everyone — including the
-harmless traders — for damage only some of them cause.
+BondMeBro treats persistent same-direction displacement as an **LP-risk proxy** — a measurable
+signal used to split the deposit, not proof of actual LP loss. A reversal does not prove no one was
+harmed, and persistence does not prove the trader had inside information. This is outcome-linked
+risk sharing, not a classifier of trader knowledge, intent or maliciousness.
 
 ## 3. Why the collateral is refundable
 
-Because the information needed to price the trade **does not exist yet** when the trade executes.
+The late price observations do not exist when the trade executes. The hook therefore holds a
+deposit first and decides its refundable part after the observation window.
 
-A fee is a decision made too early. Refundable collateral defers the decision to the moment the
-answer is knowable. A trader whose impact reverts gets everything back and has paid only the time
-value of the collateral for ten blocks. A trader whose impact persists forfeits a part of it to the
-LPs who absorbed the move.
-
-It is closer to **insurance that prices itself after the fact** than to a fee.
+If both late windows show no chargeable displacement, the deposit is fully refunded. Otherwise,
+part or all is credited to the insurance pot. Swap fees and gas still apply. Pot funds stay inside
+the hook; this version does not distribute them to LPs.
 
 ## 4. Exact-input swaps — where the money comes from
 
@@ -59,8 +57,9 @@ hook holds       0.00045 WETH  ← the collateral, refundable, 15 bps here
 you receive     ~0.29955 WETH  ← output minus the collateral
 ```
 
-**Your specified amount is never touched.** The hook does not hold the permission that would let it
-change the input side of a swap at all — that is enforced by the hook's address, not by convention.
+**The hook does not change your specified input.** It has no `beforeSwapReturnDelta` permission.
+For exact input, its post-swap collateral adjustment applies only to output. These examples assume
+a fully filled swap; a pool price limit can still cause a partial fill.
 
 ## 5. Exact-output swaps — the mirror
 
@@ -98,11 +97,12 @@ block at exactly the same price. Measuring each swap against **where the block s
 trade on where it left the pool, not merely on how far it personally pushed it.
 
 **A swap that is first in its block is unaffected** — the two terms are equal, and it pays exactly
-what the simpler own-impact rule would have charged. Most swaps are first in their block.
+what the simpler own-impact rule would have charged for the same execution.
 
-This is **pool-level and identity-free**: nothing reads the sender, the recipient, `tx.origin` or the
-router, so the charge cannot be reduced by splitting a trade across addresses or transactions — only
-by not moving the price.
+The rate calculation is **pool-level and identity-free**: it does not use the sender, recipient or
+router as a score. Block-cumulative impact materially mitigates the old per-swap rule's unbounded
+same-block dilution. It does **not** make splitting invariant: splitting can still reduce collateral
+and the amount forfeited. See limitations D and E.
 
 ## 7. C6 / C8 / C10 — what settlement looks at
 
@@ -115,12 +115,14 @@ matures at `B + 10`, and three readings are frozen along the way:
 | **C8** | `B + 8` | eight blocks in |
 | **C10** | `B + 10` | at maturity |
 
-Settlement scores only the **late** part of the window — blocks 6–7 and 8–9 — so the swap's own
-opening impact is never part of what it is charged for. Two separate windows are used, and the
-**larger** is taken, because a single opposing block can erase one window but not both.
+Settlement scores the **late** windows — blocks 6–7 and 8–9 — relative to the bond's **pre-trade
+tick**. It does not directly charge the opening block. However, displacement created by the opening
+trade can still contribute to a slash if it persists into those late windows. The larger of the two
+direction-aligned readings is used, so changing one block cannot directly change both windows.
 
-Readings are frozen when they come due, so **settling early, on time, or ten thousand blocks late
-gives the identical answer**.
+**Before maturity, settlement reverts.** At maturity or any time later, it uses the same C6/C8/C10
+endpoints. Swaps after maturity cannot change the result. Quiet periods are filled using the last
+observed tick; the hook does not refund automatically because no swaps occurred.
 
 ## 8. Refund and slash
 
@@ -133,8 +135,8 @@ slash    = variableLeg × slashBps / 10,000
 refund   = collateral − slash
 ```
 
-- Price fully reverted → `R = 0` → **full refund**.
-- Price moved back inside 5 ticks → **full refund** (the dead zone; small moves are noise).
+- Both late-window readings reverted → `R = 0` → **full refund**.
+- Both late-window readings are within 5 ticks → **full refund** (the chosen dead zone).
 - Price partly persisted → **partial slash**, the rest refunded.
 - Price fully persisted → **slash up to the whole collateral**.
 
@@ -154,7 +156,7 @@ wrong. Nobody — not the owner, not an LP, not a settler — can remove pot fun
 ## 10. Permissionless settlement
 
 `settleBond(bondId)` can be called by **anyone** once the bond has matured. The settler is not paid
-and gains nothing; the result is identical whoever calls it and whenever they call it. `settleMany`
+and gains nothing; the result is identical whoever calls it at or after maturity. `settleMany`
 settles up to 32 bonds in one transaction.
 
 There is no privileged settler, no keeper incentive, and no way for a settler to influence the
@@ -179,6 +181,10 @@ Do not assume these work. They have no tests and are outside the design.
 
 ## 13. Build and test
 
+Prerequisites: Foundry (`forge`, `cast`, `anvil`), Git, Make, Python 3 with `slither-analyzer`, and
+`jq` for the local deployment commands. Solidity 0.8.26 and Cancun are selected by `foundry.toml`.
+Install Slither locally if needed with `pip3 install slither-analyzer`.
+
 Dependencies are pinned git submodules. **Clone with them**, or the `lib/` folders come down empty
 and the build fails:
 
@@ -200,23 +206,36 @@ forge build
 forge test
 ```
 
-The full gate CI runs:
+Run the local release checks:
 
 ```bash
-make ci          # fmt-check, slither, build, test, coverage
+make ci          # fmt-check, slither, build, optimized tests, coverage
+FOUNDRY_PROFILE=ci forge test --match-path 'test/invariant/*' -vv
 ```
 
-Current state of that gate on a clean clone:
+`make ci` runs every test normally, including every gas ceiling. Coverage then excludes only
+`test_adversarial_victimCallbackStaysInsideTheCeiling` in `test/ObservationCheckpointGas.t.sol`.
+Coverage disables optimization, so that one test's gas assertion is not meaningful in a coverage
+build. Its original 150,000 limit remains enforced by the optimized test run. No adversarial suite
+is excluded. GitHub CI uses the same `make coverage` command, the larger `ci` profile, and a
+separate committed-snapshot check.
+
+The local P-L2-9.2 checks passed with the figures below. These are local results, not a fresh-clone
+certification; the committed candidate needs that separate check.
 
 | | |
 |---|---|
 | tests | **461 passing**, 0 failing, 35 suites |
-| stateful invariant campaign | **26 invariants**, 512 runs × depth 100 |
+| stateful invariant campaign | **26 invariant-suite tests: 20 invariant properties + 6 reachability/regression tests**, 512 runs × depth 100 |
 | Slither | **0 findings**, 102 detectors |
+| coverage run | **460 passing**, 0 failing; only the named gas assertion excluded |
 | coverage (`src/BondMeBro.sol`) | 99.14% lines · 86.05% branches · 100% functions |
 | runtime bytecode | **15,953 bytes** (8,623 under the EIP-170 limit) |
 | `beforeSwap` worst case | **107,543 gas** (limit 150,000) |
 | `afterSwap` worst case | **73,999 gas** (limit 100,000) |
+
+The callback maxima are above the targets of 50,000 (`beforeSwap`) and 30,000 (`afterSwap`), but
+below the hard ceilings shown. These release-documentation fixes do not change callback code.
 
 ## 14. Demo
 
@@ -233,12 +252,63 @@ forge test --match-path test/Demo.t.sol -vv
 | **2 — persistent** | collateral posted, price sticks, **slash into the insurance pot** |
 | **3 — same-block split** | one move split across many swaps, priced under both rules side by side |
 
-Deployment (to a testnet, never mainnet from this repo):
+### Local deployment on fresh Anvil
+
+This deploys only to a throwaway chain on your own computer. It does not create a pool or supply
+liquidity; `make demo` creates its own complete test fixture for those parts. Do not use these
+unlocked-account commands on a public network. No env file or signing secret is needed.
+
+In terminal 1, start a fresh node with no saved state or fork. Keep it running:
 
 ```bash
-cp .env.example .env      # then fill it in
-forge script script/DeployBondMeBro.s.sol --rpc-url "$RPC_URL" --broadcast
+anvil --host 127.0.0.1 --port 8545 --chain-id 31337 --hardfork cancun --quiet
 ```
+
+If port 8545 is already in use, stop your own old local node first. Do not use an unknown node.
+In terminal 2, from the repository root, run the following in Bash or Zsh:
+
+```bash
+set -euo pipefail
+export RPC_URL=http://127.0.0.1:8545
+test "$(cast chain-id --rpc-url "$RPC_URL")" = 31337
+
+HOOK_OWNER=$(cast rpc --rpc-url "$RPC_URL" eth_accounts | jq -er '.[0]')
+export HOOK_OWNER
+
+POOL_MANAGER=$(forge create lib/v4-periphery/lib/v4-core/src/PoolManager.sol:PoolManager \
+  --rpc-url "$RPC_URL" --unlocked --from "$HOOK_OWNER" --broadcast --json \
+  --constructor-args "$HOOK_OWNER" | jq -er '.deployedTo')
+export POOL_MANAGER
+
+forge script script/DeployBondMeBro.s.sol \
+  --rpc-url "$RPC_URL" --sender "$HOOK_OWNER" --unlocked --broadcast
+```
+
+These are all the environment values this flow needs:
+
+- `RPC_URL` is the HTTP connection to this fresh local Anvil, not a mainnet or testnet service.
+- `HOOK_OWNER` is the first funded, unlocked account returned by this Anvil. It owns the hook's
+  pool-eligibility configuration. In this example it also owns the new PoolManager and signs both
+  deployments. `--from` selects it for `forge create`; `--sender` selects it for `forge script`.
+  `--unlocked` asks the local node to sign. The hook owner and deployment signer need not be the same
+  address in other deployment setups.
+- `POOL_MANAGER` is the actual contract address returned by the successful PoolManager deployment,
+  not a guessed or copied address. Its installed constructor takes `address initialOwner`.
+
+The BondMeBro script itself reads only `POOL_MANAGER` and `HOOK_OWNER`. It mines its CREATE2 salt,
+deploys, checks its address and permissions, then prints `deployed` and `addr bits`. Success means
+the broadcast completes and `addr bits` is **4292**, which is **0x10C4** in hexadecimal.
+
+The deployed hook address must have its low 14 permission bits equal to `0x10C4`. The visible
+hexadecimal suffix does not need to be literally `10C4`; addresses ending in `10C4`, `50C4`, `90C4`,
+or `D0C4` can all satisfy the same permission mask. The equivalent Solidity check is:
+
+```solidity
+require((uint160(address(hook)) & 0x3FFF) == 0x10C4);
+```
+
+`BEFORE_SWAP_RETURNS_DELTA` is absent. This is a permission-bit property, not a text suffix check.
+Stop Anvil with Ctrl-C when finished; its throwaway state is discarded.
 
 Uniswap v4 encodes a hook's permissions in its **address**, so this cannot be deployed with a plain
 `forge create`. The script mines a CREATE2 salt until it finds an address carrying the right
@@ -299,13 +369,14 @@ ration, not a classifier, and this is the direct consequence.
 > collateral **without bound** — the advantage grew linearly with `N` (Θ(N)), because pieces moving
 > less than a full tick bonded nothing at all.
 >
-> The effective-block-impact rule (§ 6) removes that unbounded behaviour. In a synthetic 58-tick
-> scenario, dilution at 32 pieces fell from about **15×** to about **1.9×**, and it stops growing
-> with `N`.
+> In the representative **58-tick / 32-piece** scenario, collateral dilution fell from about
+> **15×** under the old rule to about **1.88×** under the current rule. The slash retained compared
+> with a single trade rose from about **6%** to about **27%**.
 >
 > **A residual advantage remains**: roughly **2× on collateral and 4× on the amount actually
-> forfeited**. Splitting is still cheaper than trading at once. This is a mitigation, not immunity,
-> and the figures above are **synthetic scenario measurements, not a mainnet guarantee**.
+> forfeited**. Splitting is still cheaper than trading at once. This is a mitigation, not immunity.
+> The figures are **SYNTHETIC SIMULATION — NOT HISTORICAL UNISWAP EVIDENCE**, and are not universal
+> mainnet ratios.
 
 **F — Very low `minBondedAmount`.** Configuring a pool with `minBondedAmount` below roughly 1,000 raw
 units is unsupported. It admits swaps whose variable leg is small enough that a positive collateral
