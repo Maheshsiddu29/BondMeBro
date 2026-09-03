@@ -400,10 +400,10 @@ function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone
   return <span className={`badge badge-${tone}`}>{children}</span>;
 }
 
-function MetricCard({ label, value, detail, icon, accent = false }: { label: string; value: string; detail: string; icon: string; accent?: boolean }) {
+function MetricCard({ label, value, detail, icon, accent = false }: { label: string; value: string; detail: string; icon?: string; accent?: boolean }) {
   return (
     <article className={`metric-card ${accent ? "metric-card-accent" : ""}`}>
-      <div className="metric-card-top"><span>{label}</span><span className="metric-icon">{icon}</span></div>
+      <div className="metric-card-top"><span>{label}</span>{icon && <span className="metric-icon">{icon}</span>}</div>
       <strong>{value}</strong>
       <span className="metric-detail">{detail}</span>
     </article>
@@ -827,7 +827,7 @@ export function Dashboard() {
               </section>
 
               <section className="metric-grid">
-                <MetricCard label="ACTIVE BONDED VALUE" value={headBond ? `${formatToken(headBond[6])} ${headCurrency}` : "0.00 ETH"} detail={headBond ? "current queue head" : "no active bonds"} icon="◈" accent />
+                <MetricCard label="ACTIVE BONDED VALUE" value={headBond ? `${formatToken(headBond[6])} ${headCurrency}` : "0.00 ETH"} detail={headBond ? "current queue head" : "no active bonds"} accent />
                 <MetricCard label="OPEN BONDS" value={formatInteger(queueLength)} detail="FIFO queue length" icon="◌" />
                 <MetricCard label="INSURANCE POT" value={`${formatToken(pot0)} ETH`} detail={`WETH pot ${formatToken(pot1)} / testnet`} icon="♢" />
                 <MetricCard label="POOL STATUS" value={!rpcOnline ? "OFFLINE" : poolConnected ? "BOUND" : "CHECKING"} detail={!rpcOnline ? "RPC connection required" : bondingEnabled ? "bonding enabled" : "configuration pending"} icon="⌁" />
@@ -836,7 +836,7 @@ export function Dashboard() {
               <section className="content-grid overview-grid">
                 <article className="neo-card active-bonds-card">
                   <div className="card-heading"><div><span className="eyebrow">01 / PORTFOLIO</span><h2>Active bonds</h2></div><button className="card-link" type="button" onClick={() => goTo("bonds")}>View all <span>→</span></button></div>
-                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div className="pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card"><div className="empty-icon">◈</div><strong>No active bonds</strong><span>New bonds appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
+                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div className="pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card active-bonds-empty"><strong>No active bonds</strong><span>New bonds appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
                   <div className="card-footer"><span>{queueLength > 0n ? `${formatInteger(queueLength)} bond${queueLength === 1n ? "" : "s"} in queue` : "Queue is clear"}</span><span className="footer-status"><StatusDot live={rpcOnline} /> synced</span></div>
                 </article>
                 <article className="glass-card portfolio-card">

@@ -90,10 +90,30 @@ button {
   display: flex;
   flex-direction: column;
   width: 242px;
+  height: 100vh;
   min-height: 100vh;
   padding: 30px 18px 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 107, 26, 0.55) transparent;
   border-right: 1px solid var(--app-border);
   background: var(--app-surface);
+}
+
+.sidebar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(255, 107, 26, 0.55);
+  background-clip: padding-box;
+}
+
+.sidebar::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .sidebar-brand,
@@ -4579,4 +4599,24 @@ h2 {
     grid-template-columns: 1fr;
     padding-top: 18px;
   }
+}
+
+.theme-dark .sidebar,
+.theme-black .sidebar {
+  scrollbar-color: rgba(255, 139, 75, 0.7) rgba(255, 255, 255, 0.04);
+}
+
+.theme-dark .sidebar::-webkit-scrollbar-track,
+.theme-black .sidebar::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.theme-dark .sidebar::-webkit-scrollbar-thumb,
+.theme-black .sidebar::-webkit-scrollbar-thumb {
+  background: rgba(255, 139, 75, 0.72);
+  background-clip: padding-box;
+}
+
+.active-bonds-empty {
+  padding-top: 28px;
 }
