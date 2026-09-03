@@ -4842,3 +4842,8 @@ h2 {
   font-size: 20px;
   font-weight: 700;
 }
+
+/* Portfolio summary removed: let active bonds use the row. */
+.overview-grid-single {
+  grid-template-columns: 1fr;
+}

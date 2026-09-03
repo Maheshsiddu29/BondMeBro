@@ -832,19 +832,11 @@ export function Dashboard() {
                 <MetricCard label="POOL" value={!rpcOnline ? "OFFLINE" : poolConnected ? "BOUND" : "CHECKING"} detail={bondingEnabled ? "enabled" : "pending"} icon="⌁" />
               </section>
 
-              <section className="content-grid overview-grid">
+              <section className="content-grid overview-grid overview-grid-single">
                 <article className="neo-card active-bonds-card">
                   <div className="card-heading"><div><span className="eyebrow">01 / PORTFOLIO</span><h2>Active bonds</h2></div><button className="card-link" type="button" onClick={() => goTo("bonds")}>View all <span>→</span></button></div>
                   {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card active-bonds-empty"><strong>No active bonds</strong><span>New bonds appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
                   <div className="card-footer"><span>{queueLength > 0n ? `${formatInteger(queueLength)} bond${queueLength === 1n ? "" : "s"} in queue` : "Queue is clear"}</span><span className="footer-status"><StatusDot live={rpcOnline} /> synced</span></div>
-                </article>
-                <article className="glass-card portfolio-card">
-                  <div className="card-heading"><div><span className="eyebrow">02 / PROTOCOL</span><h2>Portfolio summary</h2></div><Badge tone="green"><StatusDot live /> TESTNET</Badge></div>
-                  <div className="portfolio-total"><span>INSURANCE POT / ETH</span><strong>{formatToken(pot0)} <small>ETH</small></strong></div>
-                  <div className="stacked-bar"><span style={{ width: totalPot > 0n ? "58%" : "4%" }} /><span style={{ width: pot0 > 0n ? "24%" : "3%" }} /></div>
-                  <div className="legend-row"><span><i className="dot-orange" />WETH pot <b>{formatToken(pot1)} WETH</b></span><span><i className="dot-warm" />ETH pot <b>{formatToken(pot0)} ETH</b></span></div>
-                  <div className="summary-list"><div><span>Bond rate</span><strong>{config?.[2]?.toString() ?? "—"} bps</strong></div><div><span>Observation</span><strong>{observationBlocks.toString()} blocks</strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} bps</strong></div></div>
-                  <button type="button" className="outline-button full-button" onClick={() => goTo("pools")}>View pool analytics <span>→</span></button>
                 </article>
               </section>
 
