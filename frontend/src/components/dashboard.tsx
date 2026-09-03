@@ -1315,6 +1315,7 @@ function BondsScreen({
   const [settlementState, setSettlementState] = useState<ProtocolTransactionState>("idle");
   const [settlementHash, setSettlementHash] = useState<Hex | undefined>();
   const [settlementError, setSettlementError] = useState("");
+  const [refundPopup, setRefundPopup] = useState<{ amount: string; symbol: string; hash?: Hex } | undefined>();
   const headMatured = Boolean(headBond && maturityProgress >= 100);
   const activeUserBonds = userBonds.filter((bond) => !bond.settlement);
   const settledUserBonds = userBonds.filter((bond) => Boolean(bond.settlement));
@@ -1331,6 +1332,12 @@ function BondsScreen({
   const previewRefund = headBond && previewPersistence !== undefined
     ? (headBond[6] * (10_000n - previewPersistence)) / 10_000n
     : undefined;
+
+  useEffect(() => {
+    if (!refundPopup) return;
+    const timer = window.setTimeout(() => setRefundPopup(undefined), 6_000);
+    return () => window.clearTimeout(timer);
+  }, [refundPopup]);
 
   async function settleMaturedBonds() {
     if (!headMatured || !isConnected || !networkCorrect || !publicClient) return;
@@ -1362,6 +1369,13 @@ function BondsScreen({
         decodedReceiptSettlement?.id ?? headId,
         decodedReceiptSettlement?.settlement,
       );
+      if (decodedReceiptSettlement?.settlement && decodedReceiptSettlement.settlement.refundAmount > 0n && headBond) {
+        setRefundPopup({
+          amount: formatToken(decodedReceiptSettlement.settlement.refundAmount, tokenDecimalsForCurrency(headBond[4])),
+          symbol: headCurrency,
+          hash,
+        });
+      }
       setSettlementState("success");
       onRefresh();
     } catch (error) {
@@ -1372,6 +1386,7 @@ function BondsScreen({
 
   return (
     <>
+      {refundPopup && <div className="refund-success-popup" role="status" aria-live="polite"><button type="button" aria-label="Close refund success" onClick={() => setRefundPopup(undefined)}>×</button><div className="refund-success-icon">✓</div><div><strong>Refund made success</strong><span>{refundPopup.amount} {refundPopup.symbol} sent to wallet.</span>{refundPopup.hash && <a href={explorerTx(refundPopup.hash)} target="_blank" rel="noreferrer">View tx ↗</a>}</div></div>}
       <section className="screen-intro">
         <div><span className="eyebrow">02 / PORTFOLIO</span><h1>My bonds.<br /><em>Track.</em></h1></div>
         <p>Track and settle outcomes.</p>

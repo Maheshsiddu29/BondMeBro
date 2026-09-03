@@ -4944,3 +4944,90 @@ h2 {
     font-size: 44px;
   }
 }
+
+/* Refund success popup after settlement. */
+.refund-success-popup {
+  position: fixed;
+  right: 28px;
+  top: 96px;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 320px;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 17px 42px 17px 17px;
+  border: 1px solid rgba(61, 180, 120, 0.28);
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--app-surface) 94%, var(--green-soft));
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.22), 0 0 0 1px rgba(61, 180, 120, 0.08);
+  color: var(--app-ink);
+  animation: refund-pop-in 220ms ease-out;
+}
+
+.refund-success-popup button {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  background: transparent;
+  color: var(--app-muted);
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.refund-success-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 7px var(--green-soft);
+  color: #fff;
+  font-size: 19px;
+  font-weight: 800;
+}
+
+.refund-success-popup strong,
+.refund-success-popup span,
+.refund-success-popup a {
+  display: block;
+}
+
+.refund-success-popup strong {
+  font-size: 18px;
+}
+
+.refund-success-popup span {
+  margin-top: 5px;
+  color: var(--app-muted);
+  font-size: 14px;
+}
+
+.refund-success-popup a {
+  margin-top: 8px;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.theme-dark .refund-success-popup,
+.theme-black .refund-success-popup {
+  background: rgba(9, 18, 14, 0.96);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(61, 180, 120, 0.12);
+}
+
+@keyframes refund-pop-in {
+  from { opacity: 0; transform: translateY(-10px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (max-width: 760px) {
+  .refund-success-popup {
+    right: 16px;
+    top: 84px;
+    min-width: 0;
+  }
+}
