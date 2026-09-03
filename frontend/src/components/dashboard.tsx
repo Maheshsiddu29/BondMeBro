@@ -129,6 +129,7 @@ type RpcLog = {
 };
 
 type ConfigTuple = readonly [bigint, bigint, bigint];
+type ConfigWithDecimals = { config: ConfigTuple; decimals0: bigint; decimals1: bigint };
 type AccumulatorTuple = readonly [bigint, bigint, bigint];
 type BoundsTuple = readonly [Hex, Hex];
 type BondTuple = readonly [Address, bigint, bigint, bigint, Address, bigint, bigint, Hex];
@@ -154,6 +155,13 @@ function normalizeConfig(value: unknown): ConfigTuple | undefined {
     asBigInt(tupleItem(value, 2, "bondBps")),
   ];
   return result.every((item): item is bigint => item !== undefined) ? (result as unknown as ConfigTuple) : undefined;
+}
+
+function normalizeConfigWithDecimals(value: unknown): ConfigWithDecimals | undefined {
+  const config = normalizeConfig(tupleItem(value, 0, "poolConfig"));
+  const decimals0 = asBigInt(tupleItem(value, 1, "decimals0"));
+  const decimals1 = asBigInt(tupleItem(value, 2, "decimals1"));
+  return config && decimals0 !== undefined && decimals1 !== undefined ? { config, decimals0, decimals1 } : undefined;
 }
 
 function normalizeAccumulator(value: unknown): AccumulatorTuple | undefined {
@@ -287,12 +295,18 @@ function poolKey() {
   } as const;
 }
 
+function tokenInfoForCurrency(currency: string) {
+  const normalized = currency.toLowerCase();
+  return tokenOptions.find((token) => token.address.toLowerCase() === normalized);
+}
+
 function tokenSymbolForCurrency(currency: string) {
-  return currency.toLowerCase() === deployment.currency0.toLowerCase() ? "ETH" : currency.toLowerCase() === deployment.currency1.toLowerCase() ? "WETH" : "TOKEN";
+  return tokenInfoForCurrency(currency)?.symbol
+    ?? (currency.toLowerCase() === deployment.currency0.toLowerCase() ? "TOKEN0" : currency.toLowerCase() === deployment.currency1.toLowerCase() ? "TOKEN1" : "TOKEN");
 }
 
 function tokenDecimalsForCurrency(currency: string) {
-  return currency.toLowerCase() === "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238" ? 6 : 18;
+  return tokenInfoForCurrency(currency)?.decimals ?? 18;
 }
 
 function bondProgress(bond: Pick<UserBond, "openBlock" | "maturesAtBlock">, currentBlock?: bigint) {
@@ -469,6 +483,13 @@ export function Dashboard() {
     args: [deployment.poolId],
     query: { refetchInterval: 15_000 },
   });
+  const configWithDecimalsRead = useReadContract({
+    address: deployment.hook,
+    abi: bondMeBroAbi,
+    functionName: "getPoolConfigWithDecimals",
+    args: [poolKey()],
+    query: { refetchInterval: 15_000, retry: false },
+  });
   const observationRead = useReadContract({
     address: deployment.hook,
     abi: bondMeBroAbi,
@@ -553,7 +574,12 @@ export function Dashboard() {
     query: { enabled: Boolean(headId && headId !== ZERO_HASH), refetchInterval: 8_000 },
   });
 
-  const config = normalizeConfig(configRead.data);
+  const configWithDecimals = normalizeConfigWithDecimals(configWithDecimalsRead.data);
+  const config = configWithDecimals?.config ?? normalizeConfig(configRead.data);
+  const poolDecimals0 = Number(configWithDecimals?.decimals0 ?? BigInt(tokenDecimalsForCurrency(deployment.currency0)));
+  const poolDecimals1 = Number(configWithDecimals?.decimals1 ?? BigInt(tokenDecimalsForCurrency(deployment.currency1)));
+  const poolSymbol0 = tokenSymbolForCurrency(deployment.currency0);
+  const poolSymbol1 = tokenSymbolForCurrency(deployment.currency1);
   const accumulator = normalizeAccumulator(accumulatorRead.data);
   const headBond = normalizeBond(headBondRead.data);
   const observationValue = (observationRead as unknown as { data?: unknown }).data;
@@ -847,7 +873,7 @@ export function Dashboard() {
 
           {screen === "swap" && <SwapScreen isConnected={isConnected} address={address} networkCorrect={networkCorrect} poolConfig={config} rpcOnline={rpcOnline} poolConfigLoading={poolConfigLoading} poolConfigError={poolConfigError} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} swapMode={swapMode} swapAmount={swapAmount} setSwapAmount={setSwapAmount} onConnect={connectWallet} onViewBonds={() => goTo("bonds")} onProtocolActivity={recordProtocolActivity} onSwapConfirmed={refreshChainData} />}
           {screen === "bonds" && <BondsScreen headBond={headBond} headId={headId} queueLength={queueLength} maturityBlock={maturityBlock} maturityProgress={maturityProgress} currentBlock={blockNumber} headCurrency={headCurrency} accumulator={accumulator} refundTolTicks={refundTolTicks} userBonds={userBonds} isConnected={isConnected} networkCorrect={networkCorrect} claimable0={claimable0} claimable1={claimable1} onRefresh={refreshChainData} onSettlementConfirmed={recordSettlementConfirmation} onProtocolActivity={recordProtocolActivity} onConnect={connectWallet} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} onSwap={() => goTo("swap")} />}
-          {screen === "pools" && <PoolsScreen config={config} accumulator={accumulator} clampTicks={clampTicks} observationBlocks={observationBlocks} settlerFeeBps={settlerFeeBps} queueLength={queueLength} pot0={pot0} pot1={pot1} poolConnected={poolConnected} owner={ownerRead.data} rpcOnline={rpcOnline} isConnected={isConnected} networkCorrect={networkCorrect} onRefresh={refreshChainData} onProtocolActivity={recordProtocolActivity} onConnect={connectWallet} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} />}
+          {screen === "pools" && <PoolsScreen config={config} poolDecimals0={poolDecimals0} poolDecimals1={poolDecimals1} poolSymbol0={poolSymbol0} poolSymbol1={poolSymbol1} accumulator={accumulator} clampTicks={clampTicks} observationBlocks={observationBlocks} settlerFeeBps={settlerFeeBps} queueLength={queueLength} pot0={pot0} pot1={pot1} poolConnected={poolConnected} owner={ownerRead.data} rpcOnline={rpcOnline} isConnected={isConnected} networkCorrect={networkCorrect} onRefresh={refreshChainData} onProtocolActivity={recordProtocolActivity} onConnect={connectWallet} onSwitchNetwork={() => switchChain({ chainId: sepolia.id })} />}
           {screen === "activity" && <ActivityScreen activity={activity} activityError={activityError} onRefresh={refreshChainData} />}
           {screen === "learn" && <LearnScreen onSwap={() => goTo("swap")} />}
         </main>
@@ -1563,6 +1589,10 @@ function ClaimsCard({
 
 function PoolsScreen({
   config,
+  poolDecimals0,
+  poolDecimals1,
+  poolSymbol0,
+  poolSymbol1,
   accumulator,
   clampTicks,
   observationBlocks,
@@ -1581,6 +1611,10 @@ function PoolsScreen({
   onSwitchNetwork,
 }: {
   config?: ConfigTuple;
+  poolDecimals0: number;
+  poolDecimals1: number;
+  poolSymbol0: string;
+  poolSymbol1: string;
   accumulator?: AccumulatorTuple;
   clampTicks: bigint;
   observationBlocks: bigint;
@@ -1635,7 +1669,7 @@ function PoolsScreen({
       <section className="screen-intro"><div><span className="eyebrow">03 / POOL ANALYTICS</span><h1>Pool health.<br /><em>Live.</em></h1></div><p>Live pool state.</p></section>
       <section className="content-grid pool-analytics-grid">
         <article className="neo-card analytics-card"><div className="card-heading"><div><span className="eyebrow">SELECTED POOL</span><h2>ETH / WETH</h2></div><Badge tone={poolConnected ? "green" : "neutral"}><StatusDot live={poolConnected} /> {poolConnected ? "HOOK ACTIVE" : "CHECKING"}</Badge></div><div className="pool-identity-large"><div className="large-pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><span>Sepolia</span></div></div><div className="pool-stat-grid"><div><span>FEE TIER</span><strong>0.30%</strong></div><div><span>TICK SPACING</span><strong>60</strong></div><div><span>QUEUE</span><strong>{formatInteger(queueLength)}</strong></div><div><span>LAST TICK</span><strong>{accumulator?.[0]?.toString() ?? "—"}</strong></div></div><a className="outline-button full-button button-as-link" href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">View hook contract ↗</a></article>
-        <article className="glass-card configuration-card"><div className="card-heading"><div><span className="eyebrow">BOND CONFIGURATION</span><h2>Pool parameters</h2></div><Badge tone={!rpcOnline ? "muted" : config && config[2] > 0n ? "orange" : "muted"}>{!rpcOnline ? "RPC OFFLINE" : config && config[2] > 0n ? "ENABLED" : "DISABLED"}</Badge></div>{!rpcOnline && <div className="pair-warning">RPC offline.</div>}<div className="config-list"><div><span>Bond BPS</span><strong>{config?.[2]?.toString() ?? "—"} <small>basis points</small></strong></div><div><span>Minimum / currency 0</span><strong>{formatToken(config?.[0])} <small>ETH</small></strong></div><div><span>Minimum / currency 1</span><strong>{formatToken(config?.[1])} <small>WETH</small></strong></div><div><span>Observation window</span><strong>{observationBlocks.toString()} <small>blocks</small></strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} <small>bps of slash</small></strong></div></div><div className="owner-row"><span>OWNER</span><a href={owner ? explorerAddress(owner) : "#"} target="_blank" rel="noreferrer">{formatAddress(owner)} ↗</a></div></article>
+        <article className="glass-card configuration-card"><div className="card-heading"><div><span className="eyebrow">BOND CONFIGURATION</span><h2>Pool parameters</h2></div><Badge tone={!rpcOnline ? "muted" : config && config[2] > 0n ? "orange" : "muted"}>{!rpcOnline ? "RPC OFFLINE" : config && config[2] > 0n ? "ENABLED" : "DISABLED"}</Badge></div>{!rpcOnline && <div className="pair-warning">RPC offline.</div>}<div className="config-list"><div><span>Bond BPS</span><strong>{config?.[2]?.toString() ?? "—"} <small>basis points</small></strong></div><div><span>Minimum / {poolSymbol0}</span><strong>{formatToken(config?.[0], poolDecimals0)} <small>{poolSymbol0}</small></strong></div><div><span>Minimum / {poolSymbol1}</span><strong>{formatToken(config?.[1], poolDecimals1)} <small>{poolSymbol1}</small></strong></div><div><span>Observation window</span><strong>{observationBlocks.toString()} <small>blocks</small></strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} <small>bps of slash</small></strong></div></div><div className="owner-row"><span>OWNER</span><a href={owner ? explorerAddress(owner) : "#"} target="_blank" rel="noreferrer">{formatAddress(owner)} ↗</a></div></article>
       </section>
       <section className="content-grid pool-analytics-grid analytics-lower">
         <article className="neo-card"><SectionHeading eyebrow="ACCUMULATOR" title="Pool-local reference" copy="Clamped settlement data." /><div className="tick-display"><strong>{accumulator?.[0]?.toString() ?? "—"}</strong><span>LAST RECORDED TICK</span></div><div className="mini-stats"><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CLAMP</span><strong>{clampTicks.toString()} ticks</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 5) : "—"}</strong></div></div></article>

@@ -38,8 +38,11 @@ OWNER=<pool-configuration owner address>
 ```
 
 Choose `BOND_BPS`, `MIN_BONDED_AMOUNT0`, and `MIN_BONDED_AMOUNT1` before deploying.
-`BOND_BPS` is capped at 100 basis points. Both thresholds and the rate must be
-non-zero to enable bonding, or all three must be zero to deploy with disabled defaults.
+`BOND_BPS` is capped at 100 basis points. The raw threshold variables are base units;
+prefer `MIN_BONDED_AMOUNT0_DECIMAL` and `MIN_BONDED_AMOUNT1_DECIMAL` for human values
+that the script converts with `CURRENCY0` / `CURRENCY1` decimals. Both thresholds and
+the rate must be non-zero to enable bonding, or all three must be zero to deploy with
+disabled defaults.
 
 ## 2. Full current hook deployment command
 
@@ -103,6 +106,9 @@ script:
 ```dotenv
 POOL_MIN_BONDED_AMOUNT0=<minimum currency0 input in raw units>
 POOL_MIN_BONDED_AMOUNT1=<minimum currency1 input in raw units>
+# Safer alternative: set human-decimal values and let the script convert by token decimals.
+POOL_MIN_BONDED_AMOUNT0_DECIMAL=<minimum currency0 input, e.g. 100.5>
+POOL_MIN_BONDED_AMOUNT1_DECIMAL=<minimum currency1 input, e.g. 0.05>
 POOL_BOND_BPS=25
 ```
 

@@ -19,6 +19,23 @@ export const bondMeBroAbi = [
       { name: "bondBps", type: "uint16" },
     ] }],
   },
+  {
+    type: "function", name: "getPoolConfigWithDecimals", stateMutability: "view",
+    inputs: [{ name: "key", type: "tuple", components: [
+      { name: "currency0", type: "address" }, { name: "currency1", type: "address" },
+      { name: "fee", type: "uint24" }, { name: "tickSpacing", type: "int24" }, { name: "hooks", type: "address" },
+    ] }],
+    outputs: [
+      { name: "poolConfig", type: "tuple", components: [
+        { name: "minBondedAmount0", type: "uint96" },
+        { name: "minBondedAmount1", type: "uint96" },
+        { name: "bondBps", type: "uint16" },
+      ] },
+      { name: "decimals0", type: "uint8" },
+      { name: "decimals1", type: "uint8" },
+    ],
+  },
+  { type: "function", name: "currencyDecimals", stateMutability: "view", inputs: [{ name: "currency", type: "address" }], outputs: [{ name: "", type: "uint8" }] },
   { type: "function", name: "queueLength", stateMutability: "view", inputs: [{ name: "id", type: "bytes32" }], outputs: [{ name: "length", type: "uint256" }] },
   {
     type: "function", name: "queueBounds", stateMutability: "view",

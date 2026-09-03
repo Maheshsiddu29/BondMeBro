@@ -18,7 +18,8 @@ import {BondMeBro} from "../src/BondMeBro.sol";
 /// Required environment variables:
 /// - RPC_URL and PRIVATE_KEY (provided to forge script)
 /// - BOND_HOOK, CURRENCY0, CURRENCY1, POOL_FEE, TICK_SPACING
-/// - POOL_MIN_BONDED_AMOUNT0, POOL_MIN_BONDED_AMOUNT1, POOL_BOND_BPS
+/// - POOL_MIN_BONDED_AMOUNT0/1 raw units, or POOL_MIN_BONDED_AMOUNT0_DECIMAL/1_DECIMAL human values
+/// - POOL_BOND_BPS
 contract ConfigureBondMeBroPool is Script {
     using PoolIdLibrary for PoolKey;
 
@@ -27,8 +28,10 @@ contract ConfigureBondMeBroPool is Script {
         BondMeBro hook = BondMeBro(payable(hookAddress));
         PoolKey memory key = _poolKey(hookAddress);
 
-        uint256 rawMinBondedAmount0 = vm.envUint("POOL_MIN_BONDED_AMOUNT0");
-        uint256 rawMinBondedAmount1 = vm.envUint("POOL_MIN_BONDED_AMOUNT1");
+        uint256 rawMinBondedAmount0 =
+            _envThreshold("POOL_MIN_BONDED_AMOUNT0", "POOL_MIN_BONDED_AMOUNT0_DECIMAL", _currencyDecimals(key.currency0));
+        uint256 rawMinBondedAmount1 =
+            _envThreshold("POOL_MIN_BONDED_AMOUNT1", "POOL_MIN_BONDED_AMOUNT1_DECIMAL", _currencyDecimals(key.currency1));
         uint256 rawPoolBondBps = vm.envUint("POOL_BOND_BPS");
         require(rawMinBondedAmount0 <= type(uint96).max, "ConfigureBondMeBroPool: amount0 threshold overflows uint96");
         require(rawMinBondedAmount1 <= type(uint96).max, "ConfigureBondMeBroPool: amount1 threshold overflows uint96");
@@ -58,5 +61,49 @@ contract ConfigureBondMeBroPool is Script {
             tickSpacing: int24(uint24(vm.envUint("TICK_SPACING"))),
             hooks: IHooks(hookAddress)
         });
+    }
+
+    function _envThreshold(string memory rawName, string memory decimalName, uint8 decimals) internal view returns (uint256) {
+        string memory decimalValue = vm.envOr(decimalName, string(""));
+        if (bytes(decimalValue).length != 0) return _parseDecimalUnits(decimalValue, decimals);
+        return vm.envOr(rawName, uint256(0));
+    }
+
+    function _parseDecimalUnits(string memory value, uint8 decimals) internal pure returns (uint256 parsed) {
+        bytes memory input = bytes(value);
+        bool sawDot;
+        bool sawDigit;
+        uint8 fractionDigits;
+        for (uint256 i = 0; i < input.length; i++) {
+            bytes1 char = input[i];
+            uint8 code = uint8(char);
+            if (code == 46) {
+                require(!sawDot, "invalid decimal threshold");
+                sawDot = true;
+                continue;
+            }
+            require(code >= 48 && code <= 57, "invalid decimal threshold");
+            sawDigit = true;
+            if (sawDot) {
+                require(fractionDigits < decimals, "too many decimal places");
+                fractionDigits++;
+            }
+            parsed = parsed * 10 + (code - 48);
+        }
+        require(sawDigit, "empty decimal threshold");
+        while (fractionDigits < decimals) {
+            parsed *= 10;
+            fractionDigits++;
+        }
+    }
+
+    function _currencyDecimals(Currency currency) internal view returns (uint8) {
+        address currencyAddress = Currency.unwrap(currency);
+        if (currencyAddress == address(0)) return 18;
+        (bool ok, bytes memory data) = currencyAddress.staticcall(abi.encodeWithSignature("decimals()"));
+        if (!ok || data.length < 32) return 18;
+        uint256 decimals = abi.decode(data, (uint256));
+        if (decimals > 36) return 18;
+        return uint8(decimals);
     }
 }

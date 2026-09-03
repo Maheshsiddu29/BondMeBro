@@ -23,6 +23,10 @@ import {TickAccumulatorLib} from "./libraries/TickAccumulatorLib.sol";
 import {PersistenceMathLib} from "./libraries/PersistenceMathLib.sol";
 import {HookDataCodec} from "./libraries/HookDataCodec.sol";
 
+interface IERC20MetadataDecimals {
+    function decimals() external view returns (uint8);
+}
+
 /// @title BondMeBro — outcome-linked LP insurance for Uniswap v4.
 /// @notice Swaps whose total input exceeds the active pool's per-currency threshold post a
 ///         refundable bond. Exact-input bonds are taken before the pool executes and the
@@ -292,6 +296,39 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     /// @notice Returns the active custody configuration for a pool.
     function getPoolConfig(PoolId id) external view returns (PoolConfig memory) {
         return _poolConfigs[id];
+    }
+
+    /// @notice Returns pool custody configuration together with token decimals for UI/display code.
+    /// @dev Thresholds are stored and compared in raw token units. This helper prevents
+    ///      frontends and scripts from accidentally displaying a 6-decimal token threshold
+    ///      as if it had 18 decimals. Native ETH uses 18 decimals; ERC-20s that do not
+    ///      implement `decimals()` safely fall back to 18.
+    function getPoolConfigWithDecimals(PoolKey calldata key)
+        external
+        view
+        returns (PoolConfig memory poolConfig, uint8 decimals0, uint8 decimals1)
+    {
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
+        poolConfig = _poolConfigs[key.toId()];
+        decimals0 = _currencyDecimals(key.currency0);
+        decimals1 = _currencyDecimals(key.currency1);
+    }
+
+    /// @notice Decimal count used for human display of a pool currency threshold.
+    function currencyDecimals(Currency currency) external view returns (uint8) {
+        return _currencyDecimals(currency);
+    }
+
+    function _currencyDecimals(Currency currency) internal view returns (uint8) {
+        if (currency.isAddressZero()) return 18;
+        (bool ok, bytes memory data) =
+            Currency.unwrap(currency).staticcall(abi.encodeWithSelector(IERC20MetadataDecimals.decimals.selector));
+        if (!ok || data.length < 32) return 18;
+        uint256 decimals = abi.decode(data, (uint256));
+        // Anything above 36 is not useful for human threshold display and can break
+        // downstream decimal formatting, so fall back to the ERC-20 convention.
+        if (decimals > 36) return 18;
+        return uint8(decimals);
     }
 
     function _validatePoolConfig(uint96 minBondedAmount0, uint96 minBondedAmount1, uint16 poolBondBps) internal pure {

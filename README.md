@@ -254,10 +254,13 @@ with `ConfigureBondMeBroPool` without changing the hook address.
 | `maxSettlesPerSwap` | Piggyback settlement budget, capped at 32 |
 | `owner` | Address authorized to update a pool's thresholds and bond rate |
 
-The deployment script reads these from `BOND_BPS`, `MIN_BONDED_AMOUNT0`,
-`MIN_BONDED_AMOUNT1`, `REFUND_TOL_TICKS`, `OBSERVATION_BLOCKS`,
+The deployment script reads these from `BOND_BPS`, raw-unit `MIN_BONDED_AMOUNT0`,
+raw-unit `MIN_BONDED_AMOUNT1`, `REFUND_TOL_TICKS`, `OBSERVATION_BLOCKS`,
 `MAX_ABS_TICK_DELTA`, `SETTLER_FEE_BPS`,
-`MAX_SETTLES_PER_SWAP`, and `OWNER`. A pool is enabled only when all three custody
+`MAX_SETTLES_PER_SWAP`, and `OWNER`. To avoid decimal mistakes, prefer the optional
+human-readable `MIN_BONDED_AMOUNT0_DECIMAL` / `MIN_BONDED_AMOUNT1_DECIMAL` values;
+the script converts them with `CURRENCY0` / `CURRENCY1` token decimals and ignores the
+raw values when they are set. A pool is enabled only when all three custody
 values are non-zero. Set all three to zero to disable bonding; a partial configuration
 is rejected. Production deployments should derive thresholds, the clamp and the window
 together from expected volatility, token decimals and the desired manipulation cost.
@@ -353,8 +356,10 @@ forge script script/ConfigureBondMeBroPool.s.sol:ConfigureBondMeBroPool \\
   --broadcast
 ```
 
-Set `POOL_MIN_BONDED_AMOUNT0`, `POOL_MIN_BONDED_AMOUNT1`, and `POOL_BOND_BPS` first.
-The broadcaster must equal the immutable `OWNER`; both thresholds and the rate must be
+Set `POOL_MIN_BONDED_AMOUNT0`, `POOL_MIN_BONDED_AMOUNT1`, and `POOL_BOND_BPS` first,
+or use `POOL_MIN_BONDED_AMOUNT0_DECIMAL` / `POOL_MIN_BONDED_AMOUNT1_DECIMAL` for
+human-readable values that the script converts with the pool token decimals. The
+broadcaster must equal the immutable `OWNER`; both thresholds and the rate must be
 non-zero, or all three must be zero to disable bonding.
 
 ### 3. Execute a swap
@@ -496,7 +501,9 @@ Create your own `.env` locally with the values you need for deployment:
 
 The deployment script also accepts the immutable policy and default custody values
 listed above. `MIN_BONDED_AMOUNT0`, `MIN_BONDED_AMOUNT1`, and `BOND_BPS` are copied
-into each newly initialized pool; use `ConfigureBondMeBroPool` for later updates. If
+into each newly initialized pool; if the matching `_DECIMAL` variables are set, they
+are converted by token decimals before copying. Use `ConfigureBondMeBroPool` for later
+updates. If
 an owner or settler receiver rejects a token or native transfer, the hook records a
 pull payment in `claimablePayments`; that recipient can retry with
 `claimPayments(currency)`. The `MAX_BOND_AMOUNT` swap setting protects traders from

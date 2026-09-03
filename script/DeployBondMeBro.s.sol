@@ -41,8 +41,10 @@ contract DeployBondMeBro is Script {
         // Sane defaults with env overrides. Validate before narrowing casts so a mistyped
         // threshold cannot wrap into a much smaller custody limit.
         uint256 rawBondBps = vm.envOr("BOND_BPS", uint256(0));
-        uint256 rawMinBondedAmount0 = vm.envOr("MIN_BONDED_AMOUNT0", uint256(0));
-        uint256 rawMinBondedAmount1 = vm.envOr("MIN_BONDED_AMOUNT1", uint256(0));
+        uint256 rawMinBondedAmount0 =
+            _envThreshold("MIN_BONDED_AMOUNT0", "MIN_BONDED_AMOUNT0_DECIMAL", _currencyDecimals("CURRENCY0"));
+        uint256 rawMinBondedAmount1 =
+            _envThreshold("MIN_BONDED_AMOUNT1", "MIN_BONDED_AMOUNT1_DECIMAL", _currencyDecimals("CURRENCY1"));
         require(rawBondBps <= 100, "DeployBondMeBro: BOND_BPS must be <= 100");
         require(rawMinBondedAmount0 <= type(uint96).max, "DeployBondMeBro: amount0 threshold overflows uint96");
         require(rawMinBondedAmount1 <= type(uint96).max, "DeployBondMeBro: amount1 threshold overflows uint96");
@@ -83,5 +85,49 @@ contract DeployBondMeBro is Script {
 
         console2.log("deployed    ", address(hook));
         console2.log("addr bits   ", uint256(uint160(address(hook))) & 0x3FFF);
+    }
+
+    function _envThreshold(string memory rawName, string memory decimalName, uint8 decimals) internal view returns (uint256) {
+        string memory decimalValue = vm.envOr(decimalName, string(""));
+        if (bytes(decimalValue).length != 0) return _parseDecimalUnits(decimalValue, decimals);
+        return vm.envOr(rawName, uint256(0));
+    }
+
+    function _parseDecimalUnits(string memory value, uint8 decimals) internal pure returns (uint256 parsed) {
+        bytes memory input = bytes(value);
+        bool sawDot;
+        bool sawDigit;
+        uint8 fractionDigits;
+        for (uint256 i = 0; i < input.length; i++) {
+            bytes1 char = input[i];
+            uint8 code = uint8(char);
+            if (code == 46) {
+                require(!sawDot, "invalid decimal threshold");
+                sawDot = true;
+                continue;
+            }
+            require(code >= 48 && code <= 57, "invalid decimal threshold");
+            sawDigit = true;
+            if (sawDot) {
+                require(fractionDigits < decimals, "too many decimal places");
+                fractionDigits++;
+            }
+            parsed = parsed * 10 + (code - 48);
+        }
+        require(sawDigit, "empty decimal threshold");
+        while (fractionDigits < decimals) {
+            parsed *= 10;
+            fractionDigits++;
+        }
+    }
+
+    function _currencyDecimals(string memory currencyEnvName) internal view returns (uint8) {
+        address currency = vm.envOr(currencyEnvName, address(0));
+        if (currency == address(0)) return 18;
+        (bool ok, bytes memory data) = currency.staticcall(abi.encodeWithSignature("decimals()"));
+        if (!ok || data.length < 32) return 18;
+        uint256 decimals = abi.decode(data, (uint256));
+        if (decimals > 36) return 18;
+        return uint8(decimals);
     }
 }

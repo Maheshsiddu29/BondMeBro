@@ -19,6 +19,8 @@
     "bondBps": 0,
     "minBondedAmount0": "0",
     "minBondedAmount1": "0",
+    "minBondedAmount0Decimals": 18,
+    "minBondedAmount1Decimals": 18,
     "refundTolTicks": 10,
     "observationBlocks": 25,
     "maxAbsTickDelta": 506,
