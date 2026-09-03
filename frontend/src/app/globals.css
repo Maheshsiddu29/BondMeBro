@@ -4744,3 +4744,73 @@ h2 {
 .theme-light .uniswap-token-picker {
   border-color: rgba(255, 79, 184, 0.28);
 }
+
+/* All themes now use pink accents, including dark and black. */
+.theme-dark,
+.theme-black {
+  --orange: #ff4fb8;
+  --orange-deep: #ff75c8;
+  --orange-soft: rgba(255, 79, 184, 0.16);
+  --signal-orange: #ff4fb8;
+}
+
+.theme-dark .primary-button,
+.theme-dark .swap-submit-button,
+.theme-black .primary-button,
+.theme-black .swap-submit-button {
+  background: linear-gradient(135deg, #ff75c8, #ff4fb8) !important;
+  box-shadow: 0 0 0 1px rgba(255, 79, 184, 0.22), 0 10px 26px rgba(255, 79, 184, 0.2) !important;
+}
+
+.theme-dark .primary-button:hover,
+.theme-dark .swap-submit-button:hover,
+.theme-black .primary-button:hover,
+.theme-black .swap-submit-button:hover {
+  background: linear-gradient(135deg, #ff4fb8, #d91f8f) !important;
+  box-shadow: 0 0 0 1px rgba(255, 79, 184, 0.3), 0 12px 30px rgba(255, 79, 184, 0.25) !important;
+}
+
+.theme-dark .sidebar-flow-step-active > i,
+.theme-black .sidebar-flow-step-active > i {
+  background: #ff4fb8;
+  border-color: rgba(255, 79, 184, 0.34);
+}
+
+.theme-dark .neo-card,
+.theme-dark .glass-card,
+.theme-dark .metric-card,
+.theme-dark .learn-step,
+.theme-black .neo-card,
+.theme-black .glass-card,
+.theme-black .metric-card,
+.theme-black .learn-step,
+.theme-black .wallet-button,
+.theme-black .uniswap-token-picker,
+.theme-black .swap-token-panel {
+  border-color: rgba(255, 79, 184, 0.17);
+}
+
+.theme-dark .protocol-status-item strong,
+.theme-dark .metric-card strong,
+.theme-dark .preview-amount strong,
+.theme-dark .detail-hero strong,
+.theme-dark .config-list strong,
+.theme-black .protocol-status-item strong,
+.theme-black .metric-card strong,
+.theme-black .preview-amount strong,
+.theme-black .detail-hero strong,
+.theme-black .config-list strong {
+  color: #ff75c8;
+}
+
+.theme-dark .sidebar,
+.theme-black .sidebar {
+  border-right-color: rgba(255, 79, 184, 0.18);
+  scrollbar-color: rgba(255, 79, 184, 0.48) rgba(0, 0, 0, 0.35);
+}
+
+.theme-dark .sidebar::-webkit-scrollbar-thumb,
+.theme-black .sidebar::-webkit-scrollbar-thumb {
+  background: rgba(255, 79, 184, 0.52);
+  background-clip: padding-box;
+}
