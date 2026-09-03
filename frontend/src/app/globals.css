@@ -4694,3 +4694,28 @@ h2 {
 .portfolio-card .summary-list strong {
   font-size: 16px;
 }
+
+/* Light mode uses pink accents; dark and black keep the orange protocol accent. */
+.theme-light {
+  --orange: #ff4fb8;
+  --orange-deep: #d91f8f;
+  --orange-soft: #ffe7f5;
+}
+
+.theme-light .brand-symbol,
+.theme-light .primary-button,
+.theme-light .sidebar-flow-step-active > i {
+  box-shadow: 6px 6px 13px rgba(217, 31, 143, 0.18), -5px -5px 11px rgba(255, 255, 255, 0.72);
+}
+
+.theme-light .metric-card-accent {
+  border-color: rgba(255, 79, 184, 0.2);
+  background: var(--orange-soft);
+}
+
+.theme-dark,
+.theme-black {
+  --orange: #ff6b1a;
+  --orange-deep: #e95d0c;
+  --orange-soft: rgba(255, 122, 26, 0.14);
+}
