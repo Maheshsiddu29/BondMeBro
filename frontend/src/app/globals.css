@@ -4680,3 +4680,17 @@ h2 {
   height: 21px;
   font-size: 12px;
 }
+
+/* Portfolio summary emphasis. */
+.portfolio-card h2 {
+  font-size: 38px;
+  line-height: 1;
+}
+
+.portfolio-card .portfolio-total strong {
+  font-size: 40px;
+}
+
+.portfolio-card .summary-list strong {
+  font-size: 16px;
+}
