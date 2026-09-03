@@ -55,8 +55,9 @@ settlement according to the hook's configured cap.
 - ETH and WETH claimable-payment reads and browser claim transactions.
 - ETH and WETH insurance-pot reads and browser donation transactions.
 - Wallet connection and Sepolia network switching.
-- Exact-input browser swaps for the configured ETH/WETH pool, including ERC-20 and
-  Permit2 approvals.
+- Exact-input browser swaps for the configured ETH/WETH pool, including scoped
+  ERC-20 and Permit2 approvals. A positive minimum output is required for slippage
+  protection.
 - Token selector entries for ETH, WETH, and Sepolia USDC. USDC remains blocked until
   a real BondMeBro USDC pool is initialized and funded.
 

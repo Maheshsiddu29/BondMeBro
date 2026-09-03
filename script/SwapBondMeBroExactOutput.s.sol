@@ -82,8 +82,9 @@ contract SwapBondMeBroExactOutput is Script {
         (bytes memory commands, bytes[] memory inputs) = _encodePlan(request);
 
         vm.startBroadcast();
-        _approveInput(inputCurrency, request.permit2, request.router);
-        IUniversalRouterLike(request.router).execute{value: inputCurrency.isAddressZero() ? request.amountInMaximum : 0}(
+        _approveInput(inputCurrency, request.permit2, request.router, request.amountInMaximum);
+        IUniversalRouterLike(request.router)
+        .execute{value: inputCurrency.isAddressZero() ? request.amountInMaximum : 0}(
             commands, inputs, request.deadline
         );
         vm.stopBroadcast();
@@ -118,13 +119,14 @@ contract SwapBondMeBroExactOutput is Script {
         inputs[0] = abi.encode(actions, actionParams);
     }
 
-    function _approveInput(Currency currency, address permit2, address routerAddress) internal {
+    function _approveInput(Currency currency, address permit2, address routerAddress, uint128 amount) internal {
         if (currency.isAddressZero()) return;
 
-        IERC20Minimal(Currency.unwrap(currency)).approve(permit2, type(uint256).max);
-        IAllowanceTransfer(permit2).approve(
-            Currency.unwrap(currency), routerAddress, type(uint160).max, type(uint48).max
-        );
+        // Scope both allowances to this operation. The broadcaster can run the script again
+        // and approve a new amount without leaving a reusable unlimited router allowance.
+        IERC20Minimal(Currency.unwrap(currency)).approve(permit2, amount);
+        IAllowanceTransfer(permit2)
+            .approve(Currency.unwrap(currency), routerAddress, uint160(amount), uint48(block.timestamp + 1 hours));
     }
 
     function _poolKey(address hookAddress) internal view returns (PoolKey memory key) {

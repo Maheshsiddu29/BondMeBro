@@ -8,7 +8,9 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {
-    BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta
+    BeforeSwapDelta,
+    BeforeSwapDeltaLibrary,
+    toBeforeSwapDelta
 } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
@@ -213,6 +215,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     error SettlementReentrancy();
     error InvalidCurrency();
     error InvalidPoolManager();
+    error InvalidHookAddress();
     // NotPoolManager() is inherited from BaseHook and reused for unlockCallback.
 
     constructor(IPoolManager _poolManager, Config memory cfg) BaseHook(_poolManager) {
@@ -261,9 +264,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         // Seed from the pool's declared starting tick so the first swap is also clamped.
         _accumulators[id].initialize(tick);
         _poolConfigs[id] = PoolConfig({
-            minBondedAmount0: defaultMinBondedAmount0,
-            minBondedAmount1: defaultMinBondedAmount1,
-            bondBps: bondBps
+            minBondedAmount0: defaultMinBondedAmount0, minBondedAmount1: defaultMinBondedAmount1, bondBps: bondBps
         });
         emit PoolConfigUpdated(id, defaultMinBondedAmount0, defaultMinBondedAmount1, bondBps, msg.sender);
         return BaseHook.afterInitialize.selector;
@@ -277,7 +278,9 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         external
     {
         if (msg.sender != owner) revert NotOwner();
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         PoolId id = key.toId();
+        // slither-disable-next-line unused-return
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
         _validatePoolConfig(minBondedAmount0, minBondedAmount1, poolBondBps);
@@ -314,23 +317,26 @@ contract BondMeBro is BaseHook, IUnlockCallback {
 
         PoolId id = key.toId();
 
-        // Piggyback settlement: routine swaps drain matured bonds without any keeper.
-        // The resolved owner is the party the router told us is paying for this swap;
-        // compensating it keeps cleanup gas from becoming a hidden tax on pool activity.
-        _settleMaturedPrefix(id, maxSettlesPerSwap, _resolveOwner(sender, hookData));
-
-        // Record the pre-swap tick; _afterSwap consumes it. Only `tick` is needed here;
-        // sqrtPriceX96 / protocolFee / lpFee are intentionally discarded.
+        // Record the pre-swap tick and pending callback state before any settlement payout.
+        // Only `tick` is needed here; sqrtPriceX96 / protocolFee / lpFee are intentionally
+        // discarded. A nested swap from a payout receiver is rejected while settlement is
+        // in progress, so these effects cannot be overwritten by a callback.
         // slither-disable-next-line unused-return
         (, int24 tick,,) = poolManager.getSlot0(id);
         _pendingTick[id] = tick;
         _pendingSet[id] = true;
+
+        // Piggyback settlement: routine swaps drain matured bonds without any keeper.
+        // The resolved owner is the party the router told us is paying for this swap;
+        // compensating it keeps cleanup gas from becoming a hidden tax on pool activity.
+        _settleMaturedPrefix(id, maxSettlesPerSwap, _resolveOwner(sender, hookData));
 
         // Exact-output swaps must carry a complete payload even when the eventual input is
         // below the configured threshold: the user has explicitly opted into this swap's
         // refund recipient and bond limit. Exact-input payloads are decoded only if the
         // amount threshold says this swap can actually open a bond.
         if (params.amountSpecified >= 0) {
+            // slither-disable-next-line unused-return
             HookDataCodec.decode(hookData);
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
@@ -480,6 +486,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     function _resolveOwner(address swapCaller, bytes calldata hookData) internal pure returns (address) {
         if (hookData.length == 0) return swapCaller;
         if (hookData.length != HookDataCodec.LENGTH) revert HookDataCodec.InvalidHookDataLength();
+        // slither-disable-next-line unused-return
         (address refundRecipient,) = HookDataCodec.decode(hookData);
         return refundRecipient;
     }
@@ -529,6 +536,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     /// @param maxCount Max bonds to settle this call (capped at MAX_SETTLE_BATCH). 0 = no-op.
     /// @return settled How many bonds were settled.
     function settleBonds(PoolKey calldata key, uint256 maxCount) external returns (uint256 settled) {
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         if (maxCount > MAX_SETTLE_BATCH) maxCount = MAX_SETTLE_BATCH;
         return _settleMaturedPrefix(key.toId(), maxCount, msg.sender);
     }
@@ -552,14 +560,16 @@ contract BondMeBro is BaseHook, IUnlockCallback {
             Bond storage b = _bonds[id][head];
             if (block.number < uint256(b.openBlock) + uint256(observationBlocks)) break;
             bytes32 next = b.next;
+            // Advance the queue before the recipient/token callbacks. The global guard also
+            // blocks nested settlement, so observers always see the post-settlement head.
+            _queueHead[id] = next;
+            if (next == bytes32(0)) _queueTail[id] = bytes32(0);
             _settle(id, head, feeRecipient);
             head = next;
             unchecked {
                 ++settled;
             }
         }
-        _queueHead[id] = head;
-        if (head == bytes32(0)) _queueTail[id] = bytes32(0);
         _settlementInProgress = false;
     }
 
@@ -587,12 +597,12 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         delete _bonds[id][bondId];
         insurancePot[id][b.currency] += toPot;
 
-        _payOrCredit(b.currency, b.owner, refundAmount);
-        _payOrCredit(b.currency, feeRecipient, fee);
-
         emit BondSettled(
             id, bondId, b.owner, feeRecipient, refundAmount, slashAmount, fee, referenceTick, persistenceBps
         );
+
+        _payOrCredit(b.currency, b.owner, refundAmount);
+        _payOrCredit(b.currency, feeRecipient, fee);
     }
 
     /// @dev Standard ERC-20s and EOAs are paid inline. If a token or recipient rejects
@@ -656,6 +666,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     // entire call and cannot strand a partial payout.
     // slither-disable-next-line reentrancy-events
     function donatePot(PoolKey calldata key, Currency currency) external {
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         if (
             Currency.unwrap(currency) != Currency.unwrap(key.currency0)
                 && Currency.unwrap(currency) != Currency.unwrap(key.currency1)
@@ -680,6 +691,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
 
         (PoolKey memory key, Currency currency, uint256 amount) = abi.decode(data, (PoolKey, Currency, uint256));
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         if (
             Currency.unwrap(currency) != Currency.unwrap(key.currency0)
                 && Currency.unwrap(currency) != Currency.unwrap(key.currency1)

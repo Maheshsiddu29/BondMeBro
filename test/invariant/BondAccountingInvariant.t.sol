@@ -58,13 +58,12 @@ contract BondAccountingHandler is Test {
         try swapRouter.swap(
             key,
             SwapParams({
-                zeroForOne: true,
-                amountSpecified: -int256(amount),
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -int256(amount), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData()
-        ) {} catch {}
+        ) {}
+            catch {}
     }
 
     function swapUp(uint256 amount) external {
@@ -72,13 +71,12 @@ contract BondAccountingHandler is Test {
         try swapRouter.swap(
             key,
             SwapParams({
-                zeroForOne: false,
-                amountSpecified: -int256(amount),
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne: false, amountSpecified: -int256(amount), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData()
-        ) {} catch {}
+        ) {}
+            catch {}
     }
 
     function exactOutputDown(uint256 amountOut) external {
@@ -86,13 +84,12 @@ contract BondAccountingHandler is Test {
         try swapRouter.swap(
             key,
             SwapParams({
-                zeroForOne: true,
-                amountSpecified: int256(amountOut),
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: int256(amountOut), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData()
-        ) {} catch {}
+        ) {}
+            catch {}
     }
 
     function exactOutputUp(uint256 amountOut) external {
@@ -100,13 +97,12 @@ contract BondAccountingHandler is Test {
         try swapRouter.swap(
             key,
             SwapParams({
-                zeroForOne: false,
-                amountSpecified: int256(amountOut),
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne: false, amountSpecified: int256(amountOut), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData()
-        ) {} catch {}
+        ) {}
+            catch {}
     }
 
     function settle() external {
