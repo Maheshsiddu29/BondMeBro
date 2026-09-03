@@ -50,7 +50,7 @@ contract DeployBondMeBro is Script {
         BondMeBro.Config memory cfg = BondMeBro.Config({
             bondBps: uint16(rawBondBps),
             refundTolTicks: uint24(vm.envOr("REFUND_TOL_TICKS", uint256(10))),
-            observationBlocks: uint32(vm.envOr("OBSERVATION_BLOCKS", uint256(20))),
+            observationBlocks: uint32(vm.envOr("OBSERVATION_BLOCKS", uint256(25))),
             maxAbsTickDelta: uint24(vm.envOr("MAX_ABS_TICK_DELTA", uint256(9116) / 18)), // TruncGeoOracle's cap scaled to ~15-min window
             settlerFeeBps: uint16(vm.envOr("SETTLER_FEE_BPS", uint256(500))),
             maxSettlesPerSwap: uint8(vm.envOr("MAX_SETTLES_PER_SWAP", uint256(4))),

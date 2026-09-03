@@ -4649,3 +4649,34 @@ h2 {
 .theme-black .network-card {
   box-shadow: 8px 8px 20px rgba(0, 0, 0, 0.38), -4px -4px 12px rgba(255, 255, 255, 0.018);
 }
+
+/* Requested readability bump: portfolio title and sidebar protocol flow. */
+.portfolio-card h2 {
+  font-size: 30px;
+}
+
+.sidebar-flow-label {
+  font-size: 10px;
+}
+
+.sidebar-flow-step {
+  min-height: 40px;
+}
+
+.sidebar-flow-step strong {
+  font-size: 13px;
+}
+
+.sidebar-flow-step small {
+  font-size: 10px;
+}
+
+.sidebar-flow-step > span {
+  font-size: 9px;
+}
+
+.sidebar-flow-step > i {
+  width: 21px;
+  height: 21px;
+  font-size: 12px;
+}

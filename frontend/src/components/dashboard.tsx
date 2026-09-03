@@ -560,7 +560,7 @@ export function Dashboard() {
   const refundTolValue = (refundTolRead as unknown as { data?: unknown }).data;
   const settlerFeeValue = (settlerFeeRead as unknown as { data?: unknown }).data;
   const clampValue = (clampRead as unknown as { data?: unknown }).data;
-  const observationBlocks = asBigInt(observationValue) ?? 20n;
+  const observationBlocks = asBigInt(observationValue) ?? 25n;
   const refundTolTicks = asBigInt(refundTolValue) ?? 10n;
   const settlerFeeBps = asBigInt(settlerFeeValue) ?? 500n;
   const clampTicks = asBigInt(clampValue) ?? 506n;
@@ -816,7 +816,7 @@ export function Dashboard() {
                 <div className="welcome-copy">
                   <span className="eyebrow">GOOD AFTERNOON / {deployment.networkName.toUpperCase()}</span>
                   <h1>Swap.<br /><em>Settle.</em></h1>
-                  <p>Bonded swaps refund or fund LP cover.</p>
+                  <p>Refund or cover.</p>
                   <div className="welcome-actions"><button type="button" className="primary-button large-button" onClick={() => goTo("swap")}>Swap now <span>↗</span></button><button type="button" className="text-button" onClick={() => goTo("learn")}>Learn <span>→</span></button></div>
                 </div>
                 <div className="hero-visual">
@@ -827,10 +827,10 @@ export function Dashboard() {
               </section>
 
               <section className="metric-grid">
-                <MetricCard label="ACTIVE BONDED VALUE" value={headBond ? `${formatToken(headBond[6])} ${headCurrency}` : "0.00 ETH"} detail={headBond ? "current queue head" : "no active bonds"} accent />
-                <MetricCard label="OPEN BONDS" value={formatInteger(queueLength)} detail="FIFO queue length" icon="◌" />
-                <MetricCard label="INSURANCE POT" value={`${formatToken(pot0)} ETH`} detail={`WETH pot ${formatToken(pot1)} / testnet`} icon="♢" />
-                <MetricCard label="POOL STATUS" value={!rpcOnline ? "OFFLINE" : poolConnected ? "BOUND" : "CHECKING"} detail={!rpcOnline ? "RPC connection required" : bondingEnabled ? "bonding enabled" : "configuration pending"} icon="⌁" />
+                <MetricCard label="BONDED VALUE" value={headBond ? `${formatToken(headBond[6])} ${headCurrency}` : "0.00 ETH"} detail={headBond ? "queue head" : "clear"} accent />
+                <MetricCard label="OPEN BONDS" value={formatInteger(queueLength)} detail="queue" icon="◌" />
+                <MetricCard label="POT" value={`${formatToken(pot0)} ETH`} detail={`${formatToken(pot1)} WETH`} icon="♢" />
+                <MetricCard label="POOL" value={!rpcOnline ? "OFFLINE" : poolConnected ? "BOUND" : "CHECKING"} detail={bondingEnabled ? "enabled" : "pending"} icon="⌁" />
               </section>
 
               <section className="content-grid overview-grid">
@@ -849,7 +849,7 @@ export function Dashboard() {
                 </article>
               </section>
 
-              <section className="process-strip"><div><span className="eyebrow">THE MECHANISM</span><h2>Swap <i>→</i> Bond <i>→</i> Settle</h2></div><p>Bond makes price impact accountable without an external classifier.</p><button type="button" className="round-arrow" onClick={() => goTo("learn")}>↗</button></section>
+              <section className="process-strip"><div><span className="eyebrow">FLOW</span><h2>Swap <i>→</i> Bond <i>→</i> Settle</h2></div><button type="button" className="round-arrow" onClick={() => goTo("learn")}>↗</button></section>
               <ActivityPreview activity={activity} activityError={activityError} onViewAll={() => goTo("activity")} />
             </>
           )}
