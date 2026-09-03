@@ -144,7 +144,7 @@ contract BondThresholdsTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, THRESHOLD_0, THRESHOLD_1, true);
+        hook.setPoolConfig(key_, THRESHOLD_0, THRESHOLD_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -329,9 +329,9 @@ contract BondThresholdsTest is Test, Deployers {
 
     /// @notice The maximum `uint96` currency1 threshold can be stored without truncating or corrupting neighbouring packed fields.
     function test_setPoolConfig_acceptsMaxUint96Threshold() public {
-        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, true);
+        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, 10_000, 10_000, true);
 
-        (uint128 min0, uint96 min1, bool bondingEnabled) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, bool bondingEnabled,,) = hook.poolConfig(id_);
 
         assertEq(min1, type(uint96).max, "uint96 threshold was truncated");
 
@@ -355,7 +355,7 @@ contract BondThresholdsTest is Test, Deployers {
         assertFalse(success, "an oversized uint96 threshold was accepted through raw calldata");
 
         // Rejected calldata must leave the existing configuration unchanged.
-        (uint128 min0, uint96 min1, bool bondingEnabled) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, bool bondingEnabled,,) = hook.poolConfig(id_);
 
         assertEq(min0, THRESHOLD_0, "config was mutated by a rejected call");
 
@@ -371,6 +371,8 @@ contract BondThresholdsTest is Test, Deployers {
             key_,
             uint256(THRESHOLD_0),
             uint256(type(uint96).max),
+            uint256(10_000), // minVariableLeg0, at the smallest accepted value
+            uint256(10_000), // minVariableLeg1
             uint256(1) // bondingEnabled == true, ABI-encoded as a full word
         );
 
@@ -378,7 +380,7 @@ contract BondThresholdsTest is Test, Deployers {
 
         assertTrue(success, "a valid raw-calldata config was rejected");
 
-        (, uint96 min1,) = hook.poolConfig(id_);
+        (, uint96 min1,,,) = hook.poolConfig(id_);
 
         assertEq(min1, type(uint96).max, "raw-calldata config did not take effect");
     }
@@ -387,21 +389,32 @@ contract BondThresholdsTest is Test, Deployers {
                         SINGLE-SLOT CONFIG
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Verifies that adding the second threshold does not make `PoolConfig` spill into another storage slot.
-
-    /// @dev `minBondedAmount0`, `minBondedAmount1`, and `bondBps` are intentionally packed into one 256-bit slot. The test checks which storage slots are touched rather than assuming a specific number of SLOAD opcodes, because compiler optimization can change how many reads are emitted without changing the storage layout.
-    function test_configOccupiesOneSlot_exactInput() public {
-        _assertConfigTouchesOnlyItsOwnSlot(-int256(STRADDLING_AMOUNT));
+    /// @notice `PoolConfig` occupies exactly TWO storage slots on the swap path, and no more.
+    ///
+    /// @dev THIS TEST USED TO ASSERT ONE SLOT, and the change is deliberate rather than a
+    ///      regression. The config gained two variable-leg minimums, which are amounts in the
+    ///      collateral currency and need widths that cannot fit in the three spare bytes the first
+    ///      slot had left. The cost is one extra storage read on a bonded swap, which was measured
+    ///      against the callback ceilings before the change was accepted.
+    ///
+    ///      The property worth keeping is unchanged: the config must not creep into a THIRD slot.
+    ///      The test therefore still watches for a spill, one slot further along, and still checks
+    ///      which slots are touched rather than counting SLOAD opcodes -- the optimizer can change
+    ///      how many reads are emitted without changing the layout.
+    function test_configOccupiesTwoSlots_exactInput() public {
+        _assertConfigTouchesOnlyItsOwnSlots(-int256(STRADDLING_AMOUNT));
     }
 
-    function test_configOccupiesOneSlot_exactOutput() public {
-        _assertConfigTouchesOnlyItsOwnSlot(int256(STRADDLING_AMOUNT));
+    function test_configOccupiesTwoSlots_exactOutput() public {
+        _assertConfigTouchesOnlyItsOwnSlots(int256(STRADDLING_AMOUNT));
     }
 
-    function _assertConfigTouchesOnlyItsOwnSlot(int256 amountSpecified) internal {
+    function _assertConfigTouchesOnlyItsOwnSlots(int256 amountSpecified) internal {
         bytes32 configSlot = keccak256(abi.encode(id_, uint256(0)));
 
-        bytes32 spillSlot = bytes32(uint256(configSlot) + 1);
+        bytes32 secondSlot = bytes32(uint256(configSlot) + 1);
+
+        bytes32 spillSlot = bytes32(uint256(configSlot) + 2);
 
         vm.record();
 
@@ -411,9 +424,11 @@ contract BondThresholdsTest is Test, Deployers {
 
         assertGt(_countMatches(reads, configSlot), 0, "the config slot was never read");
 
-        assertEq(_countMatches(reads, spillSlot), 0, "config spilled into a second slot (read)");
+        assertGt(_countMatches(reads, secondSlot), 0, "the variable-leg minimums were never read");
 
-        assertEq(_countMatches(writes, spillSlot), 0, "config spilled into a second slot (write)");
+        assertEq(_countMatches(reads, spillSlot), 0, "config spilled into a third slot (read)");
+
+        assertEq(_countMatches(writes, spillSlot), 0, "config spilled into a third slot (write)");
     }
 
     function _countMatches(bytes32[] memory values, bytes32 target) internal pure returns (uint256 count) {
@@ -450,7 +465,7 @@ contract BondThresholdsTest is Test, Deployers {
         // which would make this a partial-fill test rather than a threshold-selection one.
         uint256 amount = bound(uint256(rawAmount), 1e6, 1e9);
 
-        hook.setPoolConfig(key_, min0, min1, true);
+        hook.setPoolConfig(key_, min0, min1, 10_000, 10_000, true);
 
         uint256 applicable = zeroForOne ? uint256(min0) : uint256(min1);
 

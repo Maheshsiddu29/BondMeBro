@@ -150,8 +150,22 @@ contract BondMeBro is BaseHook {
         uint128 minBondedAmount0;
         /// @dev Minimum consumed input in raw currency1 units; used when zeroForOne is false.
         uint96 minBondedAmount1;
-        /// @dev Whether this pool takes collateral. Disabling clears both stored thresholds.
+        /// @dev Whether this pool takes collateral. Disabling clears all four stored thresholds.
         bool bondingEnabled;
+        /// @dev Minimum variable leg in raw currency0 units, used when the collateral is currency0.
+        ///
+        ///      A SECOND THRESHOLD IN A DIFFERENT CURRENCY, and the two are not interchangeable.
+        ///      An exact-input swap pays its collateral out of the token it RECEIVES, so the size
+        ///      of the trade's input says nothing about how many raw units the collateral is a
+        ///      fraction of. On a pool whose two tokens differ in decimals or in unit value those
+        ///      numbers can be many orders of magnitude apart, and an input-side minimum cannot
+        ///      keep the output side above the point where the collateral rounds down to nothing.
+        ///
+        ///      This threshold is measured in the collateral's own currency, which is the only
+        ///      currency in which that question can be asked.
+        uint128 minVariableLeg0;
+        /// @dev Minimum variable leg in raw currency1 units, used when the collateral is currency1.
+        uint128 minVariableLeg1;
     }
 
     /// @notice Pool identifier and currencies shared by all bonds in that pool.
@@ -283,7 +297,14 @@ contract BondMeBro is BaseHook {
     /// @param minBondedAmount0 Supplied minimum in raw currency0 input units.
     /// @param minBondedAmount1 Supplied minimum in raw currency1 input units.
     /// @param bondingEnabled Whether bonding is enabled after this call.
-    event PoolConfigured(PoolId indexed id, uint128 minBondedAmount0, uint96 minBondedAmount1, bool bondingEnabled);
+    event PoolConfigured(
+        PoolId indexed id,
+        uint128 minBondedAmount0,
+        uint96 minBondedAmount1,
+        uint128 minVariableLeg0,
+        uint128 minVariableLeg1,
+        bool bondingEnabled
+    );
 
     /// @notice Records collateral taken from a completed swap.
     /// @param id Pool where the swap executed.
@@ -323,6 +344,11 @@ contract BondMeBro is BaseHook {
 
     /// @notice Only the owner may change pool participation settings.
     error NotOwner();
+
+    /// @notice A variable-leg minimum was below the smallest value that can produce collateral.
+    /// @param provided The rejected threshold, in raw units of its currency.
+    /// @param required The smallest accepted value, which is `BPS`.
+    error VariableLegMinimumTooSmall(uint256 provided, uint256 required);
 
     /// @notice Deployment requires a non-zero owner because ownership cannot be replaced later.
     error ZeroOwner();
@@ -430,27 +456,61 @@ contract BondMeBro is BaseHook {
         });
     }
 
-    /// @notice Enables or disables bonding and sets a minimum input for each swap direction.
-    /// @dev Enabling requires both thresholds to be positive. Disabling stores zero
-    /// thresholds regardless of the supplied amounts. Neither operation changes the
-    /// fixed collateral curve, cap, ten-block horizon or settlement dead zone.
+    /// @notice Enables or disables bonding and sets the two minimums a swap must clear to bond.
+    /// @dev There are two thresholds because the two amounts are in different currencies.
+    /// The first asks whether the trade spent enough of the token it PAYS WITH to take
+    /// part. The second asks whether the leg the collateral is carved from is large
+    /// enough to carve anything out of, and for an exact-input swap that is the token
+    /// the trade RECEIVES. On a pool whose tokens differ in decimals or in unit value the
+    /// two can be many orders of magnitude apart in raw units, so one cannot stand in for
+    /// the other.
+    ///
+    /// Enabling requires all four minimums to be positive, and the variable-leg minimums
+    /// to be at least BPS raw units. That floor is what guarantees a bonded swap always
+    /// produces at least one raw unit of collateral. Disabling stores zeros regardless of
+    /// the supplied amounts. Neither operation changes the fixed collateral curve, cap,
+    /// ten-block horizon or settlement dead zone.
     ///
     /// Lowering a threshold can make a previously unbonded quote require hookData.
     /// A transaction carrying empty data then reverts; it cannot silently take a bond
-    /// without a recipient and ceiling. Extremely small thresholds are unsupported:
-    /// a positive rate can round to zero tokens, which the strict bond bound rejects.
-    /// The thresholds ration participation, not trader intent.
+    /// without a recipient and ceiling. The thresholds ration participation, not trader
+    /// intent: a trade under either one executes in full and simply does not bond.
     ///
     /// @param key Pool to configure.
     /// @param minBondedAmount0 Minimum actual input in raw currency0 units; ignored when disabling.
     /// @param minBondedAmount1 Minimum actual input in raw currency1 units; ignored when disabling.
+    /// @param minVariableLeg0 Minimum variable leg in raw currency0 units, used when the collateral
+    /// is currency0; at least BPS, ignored when disabling.
+    /// @param minVariableLeg1 Minimum variable leg in raw currency1 units, used when the collateral
+    /// is currency1; at least BPS, ignored when disabling.
     /// @param bondingEnabled Whether the pool takes collateral.
-    function setPoolConfig(PoolKey calldata key, uint128 minBondedAmount0, uint96 minBondedAmount1, bool bondingEnabled)
-        external
-        onlyOwner
-    {
+    function setPoolConfig(
+        PoolKey calldata key,
+        uint128 minBondedAmount0,
+        uint96 minBondedAmount1,
+        uint128 minVariableLeg0,
+        uint128 minVariableLeg1,
+        bool bondingEnabled
+    ) external onlyOwner {
         if (bondingEnabled && (minBondedAmount0 == 0 || minBondedAmount1 == 0)) {
             revert IncompleteBondingConfig(minBondedAmount0, minBondedAmount1);
+        }
+
+        // THE FLOOR IS WHAT MAKES A ZERO COLLATERAL IMPOSSIBLE, and it is one comparison here
+        // instead of a division on every swap.
+        //
+        // Collateral is `variableLeg * collateralBps / BPS`, truncated. The rate is at least 1 when
+        // a trade bonds at all, so a leg of `BPS` raw units or more always produces at least one
+        // raw unit of collateral. Requiring that here means an eligible trade can never reach the
+        // zero-collateral rejection further down, whatever the pool's tokens or price.
+        //
+        // In practical terms `BPS` is 10,000 raw units: a hundredth of a unit for a six-decimal
+        // token, and a vanishing fraction of one for an eighteen-decimal token. It only becomes a
+        // meaningful amount for a token with very few decimals, which is worth checking before
+        // enabling bonding on such a pool.
+        if (bondingEnabled) {
+            if (minVariableLeg0 < BPS) revert VariableLegMinimumTooSmall(minVariableLeg0, BPS);
+            if (minVariableLeg1 < BPS) revert VariableLegMinimumTooSmall(minVariableLeg1, BPS);
         }
 
         PoolId id = key.toId();
@@ -458,10 +518,12 @@ contract BondMeBro is BaseHook {
         poolConfig[id] = PoolConfig({
             minBondedAmount0: bondingEnabled ? minBondedAmount0 : 0,
             minBondedAmount1: bondingEnabled ? minBondedAmount1 : 0,
-            bondingEnabled: bondingEnabled
+            bondingEnabled: bondingEnabled,
+            minVariableLeg0: bondingEnabled ? minVariableLeg0 : 0,
+            minVariableLeg1: bondingEnabled ? minVariableLeg1 : 0
         });
 
-        emit PoolConfigured(id, minBondedAmount0, minBondedAmount1, bondingEnabled);
+        emit PoolConfigured(id, minBondedAmount0, minBondedAmount1, minVariableLeg0, minVariableLeg1, bondingEnabled);
     }
 
     /// @notice Registers a pool and starts its accumulator at the actual initialization tick.
@@ -786,6 +848,33 @@ contract BondMeBro is BaseHook {
             }
 
             variableLeg = c.exactInput ? (c.outputDelta > 0 ? uint256(c.outputDelta) : 0) : actualInput;
+
+            // THE SECOND GATE, AND IT IS IN A DIFFERENT CURRENCY FROM THE FIRST.
+            //
+            // The check above asked whether the trade spent enough of the INPUT token to take part
+            // at all. This one asks whether the leg the collateral is actually carved from is large
+            // enough to carve anything out of.
+            //
+            // For an exact-input swap those are two different tokens: the trade pays its collateral
+            // out of what it RECEIVES, and on a pool whose tokens differ in decimals or in unit
+            // value the received amount can be many orders of magnitude smaller in raw units than
+            // the amount spent. Without this gate such a trade would compute a collateral of zero
+            // and be rejected outright, turning an ordinary small trade into a failed one.
+            //
+            // For an exact-output swap the leg IS the consumed input, so both gates measure the
+            // same amount and whichever is stricter decides. The check stays unconditional so the
+            // swap path carries no special case.
+            //
+            // `setPoolConfig` refuses a minimum below `BPS`, so a trade that clears this gate is
+            // guaranteed to produce at least one raw unit of collateral below.
+            uint256 minLeg =
+                _collateralIsCurrency0(c.zeroForOne, c.exactInput) ? cfg.minVariableLeg0 : cfg.minVariableLeg1;
+
+            if (variableLeg < minLeg) {
+                _clearProvisionalBond(bondId);
+
+                return int128(0);
+            }
         }
 
         // slither-disable-next-line incorrect-equality
@@ -797,6 +886,15 @@ contract BondMeBro is BaseHook {
 
         uint256 bond = (variableLeg * c.collateralBps) / BPS;
 
+        // A LAST-RESORT GUARD RATHER THAN THE WORKING CHECK.
+        //
+        // The variable-leg minimum already guarantees a positive collateral for any trade that
+        // reaches this point: a leg of at least `BPS` raw units, multiplied by a rate of at least
+        // one basis point, cannot truncate to zero. The upper half is equally unreachable while the
+        // rate is capped at one percent. Both stay because this bound is the property the custody
+        // path exists to uphold, and a guard that never fires is cheap insurance against a later
+        // change reopening the gap.
+        //
         // slither-disable-next-line incorrect-equality
         if (bond == 0 || bond >= variableLeg) {
             revert BondViolatesNoOpVLBound(bond, variableLeg);

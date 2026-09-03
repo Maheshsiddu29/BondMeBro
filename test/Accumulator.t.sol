@@ -73,7 +73,7 @@ contract AccumulatorTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -247,7 +247,7 @@ contract AccumulatorTest is Test, Deployers {
     /// @notice An unconfigured pool — which can never bond — must still advance its accumulator.
     /// @dev The cheapest path in the contract, and the one most likely to acquire an early return.
     function test_unconfiguredPool_stillAdvancesAccumulator() public {
-        hook.setPoolConfig(key_, 0, 0, false);
+        hook.setPoolConfig(key_, 0, 0, 0, 0, false);
         _assertSwapAdvances(-1e16, true, "");
     }
 

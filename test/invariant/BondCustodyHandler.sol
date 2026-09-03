@@ -689,7 +689,7 @@ contract BondCustodyHandler is Test {
 
     /// @dev Returns the bonding threshold denominated in the input currency for the selected direction.
     function _threshold(bool zeroForOne) internal view returns (uint256) {
-        (uint128 min0, uint96 min1,) = hook.poolConfig(key_.toId());
+        (uint128 min0, uint96 min1,,,) = hook.poolConfig(key_.toId());
 
         return zeroForOne ? uint256(min0) : uint256(min1);
     }

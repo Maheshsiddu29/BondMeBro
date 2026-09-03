@@ -139,7 +139,7 @@ contract SharedCurrencySolvencyTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /// @dev Swaps so that the resulting bond's COLLATERAL is denominated in USDC, whichever side

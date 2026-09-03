@@ -80,7 +80,7 @@ contract MaturityCheckpointGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     function _swap(int256 amountSpecified, bool zeroForOne, bytes memory hookData) internal {

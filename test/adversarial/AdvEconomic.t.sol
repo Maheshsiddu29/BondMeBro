@@ -800,12 +800,19 @@ contract AdvEconomicTest is AdversarialBase {
         assertGe(ourAt100, ourAt99, "the adopted form lost a wei as the impact rose");
     }
 
-    /// @notice A bond whose collateral rounds to zero is REJECTED, never finalized at zero.
+    /// @notice A bond whose collateral would round to zero is DECLINED, never finalized at zero.
     ///
-    /// @dev The lower half of INV-NOOP-VL, driven through a real pool. A zero-collateral finalized
-    ///      record would be a maturity obligation with nothing behind it — refundable to nobody and
-    ///      counted in `pendingBonds` forever.
-    function test_adv12_zeroCollateralBondIsRejectedNotFinalized() public {
+    /// @dev The lower half of INV-NOOP-VL, driven through a real pool. The invariant is unchanged:
+    ///      a zero-collateral finalized record would be a maturity obligation with nothing behind
+    ///      it — refundable to nobody and counted in `pendingBonds` forever, so it must never be
+    ///      written.
+    ///
+    ///      WHAT CHANGED IS THE DISPOSAL, NOT THE INVARIANT. Such a swap used to revert; it is now
+    ///      turned away from bonding and executes unbonded. Rejecting the whole trade also rejected
+    ///      ordinary small trades on pools whose two tokens differ in decimals, where the variable
+    ///      leg is measured in a currency the input threshold does not bound. The assertion that
+    ///      matters here — nothing finalized, nothing pending — is asserted exactly as before.
+    function test_adv12_zeroCollateralBondIsDeclinedNotFinalized() public {
         (PoolKey memory thinKey, PoolId thinId) =
             initPool(currency0, currency1, IHooks(address(hook)), 500, TickMath.getSqrtPriceAtTick(0));
 
@@ -852,17 +859,22 @@ contract AdvEconomicTest is AdversarialBase {
 
         vm.revertToState(baseline);
 
-        hook.setPoolConfig(thinKey, 1, 1, true);
+        hook.setPoolConfig(thinKey, 1, 1, 10_000, 10_000, true);
 
-        vm.expectRevert();
+        assertLt(observedLeg, 10_000, "the leg was not actually below the minimum: the test proves nothing");
 
+        uint256 hookBefore = currency1.balanceOf(address(hook));
+
+        // Executes rather than reverting — and pays nothing.
         _swapOn(thinKey, -int256(chosen), true, _hookData());
 
-        // Nothing was created by the rejected attempt.
+        assertEq(currency1.balanceOf(address(hook)), hookBefore, "a declined swap still took collateral");
+
+        // Nothing was created by the declined attempt.
         uint32 m = _maturityOfNow();
 
         (,,, uint32 pending,) = hook.maturity(thinId, m);
 
-        assertEq(pending, 0, "a rejected zero-collateral swap registered a liability");
+        assertEq(pending, 0, "a declined zero-collateral swap registered a liability");
     }
 }

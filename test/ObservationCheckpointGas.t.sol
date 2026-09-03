@@ -122,7 +122,7 @@ contract ObservationCheckpointGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -195,6 +195,14 @@ silently treat it as a quote of pool input before collateral.
 
 ## 6. Reading a bond back
 
+**A successful swap does not always create a bond.** A pool sets two minimums: one on the input the
+trade consumes, and one on the leg the collateral is carved from — which for an exact-input swap is
+the *output*, a different token. A trade under either one, or one that does not move the price by a
+whole tick, executes in full and takes no collateral. There is no bond, no `BondOpened` event and
+nothing to settle. This is a normal outcome, not an error, and integrator code must not assume a
+bond exists just because the swap succeeded. Take the bond ID from the `BondOpened` event and treat
+its absence as "unbonded".
+
 Bond IDs are deterministic:
 
 ```solidity

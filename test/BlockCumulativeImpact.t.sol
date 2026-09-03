@@ -82,7 +82,7 @@ contract BlockCumulativeImpactTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, 1, 1, true);
+        hook.setPoolConfig(key_, 1, 1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -331,7 +331,7 @@ contract BlockCumulativeImpactTest is Test, Deployers {
     ///      behind the branch, a pool switched on mid-block would price its first bonded swap
     ///      against a stale or unwritten latch.
     function test_s4_latchIsCorrectWhenBondingIsEnabledMidBlock() public {
-        hook.setPoolConfig(key_, 1, 1, false);
+        hook.setPoolConfig(key_, 1, 1, 0, 0, false);
 
         int24 start = _tick();
 
@@ -339,7 +339,7 @@ contract BlockCumulativeImpactTest is Test, Deployers {
 
         assertEq(hook.blockStartTickOf(id_), start, "latch did not advance while bonding was disabled");
 
-        hook.setPoolConfig(key_, 1, 1, true);
+        hook.setPoolConfig(key_, 1, 1, 10_000, 10_000, true);
 
         int24 tickBefore = _tick();
 

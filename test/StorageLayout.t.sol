@@ -118,7 +118,7 @@ contract StorageLayoutTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -330,27 +330,34 @@ contract StorageLayoutTest is Test, Deployers {
     ///      read it back through the public getter, catching a layout change as a side effect of
     ///      testing something else. That helper became inert when Model L stopped reading
     ///      `bondBps` as a rate, so the check belongs here instead, stated as its own claim.
-    function test_poolConfig_packsIntoExactlyOneSlot() public view {
+    function test_poolConfig_packsIntoExactlyTwoSlots() public view {
         bytes32 base = keccak256(abi.encode(id_, SLOT_POOL_CONFIG));
 
-        assertEq(
-            uint256(vm.load(address(hook), bytes32(uint256(base) + 1))),
-            0,
-            "PoolConfig spilled into a second slot: every swap now pays an extra SLOAD"
-        );
+        (uint128 min0, uint96 min1, bool bondingEnabled, uint128 leg0, uint128 leg1) = hook.poolConfig(id_);
 
-        (uint128 min0, uint96 min1, bool bondingEnabled) = hook.poolConfig(id_);
+        // SLOT 0 is unchanged: the input thresholds and the enable flag sit exactly where they did
+        // before the variable-leg minimums were added, so nothing above them shifted.
+        uint256 word0 = uint256(vm.load(address(hook), base));
 
-        uint256 word = uint256(vm.load(address(hook), base));
+        assertEq(uint128(word0), min0, "minBondedAmount0 offset");
+        assertEq(uint96(word0 >> 128), min1, "minBondedAmount1 offset");
+        assertEq((uint8(word0 >> 224) & 0xFF) != 0, bondingEnabled, "bondingEnabled is not at offset 28");
 
-        assertEq(uint128(word), min0, "minBondedAmount0 offset");
-        assertEq(uint96(word >> 128), min1, "minBondedAmount1 offset");
-        assertEq((uint8(word >> 224) & 0xFF) != 0, bondingEnabled, "bondingEnabled is not at offset 28");
+        // The slot still uses 29 of its 32 bytes. The three spare high bytes must read as zero: a
+        // stale field left behind by an incomplete removal would sit exactly there.
+        assertEq(uint24(word0 >> 232), 0, "PoolConfig's spare high bytes are not zero");
 
-        // P-L2-7 replaced two `uint16` economic fields with one `bool`, so the slot now uses 29
-        // of its 32 bytes rather than all 32. The three freed bytes must read as zero: a stale
-        // `refundToleranceTicks` left behind by an incomplete removal would sit exactly there.
-        assertEq(uint24(word >> 232), 0, "PoolConfig's freed high bytes are not zero");
+        // SLOT 1 holds the two variable-leg minimums, in raw units of currency0 and currency1.
+        // These could not go in slot 0: only three bytes were free there, and a threshold that
+        // narrow cannot express an ordinary token amount.
+        uint256 word1 = uint256(vm.load(address(hook), bytes32(uint256(base) + 1)));
+
+        assertEq(uint128(word1), leg0, "minVariableLeg0 is not at slot 1 offset 0");
+        assertEq(uint128(word1 >> 128), leg1, "minVariableLeg1 is not at slot 1 offset 16");
+
+        // TWO SLOTS AND NOT THREE. A third would be a real regression rather than a deliberate
+        // widening, so it is asserted separately.
+        assertEq(uint256(vm.load(address(hook), bytes32(uint256(base) + 2))), 0, "PoolConfig spilled into a third slot");
     }
 
     /// @notice `MaturityCheckpoint` occupies exactly one slot, with all FIVE fields at the offsets

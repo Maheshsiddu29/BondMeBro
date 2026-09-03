@@ -127,9 +127,22 @@ contract FrozenParametersTest is Test, Deployers {
     ///      this a test rather than a comment.
     function test_frozen_noSetterExposesAnEconomicParameter() public pure {
         // The one owner-facing mutator, and its exact shape.
+        //
+        // THE SIGNATURE CHANGED DELIBERATELY, and the point of this test survives the change. It
+        // gained two variable-leg minimums, which are eligibility gates in raw token units -- the
+        // same kind of parameter the two amounts beside them already were. They decide WHICH trades
+        // take part, never what participation costs.
+        //
+        // What this test exists to catch is an owner gaining control over the PRICE of the
+        // mechanism: the collateral scale, the cap, the dead zone or the observation window. None
+        // of those appears here, and the assertions above pin them as compile-time constants with
+        // no setter at all. If a future edit adds a rate, a cap or a window to this signature, this
+        // comparison fails and that is the intended alarm.
         assertEq(
             BondMeBro.setPoolConfig.selector,
-            bytes4(keccak256("setPoolConfig((address,address,uint24,int24,address),uint128,uint96,bool)")),
+            bytes4(
+                keccak256("setPoolConfig((address,address,uint24,int24,address),uint128,uint96,uint128,uint128,bool)")
+            ),
             "setPoolConfig's signature changed: check nothing economic was added to it"
         );
     }

@@ -114,7 +114,7 @@ contract BondCustodyTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -484,29 +484,39 @@ contract BondCustodyTest is Test, Deployers {
                         INV-NOOP-VL  (INV-L2-1)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice The LOWER half of INV-NOOP-VL: a bond that rounds to zero must revert, not proceed.
+    /// @notice A variable leg too small to carve collateral from is DECLINED, not reverted.
     ///
-    /// @dev This is the reachable half, and reaching it needs care, so the construction is spelled
-    ///      out.
+    /// @dev THIS TEST USED TO ASSERT A REVERT, and flipping it is the point of the change rather
+    ///      than a casualty of it. Reverting here was a real availability defect: the trade that
+    ///      gets rejected is an ordinary small one, and on a pool whose two tokens differ in
+    ///      decimals it is not small at all in human terms -- only in the raw units of the leg the
+    ///      collateral is taken from. Whole size bands of honest trades were unexecutable.
     ///
-    ///      There are two different ways a bonded swap can end up with no collateral, and the hook
-    ///      treats them as opposites:
+    ///      There are three ways a bonded swap can end up taking no collateral, and the hook now
+    ///      treats the first two the same way:
     ///
-    ///        collateralBps == 0  -- the price did not move a whole tick. There is no LP-risk
-    ///                               signal to price, so the swap is UNBONDED. No record, no
-    ///                               revert, no obligation. This is a normal outcome.
+    ///        leg < minVariableLeg -- the leg is too small to carve a bond out of. The swap is
+    ///                               UNBONDED: it executes in full, pays nothing, records nothing.
     ///
-    ///        collateralBps  > 0  but `leg * bps / 10_000 == 0` -- the price DID move, so a bond
-    ///                               is owed, but the variable leg is so small that the collateral
-    ///                               truncates away. Proceeding here would finalize a bond record
-    ///                               carrying zero collateral: a maturity obligation with nothing
-    ///                               behind it, refundable to nobody. This must revert.
+    ///        collateralBps == 0  -- the price did not move a whole tick. No LP-risk signal to
+    ///                               price, so again UNBONDED. A normal outcome.
     ///
-    ///      Only the second is INV-NOOP-VL's lower bound. Producing it requires a pool thin enough
-    ///      that a sub-10,000-wei swap still crosses a tick, which is why this test builds its own
-    ///      pool instead of using the fixture: on `POOL_LIQUIDITY` no amount small enough to
-    ///      truncate could ever move the price.
-    function test_invNoOpVL_bondRoundingToZero_reverts() public {
+    ///        leg * bps / 10_000 == 0 with both gates cleared -- NOW UNREACHABLE. A leg of at
+    ///                               least `BPS` raw units at a rate of at least one basis point
+    ///                               always yields a positive collateral, and `setPoolConfig`
+    ///                               refuses a minimum below `BPS`. The revert survives as a
+    ///                               last-resort guard; the companion test below proves it can no
+    ///                               longer fire.
+    ///
+    ///      What has NOT changed is the invariant itself: a zero-collateral bond is still never
+    ///      finalized. The swap is turned away from bonding instead of being turned away entirely,
+    ///      so this test asserts what the declined path must leave behind -- no collateral moved,
+    ///      no maturity liability, and a trade that actually executed.
+    ///
+    ///      The construction still needs a pool thin enough that a sub-10,000-unit swap crosses a
+    ///      tick, which is why it builds its own pool rather than using the fixture: on
+    ///      `POOL_LIQUIDITY` no amount that small could ever move the price.
+    function test_invNoOpVL_bondRoundingToZero_isDeclinedNotReverted() public {
         // A separate pool on the same hook, on a DIFFERENT fee tier so the PoolKey differs from
         // the fixture's, and with almost no liquidity so a few hundred wei still crosses a tick.
         (PoolKey memory thinKey, PoolId thinId) =
@@ -572,15 +582,16 @@ contract BondCustodyTest is Test, Deployers {
         // reproduces the identical tick move and identical leg measured above.
         vm.revertToState(baseline);
 
-        hook.setPoolConfig(thinKey, 1, 1, true);
+        // The lowest variable-leg minimum the hook will accept. Even at the floor, a leg of
+        // `observedLeg` units is below it -- that is precisely what made the collateral truncate.
+        hook.setPoolConfig(thinKey, 1, 1, 10_000, 10_000, true);
 
-        vm.expectRevert(
-            _wrappedIn(
-                IHooks.afterSwap.selector,
-                abi.encodeWithSelector(BondMeBro.BondViolatesNoOpVLBound.selector, uint256(0), observedLeg)
-            )
-        );
+        assertLt(observedLeg, 10_000, "the leg was not actually below the minimum: the test proves nothing");
 
+        uint256 hookBefore = currency1.balanceOf(address(hook));
+        uint256 traderBefore = currency1.balanceOf(address(this));
+
+        // No `expectRevert`: the swap must go through.
         swapRouter.swap(
             thinKey,
             SwapParams({
@@ -589,6 +600,49 @@ contract BondCustodyTest is Test, Deployers {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             _validHookData()
         );
+
+        // The trade executed and kept its whole output: declined means unbonded, not discounted.
+        assertEq(
+            currency1.balanceOf(address(this)) - traderBefore,
+            observedLeg,
+            "the declined swap did not deliver its full output"
+        );
+
+        assertEq(currency1.balanceOf(address(hook)), hookBefore, "a declined swap still took collateral");
+
+        // And it left no obligation behind.
+        (,,, uint32 pending,) = hook.maturity(thinId, uint32(block.number) + hook.OBSERVATION_BLOCKS());
+
+        assertEq(pending, 0, "a declined swap registered a maturity liability");
+    }
+
+    /// @notice ...and the zero-collateral branch the old test drove is now unreachable by
+    ///         arithmetic, so the guard behind it can no longer fire.
+    ///
+    /// @dev The coverage the rewrite above gives up is restated here as what it now is: a fact
+    ///      about two enforced bounds rather than a live branch.
+    ///
+    ///          leg >= BPS            enforced by `setPoolConfig`, which refuses a smaller minimum
+    ///          bps >= 1              anything less is the unbonded path, checked before the divide
+    ///
+    ///          bond = leg * bps / 10_000  >=  10_000 * 1 / 10_000  =  1  >  0
+    ///
+    ///      If anyone ever lowers the configurable floor below `BPS`, this fails and points at the
+    ///      guard that would become reachable again.
+    function test_invNoOpVL_lowerBoundIsUnreachableUnderTheLegMinimum() public {
+        // The floor is enforced, not merely documented.
+        vm.expectRevert(abi.encodeWithSelector(BondMeBro.VariableLegMinimumTooSmall.selector, uint256(9_999), 10_000));
+
+        hook.setPoolConfig(key_, 1, 1, 9_999, 10_000, true);
+
+        vm.expectRevert(abi.encodeWithSelector(BondMeBro.VariableLegMinimumTooSmall.selector, uint256(0), 10_000));
+
+        hook.setPoolConfig(key_, 1, 1, 10_000, 0, true);
+
+        // And at the floor, every legal rate still yields at least one raw unit.
+        for (uint256 bps = 1; bps <= hook.MAX_BOND_BPS(); bps++) {
+            assertGt((uint256(10_000) * bps) / 10_000, 0, "a leg at the enforced floor truncated to zero collateral");
+        }
     }
 
     /// @notice The UPPER half of INV-NOOP-VL cannot be reached, and this proves WHY rather than
@@ -882,7 +936,7 @@ contract BondCustodyTest is Test, Deployers {
 
     /// @notice A pool with bonding disabled never takes collateral.
     function test_unconfiguredPool_neverBonds() public {
-        hook.setPoolConfig(key_, 0, 0, false);
+        hook.setPoolConfig(key_, 0, 0, 0, 0, false);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -902,7 +956,7 @@ contract BondCustodyTest is Test, Deployers {
 
     /// @notice Exact-output swaps on a pool with bonding disabled do not require hookData.
     function test_exactOutput_onDisabledPool_needsNoHookData() public {
-        hook.setPoolConfig(key_, 0, 0, false);
+        hook.setPoolConfig(key_, 0, 0, 0, 0, false);
 
         uint256 hookBefore0 = currency0.balanceOf(address(hook));
 
@@ -940,7 +994,7 @@ contract BondCustodyTest is Test, Deployers {
     function _expectIncomplete(uint128 min0, uint96 min1) internal {
         vm.expectRevert(abi.encodeWithSelector(BondMeBro.IncompleteBondingConfig.selector, min0, min1));
 
-        hook.setPoolConfig(key_, min0, min1, true);
+        hook.setPoolConfig(key_, min0, min1, 10_000, 10_000, true);
     }
 
     /// @notice Disabling ignores the thresholds passed alongside it, and clears what was stored.
@@ -951,16 +1005,16 @@ contract BondCustodyTest is Test, Deployers {
     ///      cannot silently inherit numbers set months earlier by someone else.
     function test_setPoolConfig_disablingClearsTheThresholds() public {
         // Enabled with real thresholds first, so there is something to clear.
-        (uint128 before0, uint96 before1, bool enabledBefore) = hook.poolConfig(id_);
+        (uint128 before0, uint96 before1, bool enabledBefore,,) = hook.poolConfig(id_);
 
         assertTrue(enabledBefore, "fixture: the pool should start enabled");
         assertGt(before0, 0, "fixture: the pool should start with a currency0 threshold");
         assertGt(before1, 0, "fixture: the pool should start with a currency1 threshold");
 
         // Non-zero thresholds passed alongside `false` must be ignored, not stored.
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, false);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 0, 0, false);
 
-        (uint128 min0, uint96 min1, bool enabled) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, bool enabled,,) = hook.poolConfig(id_);
 
         assertFalse(enabled, "bonding was not disabled");
         assertEq(min0, 0, "currency0 threshold was not cleared on disable");
@@ -969,7 +1023,7 @@ contract BondCustodyTest is Test, Deployers {
 
     /// @notice A disabled pool takes no collateral, in either swap kind.
     function test_disabledPool_bondsNothing() public {
-        hook.setPoolConfig(key_, 0, 0, false);
+        hook.setPoolConfig(key_, 0, 0, 0, 0, false);
 
         uint256 hook0 = currency0.balanceOf(address(hook));
         uint256 hook1 = currency1.balanceOf(address(hook));
@@ -997,7 +1051,7 @@ contract BondCustodyTest is Test, Deployers {
 
         vm.expectRevert(BondMeBro.NotOwner.selector);
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /// @notice Swap callbacks cannot be called directly by arbitrary addresses.

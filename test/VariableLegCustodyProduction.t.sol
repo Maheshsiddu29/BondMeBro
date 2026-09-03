@@ -93,7 +93,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -345,7 +345,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
     ///      second half, a hook that simply never bonded would pass.
     function test_inv_L2_13_eligibilityFollowsTheConsumedInput() public {
         // Measure what a tightly limited swap actually fills, with bonding effectively off.
-        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, true);
+        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, 10_000, 10_000, true);
 
         uint256 probe = vm.snapshotState();
 
@@ -370,7 +370,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
         // Requested `SWAP_SIZE`, fills `realizedFill`. A threshold strictly between the two is
         // satisfied by the request and not by the fill, so the two rules disagree here and only
         // here.
-        hook.setPoolConfig(key_, uint128(realizedFill + 1), uint96(realizedFill + 1), true);
+        hook.setPoolConfig(key_, uint128(realizedFill + 1), uint96(realizedFill + 1), 10_000, 10_000, true);
 
         assertLt(realizedFill + 1, SWAP_SIZE, "the fixture cannot separate the request from the fill");
 
@@ -387,7 +387,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
         vm.revertToState(probe);
 
         // CASE B -- threshold exactly AT the fill. Eligibility is inclusive, so this bonds.
-        hook.setPoolConfig(key_, uint128(realizedFill), uint96(realizedFill), true);
+        hook.setPoolConfig(key_, uint128(realizedFill), uint96(realizedFill), 10_000, 10_000, true);
 
         hookBefore1 = currency1.balanceOf(address(hook));
 
@@ -402,7 +402,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
         vm.revertToState(probe);
 
         // CASE C -- threshold one unit BELOW the fill. Comfortably eligible.
-        hook.setPoolConfig(key_, uint128(realizedFill - 1), uint96(realizedFill - 1), true);
+        hook.setPoolConfig(key_, uint128(realizedFill - 1), uint96(realizedFill - 1), 10_000, 10_000, true);
 
         hookBefore1 = currency1.balanceOf(address(hook));
 
@@ -569,7 +569,7 @@ contract VariableLegCustodyProductionTest is Test, Deployers {
     /// @dev Stages the zero-impact case: threshold down to 1, price nudged off the tick boundary,
     ///      then a fresh block so the dust swap's maturity bucket is its own.
     function _prepareZeroImpactCase() internal {
-        hook.setPoolConfig(key_, 1, 1, true);
+        hook.setPoolConfig(key_, 1, 1, 10_000, 10_000, true);
 
         // Move the price into the interior of a tick. This swap bonds, which is why the roll below
         // is needed: its liability belongs to an earlier bucket than the one being swept.

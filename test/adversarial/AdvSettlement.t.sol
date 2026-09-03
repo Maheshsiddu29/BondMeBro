@@ -47,7 +47,7 @@ contract AdvSettlementTest is AdversarialBase {
             ""
         );
 
-        hook.setPoolConfig(keyB, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(keyB, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////

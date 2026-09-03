@@ -103,7 +103,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
 
         // MockV4Router inherits the real V4Router exact-output and
         // amountInMaximum logic. It only provides the test payment plumbing.
@@ -364,7 +364,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.revertToState(snap);
 
-        hook.setPoolConfig(key_, uint128(grossProbe + 1), uint96(grossProbe + 1), true);
+        hook.setPoolConfig(key_, uint128(grossProbe + 1), uint96(grossProbe + 1), 10_000, 10_000, true);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -416,7 +416,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
         // sub-tick again.
         vm.roll(block.number + 1);
 
-        hook.setPoolConfig(key_, 1, 1, true);
+        hook.setPoolConfig(key_, 1, 1, 10_000, 10_000, true);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
         uint256 traderBefore1 = currency1.balanceOf(address(this));
@@ -440,29 +440,52 @@ contract BondCustodyExactOutputTest is Test, Deployers {
         assertEq(currency1.balanceOf(address(this)) - traderBefore1, 100, "the swap did not deliver its output");
     }
 
-    /// @notice ADR-0008 § 10 CONFIGURATION BOUNDARY. A dust swap in an already-displaced block
-    ///         bonds, and reverts on INV-NOOP-VL if its collateral truncates to zero.
+    /// @notice A dust swap in an already-displaced block is DECLINED, not reverted.
     ///
-    /// @dev REPORTED RATHER THAN PATCHED, and the choice is deliberate. The alternative -- treating
-    ///      a zero-truncating collateral as "unbonded" instead of reverting -- would create an
-    ///      execution path that moves the price and pays nothing, which is a dust-sized reopening
-    ///      of exactly the sub-tick free expansion ADR-0008 exists to close. Failing closed is the
-    ///      safer half of the trade, and it never finalizes a zero-collateral bond either way.
+    /// @dev PREVIOUSLY REPORTED AS AN ACCEPTED BOUNDARY, AND THAT JUDGEMENT WAS WRONG. The
+    ///      reasoning recorded here used to be that failing closed was the safer half of the
+    ///      trade, because treating a zero-truncating collateral as unbonded would create an
+    ///      execution path that moves the price and pays nothing -- a dust-sized reopening of the
+    ///      sub-tick free expansion.
     ///
-    ///      REACHABLE ONLY AT AN ABSURD THRESHOLD. It needs `minBondedAmount` low enough to admit
-    ///      a variable leg under `BPS / collateralBps` wei -- at most 100 wei at the cap, 667 at
-    ///      15 bps. The next test shows a realistic threshold makes it unreachable.
-    function test_exactOutput_dustInADisplacedBlock_revertsOnInvNoOpVL() public {
-        hook.setPoolConfig(key_, 1, 1, true);
+    ///      What that missed is that the same branch also rejects trades which are not dust at
+    ///      all. The variable leg is measured in the collateral currency, and on a pool whose two
+    ///      tokens differ in decimals an ordinary trade can produce a leg of only a few thousand
+    ///      raw units. Those trades were unexecutable, which is a far larger cost than the dust
+    ///      leakage that failing closed was buying.
+    ///
+    ///      The gate is now explicit and the exemption is bounded rather than open-ended. A leg
+    ///      below the configured minimum is unbonded, and the collateral that escapes is at most
+    ///
+    ///          (minVariableLeg - 1) * MAX_BOND_BPS / BPS
+    ///
+    ///      raw units per swap -- 99 units at the enforced floor of `BPS`, which on an 18-decimal
+    ///      token is 1e-16 of a token. The bound scales with the operator's chosen minimum, so it
+    ///      is the operator's threshold, not the floor, that governs in production. See
+    ///      `VariableLegMinimum.t.sol` for the swept bound and the split case.
+    function test_exactOutput_dustInADisplacedBlock_isDeclinedNotReverted() public {
+        hook.setPoolConfig(key_, 1, 1, 10_000, 10_000, true);
 
         // Displace the block.
         _swapExactOut(1e16, true, _validHookData());
 
-        // Same block, dust leg: the effective impact is the block displacement, so this bonds --
-        // and 102 wei at that rate truncates to zero collateral.
-        vm.expectRevert();
+        uint256 hookBefore = currency0.balanceOf(address(hook));
 
+        uint32 m = uint32(block.number) + hook.OBSERVATION_BLOCKS();
+
+        // The displacing swap bonded normally, so the count is already one. What matters is that
+        // the dust swap does not add to it.
+        (,,, uint32 pendingBefore,) = hook.maturity(id_, m);
+
+        // Same block, dust leg: the effective impact is the block displacement, so this WOULD bond
+        // -- but its leg is far below the minimum, so it is turned away from bonding instead.
         _swapExactOut(100, true, _validHookData());
+
+        assertEq(currency0.balanceOf(address(hook)), hookBefore, "a declined dust swap still took collateral");
+
+        (,,, uint32 pendingAfter,) = hook.maturity(id_, m);
+
+        assertEq(pendingAfter, pendingBefore, "a declined dust swap registered a maturity liability");
     }
 
     /// @notice ...and a production-realistic threshold makes that boundary unreachable.
@@ -483,17 +506,23 @@ contract BondCustodyExactOutputTest is Test, Deployers {
     }
 
     /// @notice INV-NOOP-VL on the exact-output path: a moved tick with a leg too small to charge
-    ///         must revert rather than finalize a zero-collateral bond.
+    ///         is declined, and finalizes no zero-collateral bond.
     ///
-    /// @dev Mirrors the exact-input case in `BondCustody.t.sol`, and needs the same construction:
-    ///      a pool thin enough that a few hundred units still cross a tick. On the fixture's
-    ///      liquidity no amount small enough to truncate could ever move the price, so the case
-    ///      would be unreachable and the test would silently prove nothing.
+    /// @dev Mirrors the exact-input case in `BondCustody.t.sol`, including the reason it used to
+    ///      assert a revert and no longer does. It needs the same construction: a pool thin enough
+    ///      that a few hundred units still cross a tick. On the fixture's liquidity no amount that
+    ///      small could move the price, so the case would be unreachable and the test would
+    ///      silently prove nothing.
     ///
-    ///      The search runs with bonding DISABLED so probe swaps cannot revert with the very error
-    ///      being provoked, then the state is rewound and the chosen amount replayed with bonding
-    ///      on. Rewinding restores the price exactly, so the replay reproduces the same leg.
-    function test_exactOutput_bondTruncatingToZero_reverts() public {
+    ///      For an exact-output swap the leg IS the consumed input, so both gates measure the same
+    ///      amount -- the currency mismatch that made this severe on the exact-input path does not
+    ///      arise here. The behaviour is kept identical anyway, so the swap path carries no special
+    ///      case and neither does the reasoning about it.
+    ///
+    ///      The search runs with bonding DISABLED so probe swaps cannot be filtered by the very
+    ///      gate being exercised, then the state is rewound and the chosen amount replayed with
+    ///      bonding on. Rewinding restores the price exactly, so the replay reproduces the leg.
+    function test_exactOutput_bondTruncatingToZero_isDeclined() public {
         (PoolKey memory thinKey, PoolId thinId) =
             initPool(currency0, currency1, IHooks(address(hook)), 500, TickMath.getSqrtPriceAtTick(0));
 
@@ -548,15 +577,13 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.revertToState(baseline);
 
-        hook.setPoolConfig(thinKey, 1, 1, true);
+        hook.setPoolConfig(thinKey, 1, 1, 10_000, 10_000, true);
 
-        vm.expectRevert(
-            _wrapped(
-                IHooks.afterSwap.selector,
-                abi.encodeWithSelector(BondMeBro.BondViolatesNoOpVLBound.selector, uint256(0), observedLeg)
-            )
-        );
+        assertLt(observedLeg, 10_000, "the leg was not actually below the minimum: the test proves nothing");
 
+        uint256 hookBefore = currency0.balanceOf(address(hook));
+
+        // No `expectRevert`: the swap must go through, unbonded.
         swapRouter.swap(
             thinKey,
             SwapParams({
@@ -565,6 +592,12 @@ contract BondCustodyExactOutputTest is Test, Deployers {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             _validHookData()
         );
+
+        assertEq(currency0.balanceOf(address(hook)), hookBefore, "a declined exact-output swap took collateral");
+
+        (,,, uint32 pending,) = hook.maturity(thinId, uint32(block.number) + hook.OBSERVATION_BLOCKS());
+
+        assertEq(pending, 0, "a declined exact-output swap registered a maturity liability");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -823,7 +856,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         manager.initialize(emptyKey, TickMath.getSqrtPriceAtTick(0));
 
-        hook.setPoolConfig(emptyKey, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(emptyKey, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -865,9 +898,9 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.expectRevert(BondMeBro.NotOwner.selector);
 
-        hook.setPoolConfig(hostileKey, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(hostileKey, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
 
-        (uint128 minBonded0, uint96 minBonded1, bool bondingEnabled) = hook.poolConfig(hostileKey.toId());
+        (uint128 minBonded0, uint96 minBonded1, bool bondingEnabled,,) = hook.poolConfig(hostileKey.toId());
 
         assertEq(minBonded0, 0, "hostile pool has a currency0 threshold");
 

@@ -68,7 +68,7 @@ contract DemoTest is Test, Deployers {
         );
 
         // Bond anything at or above 0.001 units of input.
-        hook.setPoolConfig(key_, 1e15, 1e15, true);
+        hook.setPoolConfig(key_, 1e15, 1e15, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////

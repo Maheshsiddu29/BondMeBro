@@ -83,7 +83,7 @@ contract BlockImpactGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     function _hookData() internal pure returns (bytes memory) {
@@ -305,7 +305,7 @@ contract BlockImpactGasTest is Test, Deployers {
     ///      paying for 128 bond lifecycles where the old model bonded 58 IS the mitigation rather
     ///      than callback overhead.
     function test_gas_splitSequence128_allBonded() public {
-        hook.setPoolConfig(key_, 1, 1, true);
+        hook.setPoolConfig(key_, 1, 1, 10_000, 10_000, true);
 
         _swap(-1e13, true, _hookData());
 

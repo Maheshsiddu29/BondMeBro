@@ -40,11 +40,17 @@ fmt-check:
 # verified byte-identical across three independent generations.
 SNAPSHOT_EXCLUDE := ^(testFuzz_.*|test_constructor_rejectsZeroOwner\(\))$$
 
+# test/audit/ holds UNTRACKED, throwaway tests written during security review. They exist on a
+# reviewer's machine and not in CI, so letting them into the snapshot would make the committed file
+# depend on who generated it -- `snapshot-check` would then fail on a clean checkout for reasons
+# that have nothing to do with gas.
+SNAPSHOT_EXCLUDE_PATH := test/audit/*
+
 snapshot:
-	forge snapshot --no-match-test '$(SNAPSHOT_EXCLUDE)'
+	forge snapshot --no-match-test '$(SNAPSHOT_EXCLUDE)' --no-match-path '$(SNAPSHOT_EXCLUDE_PATH)'
 
 snapshot-check:
-	forge snapshot --check --no-match-test '$(SNAPSHOT_EXCLUDE)'
+	forge snapshot --check --no-match-test '$(SNAPSHOT_EXCLUDE)' --no-match-path '$(SNAPSHOT_EXCLUDE_PATH)'
 
 # The pattern is ANCHORED. An unanchored "lib" also matches src/libraries/, which silently
 # excluded every library in this repo from the coverage report — the numbers looked fine

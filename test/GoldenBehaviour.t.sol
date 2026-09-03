@@ -98,8 +98,8 @@ contract GoldenBehaviourTest is Test, Deployers {
     ///      nothing else.
     function _enableBonding(PoolKey memory k) internal {
         // PRE-CLEANUP SIGNATURE. P-L2-7 replaces the two economic `uint16` fields with a single
-        // explicit enable flag; this line becomes `setPoolConfig(k, MIN_BONDED, MIN_BONDED_1, true)`.
-        hook.setPoolConfig(k, MIN_BONDED, MIN_BONDED_1, true);
+        // explicit enable flag; this line becomes `setPoolConfig(k, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true)`.
+        hook.setPoolConfig(k, MIN_BONDED, MIN_BONDED_1, 10_000, 10_000, true);
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -175,7 +175,8 @@ outcome.
 - native ETH
 - fee-on-transfer tokens
 - rebasing or otherwise non-standard ERC-20s
-- pools configured with `minBondedAmount` below ~1,000 raw units (see limitation F)
+- pools whose tokens have very few decimals, where the variable-leg minimum is a meaningful
+  amount of value rather than dust (see limitation F)
 
 Do not assume these work. They have no tests and are outside the design.
 
@@ -213,29 +214,34 @@ make ci          # fmt-check, slither, build, optimized tests, coverage
 FOUNDRY_PROFILE=ci forge test --match-path 'test/invariant/*' -vv
 ```
 
-`make ci` runs every test normally, including every gas ceiling. Coverage then excludes only
-`test_adversarial_victimCallbackStaysInsideTheCeiling` in `test/ObservationCheckpointGas.t.sol`.
-Coverage disables optimization, so that one test's gas assertion is not meaningful in a coverage
-build. Its original 150,000 limit remains enforced by the optimized test run. No adversarial suite
-is excluded. GitHub CI uses the same `make coverage` command, the larger `ci` profile, and a
-separate committed-snapshot check.
+`make ci` runs every test normally, including every gas ceiling, and coverage runs the identical
+set — no test is excluded from either. GitHub CI uses the same `make coverage` command, the larger
+`ci` profile, and a separate committed-snapshot check.
 
 The local P-L2-9.2 checks passed with the figures below. These are local results, not a fresh-clone
 certification; the committed candidate needs that separate check.
 
 | | |
 |---|---|
-| tests | **461 passing**, 0 failing, 35 suites |
+| tests | **480 passing**, 0 failing, 36 suites |
 | stateful invariant campaign | **26 invariant-suite tests: 20 invariant properties + 6 reachability/regression tests**, 512 runs × depth 100 |
 | Slither | **0 findings**, 102 detectors |
-| coverage run | **460 passing**, 0 failing; only the named gas assertion excluded |
-| coverage (`src/BondMeBro.sol`) | 99.14% lines · 86.05% branches · 100% functions |
-| runtime bytecode | **15,953 bytes** (8,623 under the EIP-170 limit) |
-| `beforeSwap` worst case | **107,543 gas** (limit 150,000) |
-| `afterSwap` worst case | **73,999 gas** (limit 100,000) |
+| coverage run | **480 passing**, 0 failing; no test excluded |
+| coverage (`src/BondMeBro.sol`) | 98.76% lines · 85.11% branches · 100% functions |
+| runtime bytecode | **16,446 bytes** (8,130 under the EIP-170 limit) |
+| `beforeSwap` worst case | **107,717 gas** (limit 150,000) |
+| `afterSwap` worst case | **74,298 gas** (limit 100,000) |
 
 The callback maxima are above the targets of 50,000 (`beforeSwap`) and 30,000 (`afterSwap`), but
-below the hard ceilings shown. These release-documentation fixes do not change callback code.
+below the hard ceilings shown.
+
+Line and branch coverage each fell slightly against the previous release. That is the intended
+consequence of one change rather than a gap: the zero-collateral guard in the custody path is no
+longer reachable, because the variable-leg minimum makes a zero collateral arithmetically
+impossible, so no test can execute its revert. The guard is kept as defence against a later change.
+
+A bonded swap now costs about 2,470 gas more and an unbonded one about 2,174 more, for one extra
+storage read: the pool config outgrew a single slot when the variable-leg minimums were added.
 
 ## 14. Demo
 
@@ -359,9 +365,11 @@ separate swap paying fees and gas, and leaves the price exposed for a full windo
 harm keeps growing, so the largest persistent moves are systematically under-collateralized. LP
 protection stops scaling there.
 
-**D — Threshold splitting.** Swaps below a pool's `minBondedAmount` never bond. Splitting a large
-trade into many below-threshold pieces avoids collateral entirely. The threshold is a raw-amount
-ration, not a classifier, and this is the direct consequence.
+**D — Threshold splitting.** Swaps below either of a pool's two minimums never bond. Splitting a
+large trade into many below-threshold pieces avoids collateral entirely. The thresholds are
+raw-amount rations, not classifiers, and this is the direct consequence. The pieces have to be
+genuinely tiny — a pool with real liquidity does not move at all at those sizes — but nothing stops
+the strategy in principle.
 
 **E — Same-block splitting: materially mitigated, NOT eliminated.**
 
@@ -378,10 +386,16 @@ ration, not a classifier, and this is the direct consequence.
 > The figures are **SYNTHETIC SIMULATION — NOT HISTORICAL UNISWAP EVIDENCE**, and are not universal
 > mainnet ratios.
 
-**F — Very low `minBondedAmount`.** Configuring a pool with `minBondedAmount` below roughly 1,000 raw
-units is unsupported. It admits swaps whose variable leg is small enough that a positive collateral
-rate still rounds down to zero tokens, which the hook rejects by reverting rather than by creating a
-zero-collateral bond. Any realistic threshold is many orders of magnitude above this.
+**F — The variable-leg minimum on few-decimal tokens.** A pool must be configured with a minimum
+size for the leg the collateral is taken from, and that minimum can never be set below 10,000 raw
+units. On an 18-decimal token that is a vanishing fraction of one token; on a 6-decimal token it is
+a hundredth of a unit; on a token with two decimals it is 100 whole units, which is a real amount of
+value to exclude from bonding. Check what the floor means in your pool's tokens before enabling
+bonding on one with very few decimals.
+
+Trades under that minimum are not rejected — they execute in full and simply do not bond. The
+collateral they avoid is at most `minimum × 1% ` raw units each, so the exemption scales with the
+threshold the operator chooses rather than being open-ended.
 
 ## Repository layout
 
@@ -392,7 +406,7 @@ zero-collateral bond. Any realistic threshold is many orders of magnitude above 
 | `src/libraries/ModelL2SettlementLib.sol` | settlement arithmetic — windows, dead zone, refund/slash split |
 | `src/libraries/HookDataCodec.sol` | the versioned per-swap payload (refund recipient + collateral ceiling) |
 | `script/DeployBondMeBro.s.sol` | CREATE2 salt mining and deployment |
-| `test/` | 461 tests, including adversarial, stateful-invariant and demo suites |
+| `test/` | 480 tests, including adversarial, stateful-invariant and demo suites |
 | `INTEGRATION.md` | frontend and router integration rules |
 
 ## Dependency note
