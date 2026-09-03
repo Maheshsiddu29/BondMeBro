@@ -4719,3 +4719,28 @@ h2 {
   --orange-deep: #e95d0c;
   --orange-soft: rgba(255, 122, 26, 0.14);
 }
+
+/* Final light-theme pink override for components with legacy orange gradients. */
+.theme-light {
+  --signal-orange: #ff4fb8;
+}
+
+.theme-light .primary-button,
+.theme-light .swap-submit-button {
+  background: linear-gradient(135deg, #ff75c8, #ff4fb8) !important;
+  box-shadow: 0 0 0 1px rgba(255, 79, 184, 0.18), 7px 9px 18px rgba(217, 31, 143, 0.18) !important;
+}
+
+.theme-light .primary-button:hover,
+.theme-light .swap-submit-button:hover {
+  background: linear-gradient(135deg, #ff4fb8, #d91f8f) !important;
+  box-shadow: 0 0 0 1px rgba(255, 79, 184, 0.26), 0 10px 26px rgba(217, 31, 143, 0.22) !important;
+}
+
+.theme-light .direction-button,
+.theme-light .protocol-refresh,
+.theme-light .sidebar-nav-active,
+.theme-light .sidebar-flow-step-active,
+.theme-light .uniswap-token-picker {
+  border-color: rgba(255, 79, 184, 0.28);
+}
