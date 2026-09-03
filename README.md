@@ -407,6 +407,7 @@ threshold the operator chooses rather than being open-ended.
 | `src/libraries/HookDataCodec.sol` | the versioned per-swap payload (refund recipient + collateral ceiling) |
 | `script/DeployBondMeBro.s.sol` | CREATE2 salt mining and deployment |
 | `test/` | 480 tests, including adversarial, stateful-invariant and demo suites |
+| `frontend/` | Next.js dashboard: quote, swap, watch maturity, settle. Its hook ABI is generated from `out/BondMeBro.sol` |
 | `INTEGRATION.md` | frontend and router integration rules |
 
 ## Dependency note
