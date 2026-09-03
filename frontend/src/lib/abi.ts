@@ -115,6 +115,20 @@ export const bondMeBroAbi = [
       { indexed: false, name: "amount", type: "uint256" }, { indexed: false, name: "caller", type: "address" },
     ],
   },
+  {
+    type: "event", name: "PaymentDeferred", anonymous: false,
+    inputs: [
+      { indexed: true, name: "recipient", type: "address" }, { indexed: false, name: "currency", type: "address" },
+      { indexed: false, name: "amount", type: "uint256" },
+    ],
+  },
+  {
+    type: "event", name: "PaymentsClaimed", anonymous: false,
+    inputs: [
+      { indexed: true, name: "recipient", type: "address" }, { indexed: false, name: "currency", type: "address" },
+      { indexed: false, name: "amount", type: "uint256" },
+    ],
+  },
 ] as const satisfies Abi;
 
 export type BondMeBroAbi = typeof bondMeBroAbi;
