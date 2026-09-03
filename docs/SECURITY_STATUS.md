@@ -9,12 +9,19 @@ checks below document the current engineering verification boundary.
 - Frontend `npm run lint`: passed.
 - Frontend `npm audit --omit=dev --audit-level=high`: passed with no high or critical
   findings after pinning Next 15.5.25, PostCSS 8.5.23, Axios 1.20.0, and ws 8.21.3.
-- Frontend RPC route checks: read-only requests are accepted; state-changing RPC
-  methods are rejected; invalid JSON and bodies over 64 KiB are rejected; security
-  response headers are present.
-- Solidity build, lifecycle tests, fuzz tests, invariant tests, coverage, and Slither
-  are run by the repository GitHub workflows. The local sandbox does not include
-  Foundry, so `forge` commands must be repeated in WSL or CI.
+- Solidity production build completed with Solidity 0.8.26; the full local suite passed
+  with 70 tests, including 25,000 CI-profile fuzz cases and a 512-run invariant with
+  51,200 generated calls.
+- `forge fmt --check`, gas snapshot generation, the non-invariant gas snapshot check,
+  and Slither `--fail-medium` passed. Slither reports only documented low/informational
+  findings for bounded payout loops,
+  guarded callbacks, and deliberate low-level token/ETH transfer handling.
+- RPC route checks: read-only requests are accepted; state-changing RPC methods are
+  rejected; invalid JSON and bodies over 64 KiB are rejected; security response headers
+  are present.
+- The sandbox uses a temporary Forge 1.7.1/solc-js adapter because the native Solidity
+  compiler download endpoint is unavailable here. Re-run the canonical native Foundry
+  CI workflow before release.
 
 ## Hardening included
 
@@ -27,6 +34,14 @@ checks below document the current engineering verification boundary.
 - Settlement state is reconciled from the confirmed receipt; bond history and activity
   are retained during temporary RPC/indexer lag.
 - Pool-key write paths validate that the key belongs to the deployed BondMeBro hook.
+
+## Deployment boundary
+
+The additional pool-key validation and scoped operational approvals are source and
+script hardening. The existing Sepolia hook address must be redeployed and its
+frontend deployment manifest updated before those Solidity changes exist on-chain.
+Never infer that the already deployed address contains a source change until its
+runtime bytecode and deployment transaction have been verified.
 
 ## Known boundaries
 

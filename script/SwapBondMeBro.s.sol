@@ -134,9 +134,8 @@ contract SwapBondMeBro is Script {
         // Scope both allowances to this operation. The broadcaster can run the script again
         // and approve a new amount without leaving a reusable unlimited router allowance.
         IERC20Minimal(Currency.unwrap(currency)).approve(permit2, amount);
-        IAllowanceTransfer(permit2).approve(
-            Currency.unwrap(currency), routerAddress, uint160(amount), uint48(block.timestamp + 1 hours)
-        );
+        IAllowanceTransfer(permit2)
+            .approve(Currency.unwrap(currency), routerAddress, uint160(amount), uint48(block.timestamp + 1 hours));
     }
 
     function _poolKey(address hookAddress) internal view returns (PoolKey memory key) {

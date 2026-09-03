@@ -83,7 +83,8 @@ contract SwapBondMeBroExactOutput is Script {
 
         vm.startBroadcast();
         _approveInput(inputCurrency, request.permit2, request.router, request.amountInMaximum);
-        IUniversalRouterLike(request.router).execute{value: inputCurrency.isAddressZero() ? request.amountInMaximum : 0}(
+        IUniversalRouterLike(request.router)
+        .execute{value: inputCurrency.isAddressZero() ? request.amountInMaximum : 0}(
             commands, inputs, request.deadline
         );
         vm.stopBroadcast();
@@ -124,9 +125,8 @@ contract SwapBondMeBroExactOutput is Script {
         // Scope both allowances to this operation. The broadcaster can run the script again
         // and approve a new amount without leaving a reusable unlimited router allowance.
         IERC20Minimal(Currency.unwrap(currency)).approve(permit2, amount);
-        IAllowanceTransfer(permit2).approve(
-            Currency.unwrap(currency), routerAddress, uint160(amount), uint48(block.timestamp + 1 hours)
-        );
+        IAllowanceTransfer(permit2)
+            .approve(Currency.unwrap(currency), routerAddress, uint160(amount), uint48(block.timestamp + 1 hours));
     }
 
     function _poolKey(address hookAddress) internal view returns (PoolKey memory key) {

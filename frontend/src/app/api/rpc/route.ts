@@ -4,6 +4,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_RPC_BODY_BYTES = 64 * 1024;
+const MAX_BATCH_REQUESTS = 20;
+const MAX_LOG_RANGE = 10_000n;
+const RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT = 120;
+const HOOK_ADDRESS = (process.env.NEXT_PUBLIC_HOOK_ADDRESS ?? "0xbFBa0c39308B5b189E8cd0686D3b41A64e8590cC").toLowerCase();
+const rateBuckets = new Map<string, { startedAt: number; count: number }>();
 const READ_ONLY_METHODS = new Set([
   "eth_blockNumber",
   "eth_chainId",
@@ -27,7 +33,7 @@ const READ_ONLY_METHODS = new Set([
   "eth_getTransactionCount",
   "eth_getTransactionReceipt",
   "eth_getUncleByBlockHashAndIndex",
-  "eth_getUncleByBlockNumberAndIndex",
+  "eth_getUncleByBlockNumber",
   "eth_getUncleCountByBlockHash",
   "eth_getUncleCountByBlockNumber",
   "net_version",
@@ -55,17 +61,62 @@ function errorResponse(message: string, status = 400) {
   );
 }
 
+function clientIdentity(request: Request) {
+  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+    || request.headers.get("x-real-ip")
+    || "unknown";
+}
+
+function isRateLimited(request: Request) {
+  const now = Date.now();
+  const identity = clientIdentity(request);
+  const bucket = rateBuckets.get(identity);
+  if (!bucket || now - bucket.startedAt >= RATE_WINDOW_MS) {
+    if (rateBuckets.size >= 1_000) {
+      for (const [key, value] of rateBuckets) {
+        if (now - value.startedAt >= RATE_WINDOW_MS) rateBuckets.delete(key);
+      }
+    }
+    rateBuckets.set(identity, { startedAt: now, count: 1 });
+    return false;
+  }
+  bucket.count += 1;
+  return bucket.count > RATE_LIMIT;
+}
+
+function isHexQuantity(value: unknown): value is string {
+  return typeof value === "string" && /^0x[0-9a-f]+$/i.test(value);
+}
+
+function isAllowedLogFilter(params: unknown) {
+  if (!Array.isArray(params) || params.length < 1 || params[0] === null || typeof params[0] !== "object") return false;
+  const filter = params[0] as { address?: unknown; fromBlock?: unknown; toBlock?: unknown; blockHash?: unknown };
+  const addresses = Array.isArray(filter.address) ? filter.address : [filter.address];
+  if (addresses.some((address) => typeof address !== "string" || address.toLowerCase() !== HOOK_ADDRESS)) return false;
+  if (filter.blockHash !== undefined) return true;
+  if (filter.fromBlock === undefined || filter.toBlock === undefined || !isHexQuantity(filter.fromBlock) || !isHexQuantity(filter.toBlock)) return false;
+  try {
+    return BigInt(filter.toBlock) >= BigInt(filter.fromBlock)
+      && BigInt(filter.toBlock) - BigInt(filter.fromBlock) <= MAX_LOG_RANGE;
+  } catch {
+    return false;
+  }
+}
+
 function isAllowedRpcPayload(payload: unknown): boolean {
   const requests = Array.isArray(payload) ? payload : [payload];
-  if (requests.length === 0) return false;
+  if (requests.length === 0 || requests.length > MAX_BATCH_REQUESTS) return false;
   return requests.every((item) => {
     if (item === null || typeof item !== "object") return false;
-    const request = item as { jsonrpc?: unknown; method?: unknown };
-    return request.jsonrpc === "2.0" && typeof request.method === "string" && READ_ONLY_METHODS.has(request.method);
+    const request = item as { jsonrpc?: unknown; method?: unknown; params?: unknown };
+    if (request.jsonrpc !== "2.0" || typeof request.method !== "string" || !READ_ONLY_METHODS.has(request.method)) return false;
+    return request.method !== "eth_getLogs" || isAllowedLogFilter(request.params);
   });
 }
 
 export async function POST(request: Request) {
+  if (isRateLimited(request)) return errorResponse("RPC rate limit exceeded. Try again shortly.", 429);
+
   const declaredLength = Number(request.headers.get("content-length") ?? 0);
   if (declaredLength > MAX_RPC_BODY_BYTES) return errorResponse("RPC request body is too large.", 413);
 
@@ -78,7 +129,7 @@ export async function POST(request: Request) {
   } catch {
     return errorResponse("RPC request must contain valid JSON.");
   }
-  if (!isAllowedRpcPayload(payload)) return errorResponse("Only read-only Sepolia JSON-RPC methods are available through this route.", 403);
+  if (!isAllowedRpcPayload(payload)) return errorResponse("Only bounded, read-only Sepolia JSON-RPC methods are available through this route.", 403);
 
   let lastError = "RPC provider is unavailable";
   for (const rpcUrl of rpcCandidates()) {

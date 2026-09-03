@@ -105,6 +105,20 @@ contract BondThresholdsTest is Test, Deployers {
         hook.setPoolConfig(key_, 1e15, 1e15, 25);
     }
 
+    function test_poolWritePathsRejectForeignHookKey() public {
+        PoolKey memory foreignKey = key_;
+        foreignKey.hooks = IHooks(address(0xBEEF));
+
+        vm.expectRevert(BondMeBro.InvalidHookAddress.selector);
+        hook.setPoolConfig(foreignKey, 1e15, 1e15, 25);
+
+        vm.expectRevert(BondMeBro.InvalidHookAddress.selector);
+        hook.settleBonds(foreignKey, 1);
+
+        vm.expectRevert(BondMeBro.InvalidHookAddress.selector);
+        hook.donatePot(foreignKey, currency0);
+    }
+
     function test_exactInputBondUsesInputCurrencyAndRespectsMax() public {
         vm.expectRevert();
         _swap(true, -1e16, HookDataCodec.encode(address(this), 1));
