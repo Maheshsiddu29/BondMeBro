@@ -20,7 +20,7 @@
     "minBondedAmount0": "0",
     "minBondedAmount1": "0",
     "refundTolTicks": 10,
-    "observationBlocks": 50,
+    "observationBlocks": 20,
     "maxAbsTickDelta": 506,
     "settlerFeeBps": 500,
     "maxSettlesPerSwap": 4,

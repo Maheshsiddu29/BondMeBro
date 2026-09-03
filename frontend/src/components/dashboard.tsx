@@ -560,7 +560,7 @@ export function Dashboard() {
   const refundTolValue = (refundTolRead as unknown as { data?: unknown }).data;
   const settlerFeeValue = (settlerFeeRead as unknown as { data?: unknown }).data;
   const clampValue = (clampRead as unknown as { data?: unknown }).data;
-  const observationBlocks = asBigInt(observationValue) ?? 50n;
+  const observationBlocks = asBigInt(observationValue) ?? 20n;
   const refundTolTicks = asBigInt(refundTolValue) ?? 10n;
   const settlerFeeBps = asBigInt(settlerFeeValue) ?? 500n;
   const clampTicks = asBigInt(clampValue) ?? 506n;
@@ -836,7 +836,7 @@ export function Dashboard() {
               <section className="content-grid overview-grid">
                 <article className="neo-card active-bonds-card">
                   <div className="card-heading"><div><span className="eyebrow">01 / PORTFOLIO</span><h2>Active bonds</h2></div><button className="card-link" type="button" onClick={() => goTo("bonds")}>View all <span>→</span></button></div>
-                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div className="pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card active-bonds-empty"><strong>No active bonds</strong><span>New bonds appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
+                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card active-bonds-empty"><strong>No active bonds</strong><span>New bonds appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
                   <div className="card-footer"><span>{queueLength > 0n ? `${formatInteger(queueLength)} bond${queueLength === 1n ? "" : "s"} in queue` : "Queue is clear"}</span><span className="footer-status"><StatusDot live={rpcOnline} /> synced</span></div>
                 </article>
                 <article className="glass-card portfolio-card">

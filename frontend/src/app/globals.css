@@ -4620,3 +4620,32 @@ h2 {
 .active-bonds-empty {
   padding-top: 28px;
 }
+
+/* Keep sidebar edges dark/subtle in dark and black themes. */
+.theme-dark .sidebar,
+.theme-black .sidebar {
+  border-right-color: rgba(255, 107, 26, 0.18);
+  scrollbar-color: rgba(255, 107, 26, 0.45) rgba(0, 0, 0, 0.35);
+}
+
+.theme-dark .sidebar::-webkit-scrollbar,
+.theme-black .sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.theme-dark .sidebar::-webkit-scrollbar-track,
+.theme-black .sidebar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.theme-dark .sidebar::-webkit-scrollbar-thumb,
+.theme-black .sidebar::-webkit-scrollbar-thumb {
+  border: 1px solid rgba(0, 0, 0, 0.5);
+  background: rgba(255, 107, 26, 0.45);
+  background-clip: padding-box;
+}
+
+.theme-dark .network-card,
+.theme-black .network-card {
+  box-shadow: 8px 8px 20px rgba(0, 0, 0, 0.38), -4px -4px 12px rgba(255, 255, 255, 0.018);
+}
