@@ -821,7 +821,6 @@ export function Dashboard() {
                 </div>
                 <div className="hero-visual">
                   <div className="hero-orb"><span>01</span><div className="orb-ring orb-ring-one" /><div className="orb-ring orb-ring-two" /><div className="orb-dot" /></div>
-                  <div className="floating-card floating-swap"><div className="floating-card-label">SWAP PREVIEW <span>↗</span></div><div className="floating-token-row"><div className="token-bubble token-orange">Ξ</div><div><strong>0.001 ETH</strong><span>ETH → WETH / exact input</span></div><b>→</b></div><div className="floating-result"><span>EST. BOND</span><strong>0.0000025 ETH</strong></div></div>
                   <div className="floating-card floating-status"><div className="floating-card-label">BOND STATUS</div><div className="status-line"><StatusDot live /><strong>Active</strong><span>maturing</span></div></div>
                 </div>
               </section>

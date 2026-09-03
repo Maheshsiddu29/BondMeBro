@@ -4814,3 +4814,31 @@ h2 {
   background: rgba(255, 79, 184, 0.52);
   background-clip: padding-box;
 }
+
+/* Larger portfolio summary typography. */
+.portfolio-card h2 {
+  font-size: 46px;
+  line-height: 0.95;
+}
+
+.portfolio-card .portfolio-total span {
+  font-size: 12px;
+}
+
+.portfolio-card .portfolio-total strong {
+  font-size: 52px;
+  line-height: 1;
+}
+
+.portfolio-card .portfolio-total small {
+  font-size: 20px;
+}
+
+.portfolio-card .summary-list span {
+  font-size: 11px;
+}
+
+.portfolio-card .summary-list strong {
+  font-size: 20px;
+  font-weight: 700;
+}
