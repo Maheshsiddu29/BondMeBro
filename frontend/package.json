@@ -1,0 +1,42 @@
+{
+  "name": "bondmebro-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -H 0.0.0.0",
+    "build": "next build",
+    "start": "next start -H 0.0.0.0",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit --incremental false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "abi:sync": "node scripts/sync-abi.mjs",
+    "abi:check": "node scripts/sync-abi.mjs --check"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.0",
+    "@wagmi/core": "^2.22.1",
+    "next": "15.5.25",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "viem": "^2.33.0",
+    "wagmi": "^2.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^15.5.25",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "8.5.23"
+    },
+    "axios": "1.20.0",
+    "ws": "8.21.3"
+  }
+}

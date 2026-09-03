@@ -1,0 +1,7 @@
+node_modules/
+.next/
+out/
+# Never commit any env file, including examples. Deployment values are documented in README.md.
+.env*
+npm-debug.log*
+*.tsbuildinfo
