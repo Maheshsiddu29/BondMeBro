@@ -4253,6 +4253,43 @@ h2 {
   font-size: 13px;
 }
 
+.uniswap-token-picker {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 46px;
+  padding: 6px 13px 6px 7px;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  background: var(--app-surface);
+  box-shadow: 4px 4px 12px rgba(45, 39, 32, 0.08), -4px -4px 12px rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+}
+
+.uniswap-token-picker strong {
+  font-size: 15px;
+  letter-spacing: -0.02em;
+}
+
+.token-picker-chevron {
+  color: var(--orange);
+  font-size: 14px;
+}
+
+.uniswap-token-picker select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.prepare-token-button {
+  margin-top: 14px;
+}
+
 .swap-direction-button {
   position: relative;
   z-index: 2;

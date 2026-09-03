@@ -24,6 +24,13 @@ export const erc20Abi = [
   },
   {
     type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
     name: "balanceOf",
     stateMutability: "view",
     inputs: [{ name: "account", type: "address" }],
@@ -43,6 +50,21 @@ export const permit2Abi = [
       { name: "expiration", type: "uint48" },
     ],
     outputs: [],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "token", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [
+      { name: "amount", type: "uint160" },
+      { name: "expiration", type: "uint48" },
+      { name: "nonce", type: "uint48" },
+    ],
   },
 ] as const;
 

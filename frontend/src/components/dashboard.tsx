@@ -22,6 +22,7 @@ import { encodeBondHookData, encodeExactInputRouterPlan, erc20Abi, permit2Abi, u
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Address;
 const ZERO_HASH = `0x${"0".repeat(64)}` as Hex;
+const MAX_UINT160 = (1n << 160n) - 1n;
 const eventDescriptors = [
   {
     topic: keccak256(toBytes("BondOpened(bytes32,bytes32,address,address,uint128,int24,int24,uint48)")),
@@ -398,6 +399,19 @@ function SectionHeading({ eyebrow, title, copy }: { eyebrow: string; title: stri
       <h2>{title}</h2>
       {copy && <p>{copy}</p>}
     </div>
+  );
+}
+
+function TokenPicker({ label, token, options, onChange }: { label: string; token: TokenOption; options: TokenOption[]; onChange: (symbol: string) => void }) {
+  return (
+    <label className="uniswap-token-picker" aria-label={label}>
+      <span className={`token-bubble ${token.symbol === "ETH" ? "token-orange" : "token-purple"}`}>{token.icon}</span>
+      <strong>{token.symbol}</strong>
+      <span className="token-picker-chevron">⌄</span>
+      <select value={token.symbol} onChange={(event) => onChange(event.target.value)}>
+        {options.map((option) => <option value={option.symbol} key={option.symbol}>{option.symbol}</option>)}
+      </select>
+    </label>
   );
 }
 
@@ -783,9 +797,9 @@ export function Dashboard() {
               <section className="welcome-grid">
                 <div className="welcome-copy">
                   <span className="eyebrow">GOOD AFTERNOON / {deployment.networkName.toUpperCase()}</span>
-                  <h1>Trade now.<br /><em>Prove the impact later.</em></h1>
-                  <p>BondMeBro temporarily holds a small bond from qualifying swaps. At maturity, the outcome is measured and the bond is refunded or retained.</p>
-                  <div className="welcome-actions"><button type="button" className="primary-button large-button" onClick={() => goTo("swap")}>Launch swap <span>↗</span></button><button type="button" className="text-button" onClick={() => goTo("learn")}>How it works <span>→</span></button></div>
+                  <h1>Swap.<br /><em>Settle.</em></h1>
+                  <p>Qualifying swaps post a temporary bond. Reverted impact refunds; persistent impact funds LP cover.</p>
+                  <div className="welcome-actions"><button type="button" className="primary-button large-button" onClick={() => goTo("swap")}>Swap now <span>↗</span></button><button type="button" className="text-button" onClick={() => goTo("learn")}>Learn <span>→</span></button></div>
                 </div>
                 <div className="hero-visual">
                   <div className="hero-orb"><span>01</span><div className="orb-ring orb-ring-one" /><div className="orb-ring orb-ring-two" /><div className="orb-dot" /></div>
@@ -890,9 +904,13 @@ function SwapScreen({
   const [transactionError, setTransactionError] = useState("");
   const publicClient = usePublicClient({ chainId: sepolia.id });
   const { writeContractAsync } = useWriteContract();
+  const swapTokenOptions = tokenOptions.filter((token) =>
+    token.address.toLowerCase() === deployment.currency0.toLowerCase()
+    || token.address.toLowerCase() === deployment.currency1.toLowerCase(),
+  );
 
-  const payToken = tokenOptions.find((token) => token.symbol === paySymbol) ?? tokenOptions[0];
-  const receiveToken = tokenOptions.find((token) => token.symbol === receiveSymbol) ?? tokenOptions[1];
+  const payToken = swapTokenOptions.find((token) => token.symbol === paySymbol) ?? swapTokenOptions[0];
+  const receiveToken = swapTokenOptions.find((token) => token.symbol === receiveSymbol) ?? swapTokenOptions[1];
   const amountIn = parseSwapAmount(swapAmount, payToken.decimals);
   const minimumAmountOut = parseSwapAmount(minimumOutput, receiveToken.decimals) ?? 0n;
   const bondBps = poolConfig?.[2] ?? 0n;
@@ -915,7 +933,26 @@ function SwapScreen({
     args: [address ?? deployment.hook],
     query: { enabled: Boolean(address && payToken.kind === "erc20"), refetchInterval: 10_000 },
   });
+  const tokenAllowanceRead = useReadContract({
+    address: payToken.address,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [address ?? deployment.hook, deployment.permit2],
+    query: { enabled: Boolean(address && payToken.kind === "erc20"), refetchInterval: 10_000 },
+  });
+  const permit2AllowanceRead = useReadContract({
+    address: deployment.permit2,
+    abi: permit2Abi,
+    functionName: "allowance",
+    args: [address ?? deployment.hook, payToken.address, deployment.universalRouter],
+    query: { enabled: Boolean(address && payToken.kind === "erc20"), refetchInterval: 10_000 },
+  });
   const payBalance = payToken.kind === "native" ? nativeBalance.data?.value : tokenBalanceRead.data as bigint | undefined;
+  const tokenAllowance = typeof tokenAllowanceRead.data === "bigint" ? tokenAllowanceRead.data : 0n;
+  const permit2AllowanceAmount = asBigInt(tupleItem(permit2AllowanceRead.data, 0, "amount")) ?? 0n;
+  const permit2AllowanceExpiration = asBigInt(tupleItem(permit2AllowanceRead.data, 1, "expiration")) ?? 0n;
+  const permit2Live = permit2AllowanceExpiration > BigInt(Math.floor(Date.now() / 1000) + 60);
+  const tokenSpendingReady = payToken.kind === "native" || (amountIn !== undefined && tokenAllowance >= amountIn && permit2AllowanceAmount >= amountIn && permit2Live);
   const maxBondAmount = estimatedBond > 0n ? estimatedBond + estimatedBond / 10n + 1n : 1n;
   const routerConfigured = deployment.universalRouter.toLowerCase() !== ZERO_ADDRESS;
   const quoterConfigured = deployment.quoter.toLowerCase() !== ZERO_ADDRESS;
@@ -1008,9 +1045,50 @@ function SwapScreen({
     swapMode,
   ]);
 
-  const canSubmit = isConnected && networkCorrect && rpcOnline && !poolConfigLoading && !poolConfigError && swapMode === "exactIn" && supportedDirection && routerConfigured && bondingEnabledForSwap(poolConfig) && amountIn !== undefined && amountIn > 0n && quoteReady && minimumAmountOut > 0n && amountFitsBalance && transactionState !== "approving" && transactionState !== "sending";
+  const canSubmit = isConnected && networkCorrect && rpcOnline && !poolConfigLoading && !poolConfigError && swapMode === "exactIn" && supportedDirection && routerConfigured && bondingEnabledForSwap(poolConfig) && amountIn !== undefined && amountIn > 0n && quoteReady && minimumAmountOut > 0n && amountFitsBalance && tokenSpendingReady && transactionState !== "approving" && transactionState !== "sending";
   const actionDisabled = transactionState === "approving" || transactionState === "sending" || (isConnected && networkCorrect && !canSubmit);
-  const status = getSwapStatus({ isConnected, networkCorrect, rpcOnline, poolConfigLoading, poolConfigError, supportedDirection, routerConfigured, quoterConfigured, poolConfig, amountIn, minimumAmountOut, amountFitsBalance, payBalance, swapMode, quoteLoading, quoteError, quoteHasNoLiquidity, quoteAmountOut, transactionState });
+  const status = getSwapStatus({ isConnected, networkCorrect, rpcOnline, poolConfigLoading, poolConfigError, supportedDirection, routerConfigured, quoterConfigured, poolConfig, amountIn, minimumAmountOut, amountFitsBalance, payBalance, payTokenKind: payToken.kind, tokenSpendingReady, swapMode, quoteLoading, quoteError, quoteHasNoLiquidity, quoteAmountOut, transactionState });
+
+  function choosePayToken(symbol: string) {
+    if (symbol === receiveSymbol) setReceiveSymbol(paySymbol);
+    setPaySymbol(symbol);
+  }
+
+  function chooseReceiveToken(symbol: string) {
+    if (symbol === paySymbol) setPaySymbol(receiveSymbol);
+    setReceiveSymbol(symbol);
+  }
+
+  async function prepareTokenSpending() {
+    if (!address || !publicClient || payToken.kind !== "erc20" || amountIn === undefined || amountIn <= 0n) return;
+    setTransactionState("approving");
+    setTransactionError("");
+    try {
+      if (tokenAllowance < amountIn) {
+        const tokenApproval = await writeContractAsync({
+          address: payToken.address,
+          abi: erc20Abi,
+          functionName: "approve",
+          args: [deployment.permit2, amountIn],
+        });
+        await publicClient.waitForTransactionReceipt({ hash: tokenApproval });
+      }
+      if (permit2AllowanceAmount < amountIn || !permit2Live) {
+        const permitApproval = await writeContractAsync({
+          address: deployment.permit2,
+          abi: permit2Abi,
+          functionName: "approve",
+          args: [payToken.address, deployment.universalRouter, MAX_UINT160, Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60],
+        });
+        await publicClient.waitForTransactionReceipt({ hash: permitApproval });
+      }
+      await Promise.all([tokenAllowanceRead.refetch(), permit2AllowanceRead.refetch()]);
+      setTransactionState("idle");
+    } catch (error) {
+      setTransactionState("error");
+      setTransactionError(friendlyTransactionError(error));
+    }
+  }
 
   async function submitSwap() {
     if (!canSubmit || !address || !publicClient || amountIn === undefined) return;
@@ -1030,26 +1108,6 @@ function SwapScreen({
         refundRecipient: address,
         maxBondAmount,
       });
-      if (payToken.kind === "erc20") {
-        setTransactionState("approving");
-        const approvalExpiration = Math.floor(Date.now() / 1000) + 3_600;
-        const tokenApproval = await writeContractAsync({
-          address: payToken.address,
-          abi: erc20Abi,
-          functionName: "approve",
-          // Approve only this swap amount; never leave an unlimited ERC-20 allowance.
-          args: [deployment.permit2, amountIn],
-        });
-        await publicClient.waitForTransactionReceipt({ hash: tokenApproval });
-        const permitApproval = await writeContractAsync({
-          address: deployment.permit2,
-          abi: permit2Abi,
-          functionName: "approve",
-          // Permit2 is also limited to this swap and expires shortly.
-          args: [payToken.address, deployment.universalRouter, amountIn, approvalExpiration],
-        });
-        await publicClient.waitForTransactionReceipt({ hash: permitApproval });
-      }
       setTransactionState("sending");
       const hash = await writeContractAsync({
         address: deployment.universalRouter,
@@ -1093,15 +1151,16 @@ function SwapScreen({
           </div>
           <div className="swap-card-subtitle">ETH / WETH · BondMeBro protected pool</div>
           <div className="swap-mode-row"><div className="segmented-control"><button type="button" className={swapMode === "exactIn" ? "segment-active" : ""} onClick={() => setSwapMode("exactIn")}>Exact in</button><button type="button" className={swapMode === "exactOut" ? "segment-active" : ""} onClick={() => setSwapMode("exactOut")}>Exact out</button></div><span className="swap-route-label">Single-hop route</span></div>
-          <div className="swap-token-panel swap-sell-panel"><div className="field-label uniswap-field-label"><span>Sell</span><span>Balance {payBalance === undefined ? "—" : `${formatToken(payBalance, payToken.decimals)} ${payToken.symbol}`}</span></div><div className="amount-line uniswap-amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" placeholder="0.00" /><select aria-label="Pay token" className="token-select" value={payToken.symbol} onChange={(event) => setPaySymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div></div>
+          <div className="swap-token-panel swap-sell-panel"><div className="field-label uniswap-field-label"><span>Sell</span><span>Balance {payBalance === undefined ? "—" : `${formatToken(payBalance, payToken.decimals)} ${payToken.symbol}`}</span></div><div className="amount-line uniswap-amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" placeholder="0.00" /><TokenPicker label="Pay token" token={payToken} options={swapTokenOptions} onChange={choosePayToken} /></div></div>
           <button type="button" className="direction-button swap-direction-button" aria-label="Switch swap direction" onClick={() => { const oldPay = paySymbol; setPaySymbol(receiveSymbol); setReceiveSymbol(oldPay); }}>↕</button>
-          <div className="swap-token-panel swap-buy-panel"><div className="field-label uniswap-field-label"><span>Buy</span><span>{quoteLoading ? "Updating live quote…" : "Estimated output"}</span></div><div className="amount-line uniswap-amount-line"><strong className="quoted-output-value" aria-live="polite">{quoteAmountOut !== undefined && quoteAmountOut > 0n && !quoteError ? formatToken(quoteAmountOut, receiveToken.decimals) : quoteLoading ? "…" : "—"}</strong><select aria-label="Receive token" className="token-select" value={receiveToken.symbol} onChange={(event) => setReceiveSymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div><div className="minimum-output-control"><div><span>Minimum received</span><small>Auto · 0.50% slippage</small></div><input aria-label="Minimum output" value={minimumOutput} onChange={(event) => { setMinimumOutput(event.target.value); setMinimumOutputEdited(true); }} inputMode="decimal" placeholder="Waiting for quote" /></div></div>
+          <div className="swap-token-panel swap-buy-panel"><div className="field-label uniswap-field-label"><span>Buy</span><span>{quoteLoading ? "Updating quote…" : "Estimated output"}</span></div><div className="amount-line uniswap-amount-line"><strong className="quoted-output-value" aria-live="polite">{quoteAmountOut !== undefined && quoteAmountOut > 0n && !quoteError ? formatToken(quoteAmountOut, receiveToken.decimals) : quoteLoading ? "…" : "—"}</strong><TokenPicker label="Receive token" token={receiveToken} options={swapTokenOptions} onChange={chooseReceiveToken} /></div><div className="minimum-output-control"><div><span>Minimum received</span><small>Auto · 0.50%</small></div><input aria-label="Minimum output" value={minimumOutput} onChange={(event) => { setMinimumOutput(event.target.value); setMinimumOutputEdited(true); }} inputMode="decimal" placeholder="Waiting for quote" /></div></div>
           <div className="swap-settings swap-settings-uniswap"><span>Slippage <b>0.50%</b></span><span>Bond rate <b>{bondBps.toString()} bps</b></span><span>Pool fee <b>0.30%</b></span></div>
-          {!rpcOnline && <div className="pair-warning">RPC is offline, so the pool configuration cannot be read. Click “RPC offline · retry” above after starting the frontend with a valid SEPOLIA_RPC_URL.</div>}{rpcOnline && poolConfigLoading && <div className="pair-warning">Reading the live BondMeBro pool configuration…</div>}{rpcOnline && poolConfigError && <div className="pair-warning">The live pool configuration could not be read. Retry the RPC connection before sending.</div>}{swapMode === "exactIn" && quoteLoading && <div className="pair-warning">Getting a live Uniswap v4 quote for this input. The output and minimum received will update automatically.</div>}{swapMode === "exactIn" && quoteHasNoLiquidity && <div className="pair-warning">The live quote returned no usable liquidity for this direction. The pool must have active in-range liquidity before the swap can be sent.</div>}{swapMode === "exactIn" && quoteError && !quoteHasNoLiquidity && <div className="pair-warning">The live Uniswap v4 quote is unavailable for this pool key or hook simulation. Sending is disabled until a valid quote is returned.</div>}{swapMode === "exactIn" && quoteEnabled && !quoteLoading && !quoteError && !quoteHasNoLiquidity && quoteAmountOut === undefined && <div className="pair-warning">The live quote could not be decoded. No fallback estimate is used, and sending remains disabled.</div>}{swapMode === "exactIn" && quoteReady && minimumAmountOut === 0n && <div className="pair-warning">Minimum received is empty or invalid. Enter a positive value before submitting; the automatic value uses 0.50% slippage.</div>}{!supportedDirection && <div className="pair-warning">This deployment currently has a BondMeBro pool only for ETH / WETH. Select that pair for a live test; other token pairs need their own initialized pool and liquidity.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is available in the backend script and remains a browser preview until its quote and max-input UI are wired.</div>}{!routerConfigured && <div className="pair-warning">Set the network&apos;s Universal Router address in the frontend environment before sending transactions.</div>}{!quoterConfigured && <div className="pair-warning">Set the network&apos;s Uniswap v4 Quoter address in the frontend environment before sending transactions.</div>}
+          {!rpcOnline && <div className="pair-warning">RPC is offline, so the pool configuration cannot be read. Click “RPC offline · retry” above after starting the frontend with a valid SEPOLIA_RPC_URL.</div>}{rpcOnline && poolConfigLoading && <div className="pair-warning">Reading the live BondMeBro pool configuration…</div>}{rpcOnline && poolConfigError && <div className="pair-warning">The live pool configuration could not be read. Retry the RPC connection before sending.</div>}{swapMode === "exactIn" && quoteLoading && <div className="pair-warning">Getting a live Uniswap v4 quote for this input. The output and minimum received will update automatically.</div>}{swapMode === "exactIn" && quoteHasNoLiquidity && <div className="pair-warning">The live quote returned no usable liquidity for this direction. The pool must have active in-range liquidity before the swap can be sent.</div>}{swapMode === "exactIn" && quoteError && !quoteHasNoLiquidity && <div className="pair-warning">The live Uniswap v4 quote is unavailable for this pool key or hook simulation. Sending is disabled until a valid quote is returned.</div>}{swapMode === "exactIn" && quoteEnabled && !quoteLoading && !quoteError && !quoteHasNoLiquidity && quoteAmountOut === undefined && <div className="pair-warning">The live quote could not be decoded. No fallback estimate is used, and sending remains disabled.</div>}{swapMode === "exactIn" && quoteReady && minimumAmountOut === 0n && <div className="pair-warning">Minimum received is empty or invalid. Enter a positive value before submitting; the automatic value uses 0.50% slippage.</div>}{!supportedDirection && <div className="pair-warning">This deployment currently has a BondMeBro pool only for ETH / WETH. Select that pair for a live test; other token pairs need their own initialized pool and liquidity.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is preview-only.</div>}{payToken.kind === "erc20" && amountIn !== undefined && amountIn > 0n && !tokenSpendingReady && <div className="pair-warning">Approve WETH first. After that, each swap opens only one MetaMask transaction.</div>}{!routerConfigured && <div className="pair-warning">Set the Universal Router address before sending.</div>}{!quoterConfigured && <div className="pair-warning">Set the network&apos;s Uniswap v4 Quoter address in the frontend environment before sending transactions.</div>}
           <div className={`swap-status swap-status-${status.tone}`}><StatusDot live={status.tone === "ready" || status.tone === "success"} /><div><strong>{status.title}</strong><span>{status.detail}</span></div></div>
-          <button type="button" className="primary-button large-button full-button swap-submit-button" disabled={actionDisabled} onClick={() => { if (!isConnected) onConnect(); else if (!networkCorrect) onSwitchNetwork(); else void submitSwap(); }}>{transactionState === "approving" ? "Approving token…" : transactionState === "sending" ? "Sending swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !rpcOnline ? "RPC offline" : poolConfigLoading ? "Reading pool config…" : poolConfigError ? "Retry pool config" : !supportedDirection ? "Pool not configured" : !bondingEnabledForSwap(poolConfig) ? "Pool config pending" : swapMode === "exactOut" ? "Exact-out preview" : quoteLoading ? "Getting live quote" : quoteError || quoteHasNoLiquidity || !quoteReady ? "Quote unavailable" : minimumAmountOut <= 0n ? "Set minimum output" : !amountFitsBalance && payBalance !== undefined ? "Insufficient balance" : "Review and swap"} <span>→</span></button>
+          {payToken.kind === "erc20" && amountIn !== undefined && amountIn > 0n && !tokenSpendingReady && isConnected && networkCorrect && <button type="button" className="outline-button full-button prepare-token-button" disabled={transactionState === "approving" || transactionState === "sending"} onClick={() => void prepareTokenSpending()}>{transactionState === "approving" ? "Approving WETH…" : "Approve WETH once"}</button>}
+          <button type="button" className="primary-button large-button full-button swap-submit-button" disabled={actionDisabled} onClick={() => { if (!isConnected) onConnect(); else if (!networkCorrect) onSwitchNetwork(); else void submitSwap(); }}>{transactionState === "approving" ? "Approving WETH…" : transactionState === "sending" ? "Confirming swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !rpcOnline ? "RPC offline" : poolConfigLoading ? "Reading pool config…" : poolConfigError ? "Retry pool config" : !supportedDirection ? "Pool not configured" : !bondingEnabledForSwap(poolConfig) ? "Pool config pending" : swapMode === "exactOut" ? "Exact-out preview" : quoteLoading ? "Getting quote" : quoteError || quoteHasNoLiquidity || !quoteReady ? "Quote unavailable" : minimumAmountOut <= 0n ? "Set minimum output" : !amountFitsBalance && payBalance !== undefined ? "Insufficient balance" : !tokenSpendingReady ? "Approve first" : "Swap"} <span>→</span></button>
           {transactionState === "error" && <div className="transaction-message transaction-error">{transactionError}</div>}{transactionState === "success" && transactionHash && <div className="transaction-message transaction-success">Confirmed. <a href={explorerTx(transactionHash)} target="_blank" rel="noreferrer">View transaction ↗</a><button type="button" className="text-button success-next-button" onClick={onViewBonds}>Track this bond →</button></div>}
-          <span className="readonly-note">Exact-input uses the BondMeBro hook payload and the configured Universal Router.</span>
+          <span className="readonly-note">Swap submit sends one wallet transaction. WETH approval is separate only if your allowance is missing.</span>
         </article>
         <aside className="swap-context"><article className="glass-card bond-preview-card"><div className="card-heading"><div><span className="eyebrow">BOND PREVIEW</span><h2>Accountability, up front.</h2></div><span className="preview-lock">⌁</span></div><div className="preview-amount"><span>ESTIMATED BOND</span><strong>{formatToken(estimatedBond, payToken.decimals)} <small>{payToken.symbol}</small></strong></div><div className="preview-rows"><div><span>Gross input</span><strong>{amountIn === undefined ? "—" : `${formatToken(amountIn, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Pool input after bond</span><strong>{amountIn === undefined ? "—" : `${formatToken(effectivePoolInput, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Bond rate</span><strong>{bondBps.toString()} bps</strong></div><div><span>Maturity checkpoint</span><strong>{observationBlocks.toString()} blocks</strong></div><div><span>Refund recipient</span><strong>{address ? formatAddress(address) : "Connect wallet"}</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>This is temporary collateral, not a guaranteed refund. Settlement is permissionless and uses the protocol-defined outcome rule.</p></div></article><button type="button" className="learn-link" onClick={onLearn}>Why is there a bond? <span>→</span></button></aside>
       </section>
@@ -1166,6 +1225,8 @@ function getSwapStatus({
   minimumAmountOut,
   amountFitsBalance,
   payBalance,
+  payTokenKind,
+  tokenSpendingReady,
   swapMode,
   quoteLoading,
   quoteError,
@@ -1186,6 +1247,8 @@ function getSwapStatus({
   minimumAmountOut: bigint;
   amountFitsBalance: boolean;
   payBalance?: bigint;
+  payTokenKind: TokenOption["kind"];
+  tokenSpendingReady: boolean;
   swapMode: "exactIn" | "exactOut";
   quoteLoading: boolean;
   quoteError: boolean;
@@ -1193,8 +1256,8 @@ function getSwapStatus({
   quoteAmountOut?: bigint;
   transactionState: TransactionState;
 }) {
-  if (transactionState === "approving") return { tone: "pending", title: "Approvals in progress", detail: "Confirm the token and Permit2 approvals in your wallet." };
-  if (transactionState === "sending") return { tone: "pending", title: "Swap awaiting confirmation", detail: "The Universal Router transaction is being submitted." };
+  if (transactionState === "approving") return { tone: "pending", title: "WETH approval", detail: "Prepare allowance once, then swap in one confirmation." };
+  if (transactionState === "sending") return { tone: "pending", title: "Confirm swap", detail: "One Universal Router transaction is being submitted." };
   if (transactionState === "success") return { tone: "success", title: "Swap confirmed", detail: "Your BondOpened event is being indexed. Open My bonds to track maturity." };
   if (transactionState === "error") return { tone: "error", title: "Swap not completed", detail: "Review the message below and try again when ready." };
   if (!isConnected) return { tone: "warning", title: "Connect your wallet", detail: "Your wallet becomes the swap payer and refund recipient." };
@@ -1212,9 +1275,10 @@ function getSwapStatus({
   if (quoteHasNoLiquidity) return { tone: "warning", title: "Pool has no liquidity", detail: "The live quote returned no usable output for this direction." };
   if (quoteError) return { tone: "error", title: "Quote unavailable", detail: "The deployed Quoter could not simulate this pool key and hook payload." };
   if (quoteAmountOut === undefined) return { tone: "error", title: "Quote unavailable", detail: "No fallback estimate is used; wait for a valid live quote before sending." };
-  if (minimumAmountOut <= 0n && transactionState === "idle") return { tone: "warning", title: "Set minimum output", detail: "The automatic minimum is empty or invalid. A positive value protects this swap from excessive slippage." };
-  if (!amountFitsBalance && payBalance !== undefined) return { tone: "warning", title: "Insufficient balance", detail: "Lower the input amount or fund this wallet." };
-  if (transactionState === "idle") return { tone: "ready", title: "Ready to review", detail: "The wallet will confirm the swap and any required approvals." };
+  if (minimumAmountOut <= 0n && transactionState === "idle") return { tone: "warning", title: "Set minimum output", detail: "Use a positive slippage-protected minimum." };
+  if (!amountFitsBalance && payBalance !== undefined) return { tone: "warning", title: "Insufficient balance", detail: "Lower the amount or fund this wallet." };
+  if (payTokenKind === "erc20" && !tokenSpendingReady) return { tone: "warning", title: "Approve WETH once", detail: "Approval is separate; the swap itself is one confirmation after allowance is ready." };
+  if (transactionState === "idle") return { tone: "ready", title: "Ready", detail: "One MetaMask confirmation submits the swap." };
   return { tone: "ready", title: "Ready", detail: "Review the live quote and bond before submitting." };
 }
 
@@ -1325,7 +1389,7 @@ function BondsScreen({
     <>
       <section className="screen-intro">
         <div><span className="eyebrow">02 / PORTFOLIO</span><h1>My bonds<br /><em>in one view.</em></h1></div>
-        <p>Track the bond created by your swap from opening through maturity and settlement. Any account may settle a matured FIFO prefix; the refund is always sent to the encoded recipient.</p>
+        <p>Track, settle, and claim your bond outcomes.</p>
       </section>
       <section className="bond-summary-grid">
         <MetricCard label="YOUR OPEN BONDS" value={formatInteger(BigInt(activeUserBonds.length))} detail="from recent chain history" icon="◈" accent />
@@ -1374,13 +1438,13 @@ function BondsScreen({
           </>
         ) : latestSettled?.settlement ? (
           <div className="empty-card large-empty settled-summary">
-            <div className="empty-icon">✓</div><strong>Your latest bond is settled</strong><span>The queue is clear, but the completed bond remains in your wallet-filtered history below. The gross refund is included in the settlement transaction; your net wallet balance also reflects settlement gas.</span>
+            <div className="empty-icon">✓</div><strong>Your latest bond is settled</strong><span>Completed bond history stays below.</span>
             <div className="settled-summary-grid"><div><span>REFUND SENT</span><strong>{formatToken(latestSettled.settlement.refundAmount, tokenDecimalsForCurrency(latestSettled.currency))} {tokenSymbolForCurrency(latestSettled.currency)}</strong></div><div><span>SLASHED TO POT</span><strong>{formatToken(latestSettled.settlement.slashAmount, tokenDecimalsForCurrency(latestSettled.currency))} {tokenSymbolForCurrency(latestSettled.currency)}</strong></div><div><span>SETTLED AT</span><strong>Block {latestSettled.settlement.block.toString()}</strong></div></div>
             <a className="settled-summary-link" href={latestSettled.settlement.hash ? explorerTx(latestSettled.settlement.hash) : "#"} target="_blank" rel="noreferrer">View settlement transaction ↗</a>
           </div>
         ) : settlementState === "success" && settlementHash ? (
           <div className="empty-card large-empty settled-summary">
-            <div className="empty-icon">✓</div><strong>Settlement confirmed</strong><span>The chain event is still indexing. Your bond history will update without losing this confirmation.</span><a className="settled-summary-link" href={explorerTx(settlementHash)} target="_blank" rel="noreferrer">View settlement transaction ↗</a>
+            <div className="empty-icon">✓</div><strong>Settlement confirmed</strong><span>Waiting for the event index.</span><a className="settled-summary-link" href={explorerTx(settlementHash)} target="_blank" rel="noreferrer">View settlement transaction ↗</a>
           </div>
         ) : (
           <div className="empty-card large-empty">
@@ -1483,7 +1547,7 @@ function ClaimsCard({
   return (
     <article className="glass-card claims-card">
       <div className="card-heading"><div><span className="eyebrow">SETTLEMENT PAYMENTS</span><h2>Available to claim</h2></div><Badge tone={hasClaims ? "orange" : "neutral"}>{hasClaims ? "ACTION NEEDED" : "CLEAR"}</Badge></div>
-      <p className="card-copy">Ordinary wallet refunds are sent automatically inside settlement. This panel is only for pull payments when a contract recipient rejects the inline transfer.</p>
+      <p className="card-copy">Fallback credits only. Normal refunds arrive during settlement.</p>
       <div className="claim-list">
         {rows.map((row) => (
           <div className="claim-row" key={row.symbol}><div><span>{row.symbol} CREDIT</span><strong>{formatToken(row.amount)} {row.symbol}</strong></div><button type="button" className="outline-button" disabled={!isConnected || !networkCorrect || row.amount === 0n || (claimState === "sending" || claimState === "submitted")} onClick={() => void claim(row.currency)}>{claimState === "sending" && claimCurrency?.toLowerCase() === row.currency.toLowerCase() ? "Confirm…" : claimState === "submitted" && claimCurrency?.toLowerCase() === row.currency.toLowerCase() ? "Pending…" : "Claim"}</button></div>
@@ -1568,21 +1632,21 @@ function PoolsScreen({
 
   return (
     <>
-      <section className="screen-intro"><div><span className="eyebrow">03 / POOL ANALYTICS</span><h1>Pool health.<br /><em>Clearly stated.</em></h1></div><p>Protocol-level state for the selected Uniswap v4 pool. Values below come from the deployed hook and are labeled as testnet data.</p></section>
+      <section className="screen-intro"><div><span className="eyebrow">03 / POOL ANALYTICS</span><h1>Pool health.<br /><em>Live.</em></h1></div><p>Current hook state for the selected Sepolia pool.</p></section>
       <section className="content-grid pool-analytics-grid">
         <article className="neo-card analytics-card"><div className="card-heading"><div><span className="eyebrow">SELECTED POOL</span><h2>ETH / WETH</h2></div><Badge tone={poolConnected ? "green" : "neutral"}><StatusDot live={poolConnected} /> {poolConnected ? "HOOK ACTIVE" : "CHECKING"}</Badge></div><div className="pool-identity-large"><div className="large-pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><span>PoolManager bound · Sepolia</span></div></div><div className="pool-stat-grid"><div><span>FEE TIER</span><strong>0.30%</strong></div><div><span>TICK SPACING</span><strong>60</strong></div><div><span>QUEUE</span><strong>{formatInteger(queueLength)}</strong></div><div><span>LAST TICK</span><strong>{accumulator?.[0]?.toString() ?? "—"}</strong></div></div><a className="outline-button full-button button-as-link" href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">View hook contract ↗</a></article>
         <article className="glass-card configuration-card"><div className="card-heading"><div><span className="eyebrow">BOND CONFIGURATION</span><h2>Pool parameters</h2></div><Badge tone={!rpcOnline ? "muted" : config && config[2] > 0n ? "orange" : "muted"}>{!rpcOnline ? "RPC OFFLINE" : config && config[2] > 0n ? "ENABLED" : "DISABLED"}</Badge></div>{!rpcOnline && <div className="pair-warning">Pool configuration is unavailable because the server-side RPC is offline. Use the Retry control in the top bar after configuring SEPOLIA_RPC_URL.</div>}<div className="config-list"><div><span>Bond BPS</span><strong>{config?.[2]?.toString() ?? "—"} <small>basis points</small></strong></div><div><span>Minimum / currency 0</span><strong>{formatToken(config?.[0])} <small>ETH</small></strong></div><div><span>Minimum / currency 1</span><strong>{formatToken(config?.[1])} <small>WETH</small></strong></div><div><span>Observation window</span><strong>{observationBlocks.toString()} <small>blocks</small></strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} <small>bps of slash</small></strong></div></div><div className="owner-row"><span>OWNER</span><a href={owner ? explorerAddress(owner) : "#"} target="_blank" rel="noreferrer">{formatAddress(owner)} ↗</a></div></article>
       </section>
       <section className="content-grid pool-analytics-grid analytics-lower">
-        <article className="neo-card"><SectionHeading eyebrow="ACCUMULATOR" title="Pool-local reference" copy="The accumulator updates once per block and clamps large movements before they become settlement reference data." /><div className="tick-display"><strong>{accumulator?.[0]?.toString() ?? "—"}</strong><span>LAST RECORDED TICK</span></div><div className="mini-stats"><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CLAMP</span><strong>{clampTicks.toString()} ticks</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 5) : "—"}</strong></div></div></article>
-        <article className="glass-card pot-card"><div className="card-heading"><div><span className="eyebrow">LP COVERAGE</span><h2>Insurance balances</h2></div><Badge tone={pot0 > 0n || pot1 > 0n ? "orange" : "neutral"}>{pot0 > 0n || pot1 > 0n ? "READY TO DISTRIBUTE" : "EMPTY"}</Badge></div><p className="card-copy">Slash value waits in the hook until anyone distributes it to the pool&apos;s in-range liquidity through PoolManager.donate.</p><div className="coverage-balance">{pots.map((pot) => <div key={pot.symbol}><span>{pot.symbol} POT</span><strong>{formatToken(pot.amount)} {pot.symbol}</strong><button type="button" className="outline-button" disabled={!isConnected || !networkCorrect || pot.amount === 0n || (donationState === "sending" || donationState === "submitted")} onClick={() => void donate(pot.currency, pot.amount)}>{donationState === "sending" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Confirm…" : donationState === "submitted" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Pending…" : pot.amount > 0n ? `Donate ${pot.symbol} pot` : "No pot yet"}</button></div>)}</div><div className="risk-callout"><span>ⓘ</span><p>Donations are permissionless and reward in-range LPs at donation time. A pool with no in-range liquidity will reject the donation and keep the pot intact.</p></div>{!isConnected && <div className="inline-empty"><button type="button" className="text-button" onClick={onConnect}>Connect wallet</button> to distribute a non-zero pot.</div>}{isConnected && !networkCorrect && <div className="inline-empty"><button type="button" className="text-button" onClick={onSwitchNetwork}>Switch to Sepolia</button> to distribute the pot.</div>}{donationState === "error" && <div className="transaction-message transaction-error">{donationError}</div>}{donationState === "success" && donationHash && <div className="transaction-message transaction-success">Pot distributed. <a href={explorerTx(donationHash)} target="_blank" rel="noreferrer">View transaction ↗</a></div>}</article>
+        <article className="neo-card"><SectionHeading eyebrow="ACCUMULATOR" title="Pool-local reference" copy="Once-per-block, clamped settlement data." /><div className="tick-display"><strong>{accumulator?.[0]?.toString() ?? "—"}</strong><span>LAST RECORDED TICK</span></div><div className="mini-stats"><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CLAMP</span><strong>{clampTicks.toString()} ticks</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 5) : "—"}</strong></div></div></article>
+        <article className="glass-card pot-card"><div className="card-heading"><div><span className="eyebrow">LP COVERAGE</span><h2>Insurance balances</h2></div><Badge tone={pot0 > 0n || pot1 > 0n ? "orange" : "neutral"}>{pot0 > 0n || pot1 > 0n ? "READY TO DISTRIBUTE" : "EMPTY"}</Badge></div><p className="card-copy">Slash value waiting for LP donation.</p><div className="coverage-balance">{pots.map((pot) => <div key={pot.symbol}><span>{pot.symbol} POT</span><strong>{formatToken(pot.amount)} {pot.symbol}</strong><button type="button" className="outline-button" disabled={!isConnected || !networkCorrect || pot.amount === 0n || (donationState === "sending" || donationState === "submitted")} onClick={() => void donate(pot.currency, pot.amount)}>{donationState === "sending" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Confirm…" : donationState === "submitted" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Pending…" : pot.amount > 0n ? `Donate ${pot.symbol} pot` : "No pot yet"}</button></div>)}</div><div className="risk-callout"><span>ⓘ</span><p>Donates to in-range LPs; failed donations keep the pot.</p></div>{!isConnected && <div className="inline-empty"><button type="button" className="text-button" onClick={onConnect}>Connect wallet</button> to distribute a non-zero pot.</div>}{isConnected && !networkCorrect && <div className="inline-empty"><button type="button" className="text-button" onClick={onSwitchNetwork}>Switch to Sepolia</button> to distribute the pot.</div>}{donationState === "error" && <div className="transaction-message transaction-error">{donationError}</div>}{donationState === "success" && donationHash && <div className="transaction-message transaction-success">Pot distributed. <a href={explorerTx(donationHash)} target="_blank" rel="noreferrer">View transaction ↗</a></div>}</article>
       </section>
     </>
   );
 }
 
 function ActivityScreen({ activity, activityError, onRefresh }: { activity: Activity[]; activityError: boolean; onRefresh: () => void }) {
-  return <><section className="screen-intro"><div><span className="eyebrow">04 / EVENT STREAM</span><h1>Everything<br /><em>on record.</em></h1></div><p>A unified view of BondMeBro events from the recent block window. Select any transaction to inspect it on the network explorer.</p></section><article className="neo-card full-activity-card"><div className="card-heading"><div><span className="eyebrow">LAST 5,000 BLOCKS</span><h2>Protocol activity</h2></div><div className="activity-heading-actions"><Badge tone={activityError ? "neutral" : "green"}><StatusDot live={!activityError} /> {activityError ? "SAVED VIEW" : "SYNCED"}</Badge><button type="button" className="outline-button activity-refresh" onClick={onRefresh}>Refresh</button></div></div>{activity.length === 0 ? <div className="inline-empty">{activityError ? "Event history is unavailable. Check the server-side RPC configuration." : "No events in this window"}</div> : <>{activityError && <div className="inline-empty activity-cache-note">Live RPC is unavailable. Showing saved recent activity.</div>}<div className="activity-table"><div className="activity-table-head"><span>EVENT</span><span>DETAIL</span><span>BLOCK</span><span>TRANSACTION</span></div>{activity.map((item, index) => <a className="activity-table-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-pill event-${item.kind.toLowerCase()}`}>{item.kind}</span><strong>{item.detail}</strong><span>#{item.block}</span><span>{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div></>}</article></>;
+  return <><section className="screen-intro"><div><span className="eyebrow">04 / EVENT STREAM</span><h1>Activity<br /><em>log.</em></h1></div><p>Recent BondMeBro events.</p></section><article className="neo-card full-activity-card"><div className="card-heading"><div><span className="eyebrow">LAST 5,000 BLOCKS</span><h2>Protocol activity</h2></div><div className="activity-heading-actions"><Badge tone={activityError ? "neutral" : "green"}><StatusDot live={!activityError} /> {activityError ? "SAVED VIEW" : "SYNCED"}</Badge><button type="button" className="outline-button activity-refresh" onClick={onRefresh}>Refresh</button></div></div>{activity.length === 0 ? <div className="inline-empty">{activityError ? "Event history is unavailable. Check the server-side RPC configuration." : "No events in this window"}</div> : <>{activityError && <div className="inline-empty activity-cache-note">Live RPC is unavailable. Showing saved recent activity.</div>}<div className="activity-table"><div className="activity-table-head"><span>EVENT</span><span>DETAIL</span><span>BLOCK</span><span>TRANSACTION</span></div>{activity.map((item, index) => <a className="activity-table-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-pill event-${item.kind.toLowerCase()}`}>{item.kind}</span><strong>{item.detail}</strong><span>#{item.block}</span><span>{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div></>}</article></>;
 }
 
 function LearnScreen({ onSwap }: { onSwap: () => void }) {
