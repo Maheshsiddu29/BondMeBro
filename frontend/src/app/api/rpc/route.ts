@@ -33,7 +33,7 @@ const READ_ONLY_METHODS = new Set([
   "eth_getTransactionCount",
   "eth_getTransactionReceipt",
   "eth_getUncleByBlockHashAndIndex",
-  "eth_getUncleByBlockNumber",
+  "eth_getUncleByBlockNumberAndIndex",
   "eth_getUncleCountByBlockHash",
   "eth_getUncleCountByBlockNumber",
   "net_version",
@@ -75,6 +75,11 @@ function isRateLimited(request: Request) {
     if (rateBuckets.size >= 1_000) {
       for (const [key, value] of rateBuckets) {
         if (now - value.startedAt >= RATE_WINDOW_MS) rateBuckets.delete(key);
+      }
+      // Keep the in-memory limiter bounded even if an attacker rotates source IPs.
+      if (rateBuckets.size >= 1_000) {
+        const oldestKey = rateBuckets.keys().next().value;
+        if (typeof oldestKey === "string") rateBuckets.delete(oldestKey);
       }
     }
     rateBuckets.set(identity, { startedAt: now, count: 1 });
