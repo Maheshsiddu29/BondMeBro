@@ -166,8 +166,32 @@ library ModelL2Reference {
         pure
         returns (uint128 collateral, uint128 slash, uint128 refund, uint256 slashBps)
     {
-        uint256 collateralBps = ModelLReference.collateralBps(tickBefore, tickAfter);
+        return settleAtRate(
+            variableLegAmount, ModelLReference.collateralBps(tickBefore, tickAfter), tickBefore, tickAfter, tickPath
+        );
+    }
 
+    /// @notice Settlement at an EXPLICIT collateral rate (ADR-0008 § 6).
+    ///
+    /// @dev THE RATE IS NOW AN INPUT, and it has to be. Before ADR-0008 the rate was a pure
+    ///      function of the bond's two stored ticks, so this reference could re-derive it. The
+    ///      effective rate also depends on `blockStartTick`, which is per-pool state that later
+    ///      blocks overwrite, so it is unrecoverable at settlement time — the hook stores it in the
+    ///      record and so must anything that prices a settlement independently.
+    ///
+    ///      `settle` above is kept as the own-impact special case, because a first-in-block bond's
+    ///      stored rate IS the own-impact rate and several tests are about exactly that equality.
+    ///
+    ///      NOTE what is still derived rather than passed: `targetSlashBps`, from the tick path.
+    ///      ADR-0008 changes the collateral rate and nothing else, so the residual half of the
+    ///      calculation stays fully independent of the hook.
+    function settleAtRate(
+        uint128 variableLegAmount,
+        uint256 collateralBps,
+        int24 tickBefore,
+        int24 tickAfter,
+        int24[10] memory tickPath
+    ) internal pure returns (uint128 collateral, uint128 slash, uint128 refund, uint256 slashBps) {
         slashBps = slashBpsFor(collateralBps, residual(tickPath, tickBefore, tickAfter));
 
         (collateral, slash, refund) = split(variableLegAmount, collateralBps, slashBps);

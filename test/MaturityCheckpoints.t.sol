@@ -74,7 +74,7 @@ contract MaturityCheckpointsTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -99,7 +99,8 @@ contract MaturityCheckpointsTest is Test, Deployers {
     }
 
     function _acc() internal view returns (int24 lastTick, uint32 lastUpdate, int56 cumulative) {
-        return hook.accumulator(id_);
+        // `blockStartTick` (ADR-0008) is skipped; see `Accumulator.t.sol::_acc`.
+        (lastTick, lastUpdate,, cumulative) = hook.accumulator(id_);
     }
 
     /// @dev The C10 view of a bucket, in the shape this suite used before ADR-0007 landed.

@@ -103,7 +103,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
 
         // MockV4Router inherits the real V4Router exact-output and
         // amountInMaximum logic. It only provides the test payment plumbing.
@@ -364,7 +364,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.revertToState(snap);
 
-        hook.setPoolConfig(key_, uint128(grossProbe + 1), uint96(grossProbe + 1), BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, uint128(grossProbe + 1), uint96(grossProbe + 1), true);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -390,7 +390,16 @@ contract BondCustodyExactOutputTest is Test, Deployers {
     ///
     ///      Collapsing these would be wrong in the expensive direction: reverting every sub-tick
     ///      swap would make the hook fail closed on ordinary dust trades that pose no risk at all.
-    function test_exactOutput_subTickSwap_isUnbondedNotReverted() public {
+    ///      ADR-0008 SPLIT THIS CASE FURTHER, and the split is along the BLOCK boundary.
+    ///
+    ///      "Sub-tick" is now a statement about the EFFECTIVE impact, not the own impact. A
+    ///      sub-tick swap that is FIRST IN ITS BLOCK still has `blockStartTick == tickBefore`, so
+    ///      its effective impact is zero and it is unbonded exactly as before -- that is the
+    ///      property worth keeping and it is what this test now pins. A sub-tick swap arriving
+    ///      into an ALREADY-DISPLACED block has a non-zero effective impact, so it bonds, and if
+    ///      its leg is small enough for the collateral to truncate to zero, INV-NOOP-VL rejects it.
+    ///      The next two tests pin that boundary and its unreachability.
+    function test_exactOutput_subTickSwap_firstInBlock_isUnbondedNotReverted() public {
         // NUDGE THE POOL OFF THE TICK BOUNDARY FIRST, and this is not incidental setup.
         //
         // The fixture initializes at exactly tick 0. Sitting on a boundary, ANY downward price
@@ -398,16 +407,16 @@ contract BondCustodyExactOutputTest is Test, Deployers {
         // rate is 1 bps no matter how small the trade. A "sub-tick" swap is therefore impossible
         // at a boundary, and without this warm-up the dust swap below reverts on INV-NOOP-VL
         // rather than passing unbonded.
-        //
-        // That edge is real, not an artifact: on a pool configured with a threshold of 1, a dust
-        // trade executed while the price sits exactly on a boundary WILL revert, because it owes
-        // a bond that truncates to zero. It is unreachable in any realistic deployment, where
-        // `minBondedAmount` is many orders of magnitude above dust and such a trade is unbonded
-        // long before it reaches the rate. `test_exactOutput_bondTruncatingToZero_reverts` covers
-        // the case deliberately; here it is only in the way.
         _swapExactOut(1e16, true, _validHookData());
 
-        hook.setPoolConfig(key_, 1, 1, BOND_BPS, REFUND_TOL);
+        // ROLL TO A NEW BLOCK, which ADR-0008 makes load-bearing rather than cosmetic. The nudge
+        // above displaced the block; leaving the dust swap in that same block would give it the
+        // nudge's displacement as its effective impact and it would bond. A new block re-latches
+        // `blockStartTick` to the current tick, which is what makes the dust swap genuinely
+        // sub-tick again.
+        vm.roll(block.number + 1);
+
+        hook.setPoolConfig(key_, 1, 1, true);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
         uint256 traderBefore1 = currency1.balanceOf(address(this));
@@ -418,9 +427,59 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         assertEq(ModelLReference.collateralBps(tickBefore, _tick()), 0, "fixture DID move a tick; test is misaimed");
 
+        // And the effective rate agrees, which is the ADR-0008 half of the claim: first in its
+        // block, the two models are the same function.
+        assertEq(
+            ModelLReference.effectiveCollateralBps(tickBefore, _tick(), tickBefore),
+            0,
+            "the effective rate is non-zero on a first-in-block sub-tick swap"
+        );
+
         assertEq(currency0.balanceOf(address(hook)), hookBefore, "a sub-tick swap took collateral");
 
         assertEq(currency1.balanceOf(address(this)) - traderBefore1, 100, "the swap did not deliver its output");
+    }
+
+    /// @notice ADR-0008 § 10 CONFIGURATION BOUNDARY. A dust swap in an already-displaced block
+    ///         bonds, and reverts on INV-NOOP-VL if its collateral truncates to zero.
+    ///
+    /// @dev REPORTED RATHER THAN PATCHED, and the choice is deliberate. The alternative -- treating
+    ///      a zero-truncating collateral as "unbonded" instead of reverting -- would create an
+    ///      execution path that moves the price and pays nothing, which is a dust-sized reopening
+    ///      of exactly the sub-tick free expansion ADR-0008 exists to close. Failing closed is the
+    ///      safer half of the trade, and it never finalizes a zero-collateral bond either way.
+    ///
+    ///      REACHABLE ONLY AT AN ABSURD THRESHOLD. It needs `minBondedAmount` low enough to admit
+    ///      a variable leg under `BPS / collateralBps` wei -- at most 100 wei at the cap, 667 at
+    ///      15 bps. The next test shows a realistic threshold makes it unreachable.
+    function test_exactOutput_dustInADisplacedBlock_revertsOnInvNoOpVL() public {
+        hook.setPoolConfig(key_, 1, 1, true);
+
+        // Displace the block.
+        _swapExactOut(1e16, true, _validHookData());
+
+        // Same block, dust leg: the effective impact is the block displacement, so this bonds --
+        // and 102 wei at that rate truncates to zero collateral.
+        vm.expectRevert();
+
+        _swapExactOut(100, true, _validHookData());
+    }
+
+    /// @notice ...and a production-realistic threshold makes that boundary unreachable.
+    ///
+    /// @dev The threshold gate runs BEFORE the rate is consulted, so a swap under
+    ///      `minBondedAmount` returns unbonded without ever computing an effective impact. At the
+    ///      fixture's own `MIN_BONDED` the dust swap is filtered two steps earlier than the branch
+    ///      that would revert it.
+    function test_exactOutput_dustInADisplacedBlock_isUnbondedAtARealisticThreshold() public {
+        _swapExactOut(1e16, true, _validHookData());
+
+        uint256 hookBefore = currency0.balanceOf(address(hook));
+
+        // Same displaced block, same dust swap, default (realistic) threshold.
+        _swapExactOut(100, true, _validHookData());
+
+        assertEq(currency0.balanceOf(address(hook)), hookBefore, "a below-threshold dust swap took collateral");
     }
 
     /// @notice INV-NOOP-VL on the exact-output path: a moved tick with a leg too small to charge
@@ -489,7 +548,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.revertToState(baseline);
 
-        hook.setPoolConfig(thinKey, 1, 1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(thinKey, 1, 1, true);
 
         vm.expectRevert(
             _wrapped(
@@ -764,7 +823,7 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         manager.initialize(emptyKey, TickMath.getSqrtPriceAtTick(0));
 
-        hook.setPoolConfig(emptyKey, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(emptyKey, MIN_BONDED, MIN_BONDED_1, true);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -806,15 +865,15 @@ contract BondCustodyExactOutputTest is Test, Deployers {
 
         vm.expectRevert(BondMeBro.NotOwner.selector);
 
-        hook.setPoolConfig(hostileKey, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(hostileKey, MIN_BONDED, MIN_BONDED_1, true);
 
-        (uint128 minBonded0, uint96 minBonded1, uint16 bondBps,) = hook.poolConfig(hostileKey.toId());
+        (uint128 minBonded0, uint96 minBonded1, bool bondingEnabled) = hook.poolConfig(hostileKey.toId());
 
         assertEq(minBonded0, 0, "hostile pool has a currency0 threshold");
 
         assertEq(minBonded1, 0, "hostile pool has a currency1 threshold");
 
-        assertEq(bondBps, 0, "hostile pool has a bond rate");
+        assertFalse(bondingEnabled, "hostile pool has bonding enabled");
     }
 
     /// @notice The exact-output `afterSwap` callback cannot be called directly by arbitrary addresses.

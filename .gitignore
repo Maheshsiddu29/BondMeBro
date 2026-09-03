@@ -59,6 +59,15 @@ docs/adr/0004-split-phase-bond-records.md
 docs/adr/0005-model-l2-economics.md
 docs/adr/0006-variable-leg-custody.md
 docs/adr/0007-observation-checkpoints.md
+docs/adr/0008-block-cumulative-impact-collateral.md
 P_L2_5_MIGRATION_REPORT.mdgit 
 P_L2_5_MIGRATION_REPORT.md
 P_L2_6_MIGRATION_REPORT.md
+P_L2_7_MIGRATION_REPORT.md
+P_L2_8_1_SPLIT_RESISTANCE_RESEARCH_REPORT.md
+P_L2_8_1B_BLOCK_IMPACT_INVARIANT_REVIEW.md
+P_L2_8_2_MIGRATION_REPORT.md
+P_L2_8_ADVERSARIAL_REPORT.md
+
+
+

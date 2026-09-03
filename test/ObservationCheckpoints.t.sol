@@ -105,7 +105,7 @@ contract ObservationCheckpointsTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
 
         // Seed the reference where the hook seeded its accumulator: at initialization, with a
         // cumulative of zero.
@@ -185,7 +185,7 @@ contract ObservationCheckpointsTest is Test, Deployers {
 
     function _lastUpdate() internal view returns (uint32 lastUpdate) {
         // slither-disable-next-line unused-return
-        (, lastUpdate,) = hook.accumulator(id_);
+        (, lastUpdate,,) = hook.accumulator(id_);
     }
 
     /// @dev Asserts every frozen endpoint of a bucket equals the independent reference.
@@ -852,7 +852,7 @@ contract ObservationCheckpointsTest is Test, Deployers {
         (,,, uint32 pending,) = _bucket(m);
 
         // Clear every endpoint and the mask, keeping the liability. `pendingBonds` is at byte 21.
-        bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(3)))));
+        bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(2)))));
 
         vm.store(address(hook), slot, bytes32(uint256(pending) << 168));
 

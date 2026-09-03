@@ -95,6 +95,61 @@ library ModelLReference {
         return (variableLegAmount * collateralBps(tickBefore, tickAfter)) / BPS;
     }
 
+    /// @notice ADR-0008's EFFECTIVE impact, in ticks.
+    ///
+    /// @dev Written from ADR-0008 § 3's prose, not copied from the hook, for the reason this
+    ///      file's header gives:
+    ///
+    ///          ownImpact         = |tickAfter - tickBefore|
+    ///          blockDisplacement = |tickAfter - blockStartTick|
+    ///          effectiveImpact   = max(ownImpact, blockDisplacement)
+    ///
+    /// @param tickBefore Pool tick immediately before the swap.
+    /// @param tickAfter Pool tick immediately after the swap.
+    /// @param blockStartTick Pool tick when this block's FIRST swap was about to execute.
+    function effectiveImpactTicks(int24 tickBefore, int24 tickAfter, int24 blockStartTick)
+        internal
+        pure
+        returns (uint256)
+    {
+        int256 own = int256(tickAfter) - int256(tickBefore);
+        int256 displacement = int256(tickAfter) - int256(blockStartTick);
+
+        uint256 ownTicks = uint256(own < 0 ? -own : own);
+        uint256 displacementTicks = uint256(displacement < 0 ? -displacement : displacement);
+
+        return ownTicks > displacementTicks ? ownTicks : displacementTicks;
+    }
+
+    /// @notice ADR-0008's block-cumulative collateral rate.
+    ///
+    /// @dev The SAME frozen curve as `collateralBps` -- same scale, same cap, same `ceil` -- fed
+    ///      the effective impact instead of the own impact. Restating the curve rather than
+    ///      delegating keeps the two derivations independent, so a bug in one cannot hide in the
+    ///      other.
+    ///
+    ///      When a trade is first in its block, `blockStartTick == tickBefore` and this returns
+    ///      exactly `collateralBps(tickBefore, tickAfter)`. That equality is what
+    ///      `test/BlockCumulativeImpact.t.sol` asserts across all four modes.
+    function effectiveCollateralBps(int24 tickBefore, int24 tickAfter, int24 blockStartTick)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 bps = (effectiveImpactTicks(tickBefore, tickAfter, blockStartTick) * COLLATERAL_SCALE + 99) / 100;
+
+        return bps > MAX_BOND_BPS ? MAX_BOND_BPS : bps;
+    }
+
+    /// @notice The collateral a bond must post under ADR-0008.
+    function effectiveCollateralFor(uint256 variableLegAmount, int24 tickBefore, int24 tickAfter, int24 blockStartTick)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (variableLegAmount * effectiveCollateralBps(tickBefore, tickAfter, blockStartTick)) / BPS;
+    }
+
     /// @notice Which currency the collateral is taken in, as a `currency0` predicate.
     ///
     /// @dev The unified custody rule from ADR-0006, restated independently:

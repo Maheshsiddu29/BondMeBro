@@ -97,7 +97,7 @@ contract QuoterIntegrationTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
 
         quoter = new V4Quoter(manager);
 

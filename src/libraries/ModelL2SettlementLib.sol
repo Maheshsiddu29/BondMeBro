@@ -65,6 +65,9 @@ library ModelL2SettlementLib {
     /// @notice Blocks spanned by each late window. Both windows are two blocks wide.
     uint256 internal constant LATE_WINDOW_BLOCKS = 2;
 
+    /// @notice Denominator for `SLASH_SCALE`, making the rate `25/100 == 0.25` bps per tick.
+    uint256 internal constant SLASH_SCALE_DENOMINATOR = 100;
+
     /// @notice One late window's average displacement, aligned to the trade's own direction.
     ///
     /// @dev THE ALIGNMENT HAPPENS IN CUMULATIVE SPACE, AND THAT IS NOT INTERCHANGEABLE WITH THE
@@ -191,7 +194,7 @@ library ModelL2SettlementLib {
     ///      Not capped here. The cap is `collateralBps`, applied by `slashBpsFor`, because a bond
     ///      can never forfeit more than it posted.
     function targetSlashBps(uint256 chargeable) internal pure returns (uint256) {
-        return (chargeable * SLASH_SCALE + 99) / 100;
+        return (chargeable * SLASH_SCALE + (SLASH_SCALE_DENOMINATOR - 1)) / SLASH_SCALE_DENOMINATOR;
     }
 
     /// @notice The realized slash rate: what the residual asks for, capped by what was posted.

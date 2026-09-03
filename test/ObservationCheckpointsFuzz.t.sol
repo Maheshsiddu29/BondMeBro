@@ -92,7 +92,7 @@ contract ObservationCheckpointsFuzzTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
 
         refPoints.push(RefPoint({blockNumber: uint32(block.number), cumulative: 0, tickFrom: _poolTick()}));
     }
@@ -149,7 +149,7 @@ contract ObservationCheckpointsFuzzTest is Test, Deployers {
 
     function _lastUpdate() internal view returns (uint32 lastUpdate) {
         // slither-disable-next-line unused-return
-        (, lastUpdate,) = hook.accumulator(id_);
+        (, lastUpdate,,) = hook.accumulator(id_);
     }
 
     /*//////////////////////////////////////////////////////////////

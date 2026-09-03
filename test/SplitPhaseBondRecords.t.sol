@@ -42,8 +42,13 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
 
     /// @dev `bonds` mapping slot, and the byte offset of `Bond.state` within struct slot 1.
     ///      Both derived from `forge inspect BondMeBro storage-layout`, never by hand.
-    uint256 internal constant BONDS_SLOT = 4;
-    uint256 internal constant STATE_BYTE_OFFSET = 30;
+    uint256 internal constant BONDS_SLOT = 3;
+    /// @dev Byte offset of `Bond.state` within the record's second slot.
+    ///
+    ///      MOVED FROM 30 TO 23 IN P-L2-7: removing `cumulativeAtOpen` (an `int56`) freed seven
+    ///      bytes from the middle of slot 1 and shifted `state` down with everything above it.
+    ///      `test/StorageLayout.t.sol` is the authority and fails first if it moves again.
+    uint256 internal constant STATE_BYTE_OFFSET = 25;
 
     uint8 internal constant STATE_NONE = 0;
     uint8 internal constant STATE_PROVISIONAL = 1;
@@ -72,7 +77,7 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -277,8 +282,13 @@ contract SplitPhaseBondRecordsTest is Test, Deployers {
         assertEq(afterLater.variableLegAmount, before.variableLegAmount, "variable leg changed");
         assertEq(afterLater.maturityBlock, before.maturityBlock, "maturity changed");
         assertEq(afterLater.tickAfter, before.tickAfter, "tickAfter changed");
-        assertEq(afterLater.cumulativeAtOpen, before.cumulativeAtOpen, "opening observation changed");
         assertEq(afterLater.refundRecipient, before.refundRecipient, "recipient changed");
+
+        // `cumulativeAtOpen` was asserted here until P-L2-7 removed it from `Bond`. Model L2
+        // measures every late window against `tickBefore`, not against an opening cumulative, so
+        // the field had become write-only. `tickBefore` carries the immutability claim now.
+        assertEq(afterLater.tickBefore, before.tickBefore, "opening tick changed");
+        assertEq(afterLater.collateralIsCurrency0, before.collateralIsCurrency0, "collateral currency changed");
     }
 
     /// @notice Exact-input still creates its record in one phase, never provisionally.

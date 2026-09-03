@@ -84,6 +84,36 @@ contract BondCustodyHandler is Test {
     /// @notice Bonds settled by the campaign.
     uint256 public settledCount;
 
+    /*//////////////////////////////////////////////////////////////
+                       ADR-0008 CAMPAIGN COUNTERS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Swaps that executed in a block another swap had already touched.
+    /// @dev The campaign must REACH the block-cumulative path for the ADR-0008 invariants to mean
+    ///      anything. A run where every swap is alone in its block exercises the old model only.
+    uint256 public sameBlockSwaps;
+
+    /// @notice Swaps that were the first to touch their pool in their block.
+    uint256 public firstInBlockSwaps;
+
+    /// @notice Bonds whose rate was decided by the BLOCK term rather than their own impact.
+    /// @dev The sharpest non-vacuity signal in the campaign: zero here means ADR-0008's rate never
+    ///      differed from the pre-migration rate anywhere in the run.
+    uint256 public blockTermDecidedBonds;
+
+    /// @notice Every bond id the campaign ever finalized, settled or not.
+    /// @dev `openBondIds` is pruned on settlement, so it cannot support an invariant that must hold
+    ///      over a bond's whole life. The ADR-0008 record invariants need this one.
+    bytes32[] internal allBondIds;
+
+    function allBondCount() external view returns (uint256) {
+        return allBondIds.length;
+    }
+
+    function allBondAt(uint256 index) external view returns (bytes32) {
+        return allBondIds[index];
+    }
+
     /// @notice Bonds whose settlement was attempted too early and correctly reverted.
     uint256 public earlySettleRejected;
 
@@ -207,6 +237,32 @@ contract BondCustodyHandler is Test {
     ///      `ghostSettlementMismatch == false` by doing nothing at all.
     uint256 public settlementsChecked;
 
+    /*//////////////////////////////////////////////////////////////
+              P-L2-8 NON-VACUITY COUNTERS (task section 27)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Settlements that refunded everything and slashed nothing.
+    uint256 public fullRefundCount;
+
+    /// @notice Settlements that slashed part and refunded part.
+    uint256 public partialSlashCount;
+
+    /// @notice Settlements that slashed everything and refunded nothing.
+    uint256 public fullSlashCount;
+
+    /// @notice Whether any settled bond was collateralised in each currency.
+    /// @dev Under variable-leg custody the collateral currency depends on the swap KIND as well as
+    ///      its direction, so a campaign touching only one is exercising half the custody paths.
+    mapping(Currency => bool) public settledInCurrency;
+
+    /// @notice The union of every `frozenMask` bit this campaign has ever observed set.
+    /// @dev A campaign that never froze C6 would satisfy every conditional endpoint assertion by
+    ///      skipping it. This makes that visible.
+    uint8 public observedMaskUnion;
+
+    /// @notice Settlements performed at or after maturity.
+    uint256 public settledAfterMaturity;
+
     /// @notice Number of distinct maturity blocks the campaign has touched.
     function touchedMaturityCount() external view returns (uint256) {
         return touchedMaturities.length;
@@ -302,7 +358,7 @@ contract BondCustodyHandler is Test {
     ///      Iterates the ACTIVE SET, never a block range. There is no
     ///      `for b = oldLastUpdate + 1 ... newLastUpdate` here or anywhere else.
     function _resolveDueMaturities() internal {
-        (, uint32 lastUpdate,) = hook.accumulator(key_.toId());
+        (, uint32 lastUpdate,,) = hook.accumulator(key_.toId());
 
         uint256 i;
 
@@ -498,7 +554,31 @@ contract BondCustodyHandler is Test {
             ghostInsurancePot[currency] += slash;
             ghostRefundPaid[currency] += refund;
 
+            // ADR-0004 Rule 3: `pendingBonds` counts FINALIZED, UNSETTLED bonds, so the hook
+            // decrements it here and the ghost must follow.
+            //
+            // THIS LINE WAS MISSING AND COULD NOT PREVIOUSLY HAVE BEEN NOTICED. `settleABond` was
+            // never registered as a campaign action, so no bond ever settled during a run and
+            // `invariant_pendingBondsCountsFinalizedOnly` was correct only by never being tested
+            // against a decrement. Registering the action surfaced it immediately.
+            expectedFinalizedAt[bond.maturityBlock] -= 1;
+
             settledCount++;
+
+            // OUTCOME CLASSIFICATION, so "the invariants passed" can be distinguished from "the
+            // campaign never reached an interesting state".
+            if (slash == 0) fullRefundCount++;
+            else if (refund == 0) fullSlashCount++;
+            else partialSlashCount++;
+
+            settledInCurrency[currency] = true;
+
+            if (block.number >= bond.maturityBlock) settledAfterMaturity++;
+
+            // slither-disable-next-line unused-return
+            (,,,, uint8 mask) = hook.maturity(key_.toId(), bond.maturityBlock);
+
+            observedMaskUnion |= mask;
 
             _dropOpenBond(bondId);
         } catch {
@@ -552,6 +632,7 @@ contract BondCustodyHandler is Test {
 
         bondOpen[bondId] = true;
         openBondIds.push(bondId);
+        allBondIds.push(bondId);
     }
 
     /// @dev Removes a settled bond from the live-liability set. Swap-and-pop, O(1).
@@ -587,8 +668,12 @@ contract BondCustodyHandler is Test {
             path[k] = refTickDuring(openBlock + uint32(k));
         }
 
-        (uint128 refCollateral, uint128 refSlash, uint128 refRefund,) =
-            ModelL2Reference.settle(bond.variableLegAmount, bond.tickBefore, bond.tickAfter, path);
+        // ADR-0008 § 6: price against the rate the record actually carries, not a recomputation
+        // from the ticks. `blockStartTick` is gone by now, so recomputing would silently price the
+        // OLD model against the new one and report a false disagreement.
+        (uint128 refCollateral, uint128 refSlash, uint128 refRefund,) = ModelL2Reference.settleAtRate(
+            bond.variableLegAmount, uint256(bond.collateralBps), bond.tickBefore, bond.tickAfter, path
+        );
 
         settlementsChecked++;
 
@@ -604,7 +689,7 @@ contract BondCustodyHandler is Test {
 
     /// @dev Returns the bonding threshold denominated in the input currency for the selected direction.
     function _threshold(bool zeroForOne) internal view returns (uint256) {
-        (uint128 min0, uint96 min1,,) = hook.poolConfig(key_.toId());
+        (uint128 min0, uint96 min1,) = hook.poolConfig(key_.toId());
 
         return zeroForOne ? uint256(min0) : uint256(min1);
     }
@@ -697,7 +782,18 @@ contract BondCustodyHandler is Test {
         uint256 managerInputBefore;
         uint256 selfVariableBefore;
         int24 tickBefore;
+        int24 blockStartTick;
     }
+
+    /// @dev The handler's OWN block-start latch (ADR-0008), tracked independently of the hook.
+    ///
+    ///      NOT READ FROM `hook.accumulator`. `docs/INVARIANTS-L2.md`'s governing rule is that a
+    ///      reference which asks the hook what it thinks proves only that the hook agrees with
+    ///      itself. So the campaign reconstructs the latch from the pool: whenever `block.number`
+    ///      moves, the next swap's pre-swap tick becomes the block's starting tick.
+    int24 internal ghostBlockStartTick;
+
+    uint32 internal ghostBlockStartAt;
 
     /// @dev Captures everything needed before a swap, choosing currencies by KIND and direction.
     function _snapshotLegs(bool zeroForOne, bool isExactInput) internal view returns (Legs memory legs) {
@@ -716,6 +812,10 @@ contract BondCustodyHandler is Test {
 
         // slither-disable-next-line unused-return
         (, legs.tickBefore,,) = manager.getSlot0(key_.toId());
+
+        // Reconstruct ADR-0008's latch. On a block's FIRST swap the pool's pre-swap tick IS the
+        // block's starting tick; later swaps in the same block inherit it.
+        legs.blockStartTick = ghostBlockStartAt == uint32(block.number) ? ghostBlockStartTick : legs.tickBefore;
     }
 
     /// @dev Reconstructs the expected bond from realized movement and updates every ghost total.
@@ -759,9 +859,32 @@ contract BondCustodyHandler is Test {
 
         // ELIGIBILITY IS DECIDED ON THE ACTUAL CONSUMED INPUT (INV-L2-13), not on the requested
         // amount. A swap that asked for more than the threshold but filled below it is unbonded.
+        // ADR-0008: the rate is sized from the EFFECTIVE impact, so the campaign's independent
+        // prediction must be too or `invariant_bondsMatchTheFormula` would be asserting the old
+        // mechanism against the new one.
         uint256 expectedBond = actualInput < _threshold(zeroForOne)
             ? 0
-            : ModelLReference.collateralFor(variableLeg, legs.tickBefore, tickAfter);
+            : ModelLReference.effectiveCollateralFor(variableLeg, legs.tickBefore, tickAfter, legs.blockStartTick);
+
+        // Campaign reach counters (ADR-0008). Recorded BEFORE the latch is committed, so the
+        // "was this block already touched" question is still answerable.
+        if (ghostBlockStartAt == uint32(block.number)) {
+            sameBlockSwaps++;
+        } else {
+            firstInBlockSwaps++;
+        }
+
+        if (
+            bondTaken > 0
+                && ModelLReference.effectiveImpactTicks(legs.tickBefore, tickAfter, legs.blockStartTick)
+                    > ModelLReference.effectiveImpactTicks(legs.tickBefore, tickAfter, legs.tickBefore)
+        ) {
+            blockTermDecidedBonds++;
+        }
+
+        // Commit the latch for the rest of this block.
+        ghostBlockStartTick = legs.blockStartTick;
+        ghostBlockStartAt = uint32(block.number);
 
         expectedBondTotal[legs.collateralCurrency] += expectedBond;
 

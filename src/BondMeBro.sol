@@ -41,17 +41,91 @@ uint160 constant HOOK_FLAGS = uint160(
 );
 
 /// @title BondMeBro
-/// @notice A hook that takes a collateral bond on swaps that exceed a per-pool threshold, and returns it after the swap. The bond is sized as a fraction of gross input, and is taken from the trader's input currency. The hook supports both exact-input and exact-output swaps, single-hop, ERC-20 <-> ERC-20, both directions.
-
-/// @dev please note that BondMeBro currently handles bondCustody only. It can calculate, validate and holds the bond, but bond settlement is yet to be designed and implemented.For now , it doesnt store long-term bond, track maturity, settle traders and refund them but it is part of the current roadmap and is currently under development. This hook is stateless design, so it does'nt store any state between beforeSwap and afterSwap.
-
-/// for exact-input swaps , the bond is taken out from the funds that trader planned to spend on the trade/swap.For instance, if trader wants to swap 1000 USDC for ETH , only 999 USDC goes into the pool and 1 USDC is taken as bond and held as collateral. Trader does'nt need to pay 10001 USDC for the swap. The bond is taken as same currency as the i/p currency of the swap.
-
-///for exact-output swaps, it is difficult to calculate the bond amount, coz for exact-output swaps the trader specifies the o/p amount they want to receive. So, pool determines the exact ampunt during the execution. For that reason, the bond is added on top of the funds that trader planned to spend on the trade/swap. For instance, if trader wants Trader requests exactly 1 ETH , then pool requires 1000 USDC to give 1 ETH. The hook will take 10 USDC as bond and send 1000 USDC to the pool. So, the total amount spent by trader is 1010 USDC. The bond is taken as same currency as the i/p currency of the swap.The trader's `maxBondAmount` and the router's exact-output maximum-input protection limit how much additional input may be charged.
-
-///For Custody, bonds are always taken in the input currency of the swap. The hook does not support cross-currency custody.Exact-input swap use 'beforeSwapDelta' and exact-output swaps use 'afterSwapDelta', actual amount is known only after the swap is executed by the pool. The exact-output swap doesnt store temporary information between 'beforeSwap' and 'afterSwap'; the required hookData is validated again when needed.abi
-
-///For now , this hook does'nt support multi-hop swaps,native currency, fee on transfer tokens and rebasing. These features to be added considering the time left for the hookathon.
+///
+/// @notice A Uniswap v4 hook that takes REFUNDABLE COLLATERAL from swaps large enough to matter,
+///         holds it for ten blocks, and returns whatever the price did not keep.
+///
+///         The idea in one line: a swap that moves the price and leaves it moved has imposed a
+///         cost on liquidity providers; a swap whose price impact reverts has not. BondMeBro
+///         measures which happened and charges accordingly, rather than charging everyone a fee
+///         up front.
+///
+/// @dev SUPPORTED MODES. Single-hop ERC-20 <-> ERC-20, exact-input and exact-output, both
+///      directions. NOT supported, and not tested: multi-hop, native currency, fee-on-transfer
+///      tokens, and rebasing or otherwise non-standard tokens.
+///
+///      HOW MUCH IS TAKEN — impact-scaled, from realized execution (ADR-0005, ADR-0006, ADR-0008).
+///
+///          ownImpact         = |tickAfter - tickBefore|
+///          blockDisplacement = |tickAfter - blockStartTick|
+///          effectiveImpact   = max(ownImpact, blockDisplacement)
+///
+///          collateralBps = min(100, ceil(effectiveImpact * 0.25))
+///          collateral    = variableLegAmount * collateralBps / 10_000
+///
+///      Both inputs are REALIZED, never requested: a swap that asks for a large amount and fills a
+///      small one is charged on what it actually did. Eligibility works the same way — a trade
+///      participates only if the input the pool actually CONSUMED clears the pool's threshold.
+///
+///      WHY THE BLOCK TERM EXISTS (ADR-0008). Sizing collateral from a swap's OWN impact alone
+///      lets one price move be split into N same-block pieces, each posting about `leg × impact /
+///      N²`, so the total falls as `1/N` while the pool ends the block at exactly the same price.
+///      Below one tick per piece the rate rounds to zero and the pieces stop bonding at all, so
+///      the dilution is unbounded — measured at 132x for 512 pieces of a 58-tick move.
+///
+///      `blockStartTick` is the tick the pool sat at when the block's FIRST swap was about to
+///      execute, so `blockDisplacement` prices a trade on WHERE IT LEFT THE POOL relative to where
+///      the block started, not merely on how far it personally moved it.
+///
+///      IT IS POOL-LEVEL AND IDENTITY-FREE. Nothing here reads `sender`, `refundRecipient`,
+///      `tx.origin` or the router, so the charge cannot be reduced by spreading a trade across
+///      addresses, routers or transactions — only by not moving the price.
+///
+///      A TRADE FIRST IN ITS BLOCK IS UNAFFECTED. Then `blockStartTick == tickBefore`, the two
+///      terms are equal, and the collateral is bit-identical to what the pre-ADR-0008 rule took.
+///      Isolated traffic is priced exactly as before.
+///
+///      THIS IS MITIGATION, NOT IMMUNITY. A same-block split still dilutes the charge by about 2x
+///      on collateral and 4x on the slash. ADR-0008 § 7 states the measured limits and explicitly
+///      does not claim split invariance.
+///
+///      WHICH TOKEN IT COMES FROM — the swap's VARIABLE leg, which the swap KIND decides:
+///
+///          exact-input  : the input is fixed, so the collateral comes out of the OUTPUT
+///          exact-output : the output is fixed, so the collateral comes out of the INPUT
+///
+///      Either way the SPECIFIED leg is untouched: a trader who asks to spend exactly 1,000 USDC
+///      spends exactly 1,000 USDC. The hook does not hold `BEFORE_SWAP_RETURNS_DELTA` and so has
+///      no mechanism to alter the specified amount at all.
+///
+///      HOW MUCH IS KEPT — Model L2's surviving-displacement residual (ADR-0005, ADR-0007).
+///      Settlement reads the pool's tick cumulative at three frozen endpoints and asks how much of
+///      the original displacement was still there late in the window:
+///
+///          R = max( aligned TWA over blocks 6-7, aligned TWA over blocks 8-9, 0 )
+///          Q = 0 if R <= 5 ; 2(R - 5) if R < 10 ; R otherwise      <- the D = 5 dead zone
+///          slashBps = min(collateralBps, ceil(Q * 0.25))
+///          slash    = variableLegAmount * slashBps / 10_000
+///          refund   = collateral - slash
+///
+///      Displacement is measured in the trade's OWN direction and clamped at zero, so a price move
+///      the other way can never manufacture a charge. Settlement is permissionless and its answer
+///      does not depend on when it is called.
+///
+///      WHAT THIS IS NOT. It does not detect or label traders, it does not price toxicity, and it
+///      does not make manipulation impossible. It is an LP-risk PROXY: measured price displacement
+///      over a fixed window, nothing more. Its known limitations are documented rather than
+///      hidden — see ADR-0005 § 6 for the two-block straddle, the noise floor below which
+///      displacement is free, and the 1% cap above which protection stops scaling.
+///
+///      THE PARAMETERS ARE FROZEN AND NOT GOVERNABLE. The collateral scale, the 1% cap, the
+///      ten-block horizon and the dead zone are compile-time constants. A pool owner can enable or
+///      disable the mechanism and set which trades are large enough to participate; nobody can
+///      change what participation costs.
+///
+///      STATE. The hook is NOT stateless: it keeps a per-pool tick accumulator, one record per
+///      bond, and one maturity bucket per block holding that cohort's three observation endpoints.
+///      See ADR-0003, ADR-0004 and ADR-0007.
 
 contract BondMeBro is BaseHook {
     using StateLibrary for IPoolManager;
@@ -69,7 +143,16 @@ contract BondMeBro is BaseHook {
     ///      is a compile-time constant.
     uint256 public constant BPS = 10_000;
 
-    /// @notice Max bond rate allowed by the contract is 1% of gross input i;e 100 bps.
+    /// @notice The collateral rate cap: 1% of the variable leg, i.e. 100 bps.
+    ///
+    /// @dev ADR-0005 calls this `MAX_COLLATERAL_BPS`; the name here keeps the contract's own
+    ///      "bond" vocabulary, which `settleBond`, `bondExists` and `maxBondAmount` also use.
+    ///      They are the same constant.
+    ///
+    ///      A cap is required rather than merely prudent: it is what keeps the collateral a small
+    ///      fraction of the trade, which is what makes INV-NOOP-VL's strict upper bound
+    ///      unreachable in practice. Raising it is an economic decision needing its own ADR, and
+    ///      ADR-0005 § 6.3 records what is given up by holding it here.
     /// @dev This is a compile-time constant and cannot be changed by the owner.Keeping Max bond rate at 1% gives large safety margin from INV-NOOP boundary , where bond would equal to trader's full input
 
     uint16 public constant MAX_BOND_BPS = 100;
@@ -124,7 +207,7 @@ contract BondMeBro is BaseHook {
     ///      long the mechanism waits before judging whether a price displacement persisted, which
     ///      is the core economic parameter of the whole mechanism: too short and ordinary noise
     ///      reads as persistence, too long and the bond is held far beyond its useful life. That
-    ///      trade-off can only be settled against the simulation and toxicity research, none of
+    ///      trade-off can only be settled against simulation and market-impact research, none of
     ///      which is present in this repository.
     ///
     ///      Must satisfy `0 < OBSERVATION_BLOCKS <= MAX_OBSERVATION_BLOCKS`; 10 <= 16 holds, with
@@ -173,6 +256,14 @@ contract BondMeBro is BaseHook {
     ///      optimum — see ADR-0005 section 6.4 before changing it, and open a new ADR.
     uint16 public constant COLLATERAL_SCALE = 25;
 
+    /// @notice Denominator for `COLLATERAL_SCALE`, making the rate `25/100 == 0.25` bps per tick.
+    ///
+    /// @dev Named rather than written as a bare `100`, because the pair is what expresses the
+    ///      frozen 0.25 and a reader seeing only `+ 99) / 100` has to reconstruct that. The `+ 99`
+    ///      is the ceiling, which is load-bearing: with `floor`, impacts of 1-3 ticks would price
+    ///      at ZERO and a swap that visibly moved the price would post nothing.
+    uint256 public constant COLLATERAL_SCALE_DENOMINATOR = 100;
+
     /// @notice Realized impact at which the `MAX_BOND_BPS` cap first binds.
     /// @dev `ceil(397 * 25 / 100) == 100`, and `ceil(396 * 25 / 100) == 99`. Stated as a constant
     ///      so the boundary is pinned by name rather than rediscovered.
@@ -192,43 +283,36 @@ contract BondMeBro is BaseHook {
 
     /// Keeping the config in one slot avoids introducing an additional storageslot read on swap paths. This is particularly useful for bondedexact-output `afterSwap`, which is already above its target gas budget.
 
-    /// @param minBondedAmount0 Minimum gross input that requires collateral when  currency0 is the input (`zeroForOne == true`), expressed in raw  currency0 units. See ADR-0001 §3.1.
+    /// @param minBondedAmount0 Minimum CONSUMED input that makes a swap participate when currency0
+    ///        is the input (`zeroForOne == true`), in raw currency0 units. Measured against what the
+    ///        pool actually took, never against what was requested.
 
-    /// @param minBondedAmount1 Minimum gross input that requires collateral when  currency1 is the input (`zeroForOne == false`), expressed in raw  currency1 units.
+    /// @param minBondedAmount1 The same for currency1 as the input (`zeroForOne == false`), in raw
+    ///        currency1 units. Separate because the two currencies may differ in decimals and
+    ///        value.
 
-    /// @param bondBps VESTIGIAL AS A RATE. It is now only the per-pool ENABLE FLAG.
+    /// @param bondingEnabled Whether this pool bonds at all.
     ///
-    ///        P-L2-3/4 replaced amount-proportional sizing with Model L, which derives the
-    ///        collateral rate from the realized tick impact (`_collateralBpsFor`) and never reads
-    ///        this field. It survives because `cfg.bondBps == 0` is the "bonding disabled"
-    ///        sentinel and because the all-or-nothing config rule still requires it to be set.
+    ///        THE ONLY ECONOMIC CONTROL AN OWNER HAS, and that is deliberate. Everything that
+    ///        decides how much a trade pays is a compile-time constant: the collateral scale, the
+    ///        1% cap, the observation horizon and the `D = 5` dead zone. An owner can turn the
+    ///        mechanism on or off for a pool and choose which trades are large enough to
+    ///        participate; they cannot change what participation costs.
     ///
-    ///        An owner setting this to 25 expecting 25 bps will get whatever the tick impact
-    ///        implies. Removing or renaming it changes the storage layout and the owner-facing
-    ///        ABI, so it is deliberately left alone until P-L2-7.
+    ///        This replaced two `uint16` fields in P-L2-7. `bondBps` had been vestigial as a rate
+    ///        since P-L2-3/4 — Model L derives the rate from realized impact — and survived only
+    ///        as a `!= 0` enable sentinel; `refundToleranceTicks` was Model B's noise floor and
+    ///        became unread in P-L2-6. Keeping either would have left a field whose name promised
+    ///        control it did not have, which is the most dangerous kind of configuration surface.
     ///
-    /// @param refundToleranceTicks VESTIGIAL AFTER P-L2-6. Read by nothing.
-    ///
-    ///        It was Model B's noise floor, subtracted from both sides of the persistence
-    ///        fraction. Model L2 replaced that curve entirely: the noise floor is now the `D = 5`
-    ///        dead zone, which is a FROZEN COMPILE-TIME CONSTANT in `ModelL2SettlementLib`
-    ///        (ADR-0005 § 2.1) rather than per-pool configuration. Nothing on any production path
-    ///        reads this field any more.
-    ///
-    ///        ADR-0005 § 4 anticipates repurposing the two `uint16` fields — `bondBps` to the
-    ///        collateral scale and this one to `D` — but P-L2-6's scope is settlement economics
-    ///        only, and the parameters it implements are frozen rather than configurable. Making
-    ///        them per-pool is a separate decision with its own governance surface, and belongs
-    ///        with the rest of the config cleanup in P-L2-7.
-    ///
-    ///        `uint16` keeps `PoolConfig` at exactly 128 + 96 + 16 + 16 = 256 bits, ONE slot. That
-    ///        matters: the swap path already reads this struct, and a second slot would add a cold
-    ///        SLOAD to every swap. Verified with `forge inspect BondMeBro storage-layout`.
+    ///        ADR-0005 § 4 anticipated repurposing the two fields as an owner-settable scale and
+    ///        dead zone. That was NOT done: it would hand governance direct control over the
+    ///        economics, which needs its own research and its own ADR rather than arriving as a
+    ///        side effect of cleanup.
     struct PoolConfig {
         uint128 minBondedAmount0;
         uint96 minBondedAmount1;
-        uint16 bondBps;
-        uint16 refundToleranceTicks;
+        bool bondingEnabled;
     }
 
     /// @notice Compact reference to a pool, written once at initialization.
@@ -251,10 +335,12 @@ contract BondMeBro is BaseHook {
     ///
     ///      Packing (verified with `forge inspect BondMeBro storage-layout`):
     ///        slot 0: refundRecipient 20 + openBlock 4 + maturityBlock 4 + poolIndex 4 = 32 bytes
-    ///        slot 1: amount 16 + cumulativeAtOpen 7 + tickBefore 3 + tickAfter 3 + flags 1 = 30
+    ///        slot 1: variableLegAmount 16 + tickBefore 3 + tickAfter 3 + collateralBps 2
+    ///                + flag 1 + state 1 = 26 bytes
     ///
     ///      Two slots is the floor for this field set: `refundRecipient` (20) plus any useful
-    ///      `amount` width already fills the first slot.
+    ///      `amount` width already fills the first slot. P-L2-8.2's `collateralBps` went into slot
+    ///      1's existing spare bytes and did NOT add a third slot — 6 bytes remain.
     ///
     /// @param refundRecipient Address the refund is owed to, from validated hookData. Never
     ///        `sender` and never `tx.origin`.
@@ -275,9 +361,29 @@ contract BondMeBro is BaseHook {
     ///        the opening impact rises, over 606,000,000 combinations.
     ///
     ///        Use `collateralAmountOf` to read the collateral actually held.
-    /// @param cumulativeAtOpen Tick accumulator value at `openBlock`; the window's start reading.
-    /// @param tickBefore Pool tick immediately before the swap.
+    /// @param tickBefore Pool tick immediately before the swap. The SETTLEMENT displacement's ZERO:
+    ///        every Model L2 late window is measured against it. Since ADR-0008 it is no longer the
+    ///        sole input to the collateral RATE — see `collateralBps`.
     /// @param tickAfter Pool tick immediately after the swap.
+    /// @param collateralBps The rate custody ACTUALLY charged, in bps of the variable leg.
+    ///
+    ///        STORED RATHER THAN RECOMPUTED, AND THAT IS FORCED BY ADR-0008 rather than chosen.
+    ///        Before ADR-0008 the rate was a pure function of the two ticks this record already
+    ///        held, so settlement recomputed it and reproduced the physically-taken amount by
+    ///        construction. The effective rate now also depends on `blockStartTick`, which is
+    ///        PER-POOL state that every later block overwrites — unrecoverable by the time anyone
+    ///        settles. Recomputing would silently return a DIFFERENT number from the one taken,
+    ///        which is the one failure mode this record exists to prevent.
+    ///
+    ///        Two bytes, into slot 1's existing spare: 16 + 3 + 3 + 2 + 1 + 1 = 26 of 32. `uint8`
+    ///        would also have fitted and is enough for a rate capped at 100; `uint16` is used
+    ///        because it survives a future cap change without a layout migration, and the byte it
+    ///        costs was already paid for.
+    ///
+    ///        ADR-0005 § 3.2's argument for storing the LEG rather than the COLLATERAL is
+    ///        untouched and still governs: the leg is what the only INV-L2-4-safe token slash form
+    ///        needs, and the `leg = 102` counterexample still rules out the ratio form. This adds
+    ///        the rate; it does not replace the leg.
     /// @param collateralIsCurrency0 True when the COLLATERAL is the pool's currency0. Under
     ///        variable-leg custody this is decided by the swap KIND as well as the direction, so
     ///        it must be read from the record and never re-derived from direction alone
@@ -292,9 +398,9 @@ contract BondMeBro is BaseHook {
         uint32 maturityBlock;
         uint32 poolIndex;
         uint128 variableLegAmount;
-        int56 cumulativeAtOpen;
         int24 tickBefore;
         int24 tickAfter;
+        uint16 collateralBps;
         bool collateralIsCurrency0;
         BondState state;
     }
@@ -356,14 +462,6 @@ contract BondMeBro is BaseHook {
         SETTLED
     }
 
-    /// @notice Pre-swap accumulator observation, passed between callback helpers.
-    /// @dev A struct purely to keep helper signatures inside the EVM stack limit.
-    struct Observation {
-        int24 tickBefore;
-        int24 tickAfter;
-        int56 cumulativeAtOpen;
-    }
-
     struct MaturityCheckpoint {
         int56 cumulativeMinus4;
         int56 cumulativeMinus2;
@@ -382,11 +480,6 @@ contract BondMeBro is BaseHook {
 
     /// @notice Bonding parameters per pool. A pool with no entry never bonds.
     mapping(PoolId => PoolConfig) public poolConfig;
-
-    /// @notice Number of times `afterInitialize` has fired.
-    /// @dev we kept afterInitializeCount as public variable to check if the hook is called after initialize in the test suite. It is not used for any other purpose.It is safe to keep because it only increases when the pool is initialized, not every time when someone swaps. This does'nt make normal trading expensive.
-    /// We used 'beforeSwapCount' and 'afterSwapCount' before, but they were removed because they wrote to storage on every swap, which costs a lot of gas.
-    uint256 public afterInitializeCount;
 
     /// @notice Time-weighted tick accumulator for each pool.
     ///
@@ -442,40 +535,55 @@ contract BondMeBro is BaseHook {
                               EVENTS & ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Emitted when one of the hook callbacks executes.
-    event CallbackFired(string which, int24 tick);
-
     /// @notice Emitted when bonding parameters are changed for a pool.
     /// @param id Pool being configured.
     /// @param minBondedAmount0 Minimum bonded input when currency0 is the input.
     /// @param minBondedAmount1 Minimum bonded input when currency1 is the input.
-    /// @param bondBps Bond rate in basis points of gross input.
-    event PoolConfigured(
-        PoolId indexed id,
-        uint128 minBondedAmount0,
-        uint96 minBondedAmount1,
-        uint16 bondBps,
-        uint16 refundToleranceTicks
-    );
+    /// @param bondingEnabled Whether the pool bonds at all after this call.
+    event PoolConfigured(PoolId indexed id, uint128 minBondedAmount0, uint96 minBondedAmount1, bool bondingEnabled);
 
     /// @notice Emitted when BondMeBro takes collateral from a swap.
     /// @param id Pool where the swap occurred.
     /// @param refundRecipient Address intended to receive a future refund.
     /// @param currency Currency used for the bond.
     /// @param bond Amount of collateral taken, in raw token units.
-    /// @param grossInput Total input amount used to size the bond.
+    /// @param variableLegAmount The swap's realized VARIABLE leg -- the output for exact-input, the
+    ///        pool input for exact-output. This is the quantity the collateral is a fraction of,
+    ///        and the quantity the record stores.
+    ///
+    ///        RENAMED FROM `grossInput` IN P-L2-7. The emitted VALUE has been the variable leg
+    ///        since P-L2-3/4 moved custody; only the parameter name was left behind, describing a
+    ///        quantity this event has not carried for two stages. Same type, same position, same
+    ///        topic.
     event BondTaken(
-        PoolId indexed id, address indexed refundRecipient, Currency indexed currency, uint256 bond, uint256 grossInput
+        PoolId indexed id,
+        address indexed refundRecipient,
+        Currency indexed currency,
+        uint256 bond,
+        uint256 variableLegAmount
     );
 
     /// @notice Emitted when a bond record is created and its maturity registered.
     /// @param bondId Deterministic identifier of the new bond.
     /// @param id Pool the bond belongs to.
     /// @param refundRecipient Address the refund is owed to.
-    /// @param amount Collateral held, in raw input-currency units.
+    /// @param variableLegAmount The realized VARIABLE leg the record stores -- the output for an
+    ///        exact-input swap, the pool input for an exact-output one.
+    ///
+    ///        RENAMED FROM `amount` IN P-L2-7, and the old doc was wrong in two ways at once: it
+    ///        said "collateral held" and "input-currency units", and the value is neither. The
+    ///        record has stored the variable leg since P-L2-3/4 (ADR-0005 § 3.2), and for
+    ///        exact-input the collateral currency is the OUTPUT. Read the collateral with
+    ///        `collateralAmountOf`, which derives it.
+    ///
+    ///        Same type, same position, same event topic.
     /// @param maturityBlock Block at which the bond's observation window closes.
     event BondOpened(
-        bytes32 indexed bondId, PoolId indexed id, address indexed refundRecipient, uint128 amount, uint32 maturityBlock
+        bytes32 indexed bondId,
+        PoolId indexed id,
+        address indexed refundRecipient,
+        uint128 variableLegAmount,
+        uint32 maturityBlock
     );
 
     /// @notice Emitted when a maturity bucket's cumulative is permanently frozen.
@@ -493,19 +601,17 @@ contract BondMeBro is BaseHook {
     ///      Reject the zero address during deployment because this cannot be fixed later.
     error ZeroOwner();
 
-    /// @notice Thrown when the configured bond rate exceeds `MAX_BOND_BPS`.
-    error BondBpsAboveCap(uint16 bondBps, uint16 cap);
-
-    /// @notice Thrown when only part of a pool configuration is provided.
-    /// @dev `(0, 0, 0)` disables bonding. Otherwise both thresholds and `bondBps`
-    ///      must all be non-zero.
+    /// @notice Thrown when bonding is enabled without both direction thresholds.
     ///
-    ///      A zero threshold does not mean "disable this direction". Because the
-    ///      check is `grossInput >= threshold`, a zero threshold would bond every
-    ///      positive swap in that direction.
-    error IncompletePoolConfig(
-        uint128 minBondedAmount0, uint96 minBondedAmount1, uint16 bondBps, uint16 refundToleranceTicks
-    );
+    /// @dev A ZERO THRESHOLD DOES NOT MEAN "DISABLE THIS DIRECTION". Eligibility is
+    ///      `consumedInput >= threshold`, so a zero threshold bonds EVERY positive swap in that
+    ///      direction — the most aggressive possible setting, reached by omission. Requiring both
+    ///      explicitly keeps the most punitive configuration from being the easiest typo.
+    ///
+    ///      Disabling is `bondingEnabled == false`, which is unambiguous and needs no sentinel.
+    ///      `BondBpsAboveCap` was removed alongside this in P-L2-7: with no owner-settable rate
+    ///      there is no rate left to cap.
+    error IncompleteBondingConfig(uint128 minBondedAmount0, uint96 minBondedAmount1);
 
     /// @notice INV-NOOP-VL. Thrown when the collateral would not sit strictly inside the swap's
     ///         variable leg.
@@ -557,7 +663,14 @@ contract BondMeBro is BaseHook {
     /// @param collateral Original collateral, in raw units.
     /// @param refund Portion returned to the recipient.
     /// @param slash Portion retained in the pool's insurance pot.
-    /// @param persistenceBps Fraction of the original displacement that survived, in bps.
+    /// @param slashBps Realized slash rate, in bps of the variable leg.
+    ///
+    ///        RENAMED FROM `persistenceBps` IN P-L2-7. Under Model B this carried a persistence
+    ///        FRACTION -- how much of the original displacement survived, as a ratio. Model L2
+    ///        emits a RATE instead: `min(collateralBps, ceil(Q * 0.25))`, in bps of the variable
+    ///        leg. Same type, same position, same event topic, so decoders are unaffected; only
+    ///        the name and its meaning changed, and leaving the old name would have described the
+    ///        value wrongly.
     event BondSettled(
         bytes32 indexed bondId,
         PoolId indexed id,
@@ -566,7 +679,7 @@ contract BondMeBro is BaseHook {
         uint128 collateral,
         uint128 refund,
         uint128 slash,
-        uint16 persistenceBps
+        uint16 slashBps
     );
 
     /// @notice Thrown when settlement is attempted before the bond's maturity block.
@@ -649,71 +762,53 @@ contract BondMeBro is BaseHook {
                               CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Sets the bonding configuration for a pool.
+    /// @notice Enables or disables refundable collateral for a pool, and sets its participation
+    ///         thresholds.
     ///
-    /// @dev Use `(0, 0, 0)` to disable bonding.
+    /// @dev THE OWNER CHOOSES WHO PARTICIPATES, NOT WHAT IT COSTS. Enabling bonding requires both
+    ///      direction thresholds; the collateral rate, the 1% cap, the 10-block observation
+    ///      horizon and the `D = 5` dead zone are compile-time constants and are not configurable
+    ///      by anyone. See `PoolConfig`.
     ///
-    ///      Otherwise all three values must be non-zero:
-    ///      - threshold for currency0 input
-    ///      - threshold for currency1 input
-    ///      - bond rate
-    ///
-    ///      Separate thresholds are needed because the two currencies may have
-    ///      different decimals and values.
-    ///
-    ///      Example for a USDC/WETH pool:
+    ///      Separate thresholds are needed because the two currencies may have different decimals
+    ///      and values. Example for a USDC/WETH pool:
     ///
     ///          minBondedAmount0 = 100e6      // 100 USDC
     ///          minBondedAmount1 = 0.03e18    // 0.03 WETH
-    ///          bondBps          = 25         // 0.25%
+    ///          bondingEnabled   = true
     ///
-    ///      Lowering a threshold can make a previously unbonded quote require a
-    ///      bond at execution time. If that transaction has no valid hookData,
-    ///      it will revert.
+    ///      Lowering a threshold can make a previously unbonded quote require collateral at
+    ///      execution time. If that transaction carries no valid hookData, it reverts — which is
+    ///      the intended failure, since the alternative is taking collateral the trader never
+    ///      authorised a recipient or a ceiling for.
+    ///
+    ///      Disabling clears both thresholds so a disabled pool cannot carry stale numbers that
+    ///      would take effect the moment it is re-enabled.
     ///
     /// @param key Pool to configure.
-    /// @param minBondedAmount0 Minimum gross input requiring a bond when currency0
-    ///        is the input, in raw currency0 units.
-    /// @param minBondedAmount1 Minimum gross input requiring a bond when currency1
-    ///        is the input, in raw currency1 units.
-    /// @param bondBps Bond rate in basis points of gross input.
-    function setPoolConfig(
-        PoolKey calldata key,
-        uint128 minBondedAmount0,
-        uint96 minBondedAmount1,
-        uint16 bondBps,
-        uint16 refundToleranceTicks
-    ) external onlyOwner {
-        if (bondBps > MAX_BOND_BPS) {
-            revert BondBpsAboveCap(bondBps, MAX_BOND_BPS);
-        }
-
-        // All zero disables bonding. Otherwise ALL FOUR values must be set.
-        //
-        // `refundToleranceTicks` joins the completeness rule rather than being optional: a zero
-        // tolerance is a real and dangerous setting, not "unset". With no noise floor the
-        // persistence curve slashes on any surviving displacement at all, including a single tick
-        // of ordinary market drift, so a pool configured by omission would slash far more than
-        // intended. Requiring it explicitly keeps the most punitive setting from being the easiest
-        // typo — the same reasoning that made the two thresholds mandatory in T3C.
-        bool anySet = minBondedAmount0 != 0 || minBondedAmount1 != 0 || bondBps != 0 || refundToleranceTicks != 0;
-
-        bool allSet = minBondedAmount0 != 0 && minBondedAmount1 != 0 && bondBps != 0 && refundToleranceTicks != 0;
-
-        if (anySet && !allSet) {
-            revert IncompletePoolConfig(minBondedAmount0, minBondedAmount1, bondBps, refundToleranceTicks);
+    /// @param minBondedAmount0 Minimum CONSUMED input that participates when currency0 is the
+    ///        input, in raw currency0 units. Ignored when disabling.
+    /// @param minBondedAmount1 The same for currency1. Ignored when disabling.
+    /// @param bondingEnabled Whether this pool takes refundable collateral at all.
+    function setPoolConfig(PoolKey calldata key, uint128 minBondedAmount0, uint96 minBondedAmount1, bool bondingEnabled)
+        external
+        onlyOwner
+    {
+        // Enabling requires BOTH thresholds. Disabling ignores them: whatever is passed alongside
+        // `false` is irrelevant, because nothing will read it.
+        if (bondingEnabled && (minBondedAmount0 == 0 || minBondedAmount1 == 0)) {
+            revert IncompleteBondingConfig(minBondedAmount0, minBondedAmount1);
         }
 
         PoolId id = key.toId();
 
         poolConfig[id] = PoolConfig({
-            minBondedAmount0: minBondedAmount0,
-            minBondedAmount1: minBondedAmount1,
-            bondBps: bondBps,
-            refundToleranceTicks: refundToleranceTicks
+            minBondedAmount0: bondingEnabled ? minBondedAmount0 : 0,
+            minBondedAmount1: bondingEnabled ? minBondedAmount1 : 0,
+            bondingEnabled: bondingEnabled
         });
 
-        emit PoolConfigured(id, minBondedAmount0, minBondedAmount1, bondBps, refundToleranceTicks);
+        emit PoolConfigured(id, minBondedAmount0, minBondedAmount1, bondingEnabled);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -735,8 +830,6 @@ contract BondMeBro is BaseHook {
     ///
     ///      This runs once per pool and is off the swap path.
     function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick) internal override returns (bytes4) {
-        afterInitializeCount++;
-
         PoolId id = key.toId();
 
         // Register the pool so bonds can reference it by a 4-byte index instead of a 32-byte
@@ -749,35 +842,40 @@ contract BondMeBro is BaseHook {
             poolRefByIndex[index] = PoolRef({id: id, currency0: key.currency0, currency1: key.currency1});
         }
 
+        // ADR-0008. Seed the block-start tick alongside the accumulator's first observation, so a
+        // swap in the pool's very first block measures its displacement from the initialization
+        // price rather than from an unwritten zero. `beginBlock` before `update`, always: after
+        // `update` the `lastUpdate == 0` test it keys off is already false.
+        accumulator[id].beginBlock(tick);
+
         // slither-disable-next-line unused-return
         accumulator[id].update(tick);
-
-        emit CallbackFired("afterInitialize", tick);
 
         return BaseHook.afterInitialize.selector;
     }
 
-    /// @notice Handles pre-swap validation and exact-input bond custody.
+    /// @notice Pre-swap validation, the checkpoint scan, and the provisional bond record.
     ///
-    /// @dev EXACT-INPUT
+    /// @dev NO CUSTODY HAPPENS HERE, for either swap kind. This callback returns `ZERO_DELTA` on
+    ///      every path and the hook does not hold `BEFORE_SWAP_RETURNS_DELTA`, so it has no
+    ///      mechanism to touch the swap's specified amount at all. That is ADR-0006's central
+    ///      security property, and it is structural rather than a matter of restraint.
     ///
-    ///      The input amount is known before the swap, so BondMeBro can calculate
-    ///      and take the bond here.
+    ///      What this callback does, in order:
     ///
-    ///      For a bonded exact-input swap:
+    ///        1. advances the tick accumulator and freezes every observation endpoint the cursor
+    ///           has now crossed (ADR-0007);
+    ///        2. short-circuits when the pool has bonding disabled;
+    ///        3. short-circuits an exact-input swap whose REQUESTED input is already below the
+    ///           threshold, since no fill can bring it above one;
+    ///        4. otherwise decodes and validates hookData, and writes the provisional record.
     ///
-    ///          grossInput = trader's specified input
-    ///          bond       = grossInput * bondBps / 10_000
-    ///          poolInput  = grossInput - bond
+    ///      Step 3 is an exact filter, not a heuristic: a swap requesting less than the threshold
+    ///      cannot consume more than it requested, so it can never become eligible. Exact-output
+    ///      gets no such filter, because its input is unknown until the pool executes.
     ///
-    ///      The bond is carved out of the trader's specified input rather than
-    ///      charged on top.
-    ///
-    ///      EXACT-OUTPUT
-    ///
-    ///      The actual input is not known yet, so no bond is taken here.
-    ///      Valid hookData is still checked before the pool executes.
-    ///      Exact-output custody happens later in `_afterSwap`.
+    ///      Sizing and custody both happen in `_afterSwap`, where the realized legs and the
+    ///      realized tick impact are known. See `_takeVariableLegBond`.
     ///
     ///      BONDED EXACT-INPUT ORDER:
     ///      1. validate hookData
@@ -813,7 +911,7 @@ contract BondMeBro is BaseHook {
         PoolConfig memory cfg = poolConfig[id];
 
         // Bonding disabled for this pool.
-        if (cfg.bondBps == 0) {
+        if (!cfg.bondingEnabled) {
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
 
@@ -859,19 +957,20 @@ contract BondMeBro is BaseHook {
         // slither-disable-next-line unused-return
         (address refundRecipient,) = HookDataCodec.decode(hookData);
 
-        TickAccumulatorLib.Accumulator storage acc = accumulator[id];
-
-        // The provisional header is now written for exact-INPUT too, which production did not do.
-        // That moves two cold SSTOREs out of `_afterSwap` and into this callback -- deliberately,
-        // because `_afterSwap` must also perform the token transfer and has the tighter ceiling.
-        // ADR-0004 Rule 2's argument, applied to the path ADR-0004 section 6 left alone.
+        // The provisional header is written for BOTH swap kinds. That moves two cold SSTOREs out
+        // of `_afterSwap` and into this callback -- deliberately, because `_afterSwap` must also
+        // perform the token transfer and has the tighter ceiling. ADR-0004 Rule 2.
+        //
+        // `lastTick` is the pool tick from BEFORE this swap: `_advanceAndCheckpoint` above moved
+        // time forward but left the tick alone. It is the displacement's zero, and Model L2
+        // measures every late window against it (ADR-0005 § 3.3).
         //
         // The currency flag is written provisionally from the DIRECTION and corrected to the
-        // collateral currency at finalization, where the swap kind is what decides it. A
+        // collateral currency at finalization, where the swap KIND is what decides it. A
         // provisional record is invisible to every protocol path (ADR-0004 Rule 1), so the
         // intermediate value is never observable.
         // slither-disable-next-line unused-return
-        _openProvisionalBond(id, params.zeroForOne, refundRecipient, acc.lastTick, acc.tickCumulative);
+        _openProvisionalBond(id, params.zeroForOne, refundRecipient, accumulator[id].lastTick);
 
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
@@ -949,7 +1048,19 @@ contract BondMeBro is BaseHook {
         // a claim on the variable leg.
         return (
             BaseHook.afterSwap.selector,
-            _takeVariableLegBond(id, hookData, _custodyContext(key, params, delta, tickBefore, tickAfter))
+            _takeVariableLegBond(
+                id,
+                hookData,
+                // `blockStartTick` is read INLINE rather than into a named local. This frame is at
+                // the EVM stack limit under this project's non-viaIR settings -- the note above on
+                // `tickBefore` records the same constraint -- and one more live `int24` is the
+                // difference between compiling and "stack too deep".
+                //
+                // It is safe to read here: `_advanceAndCheckpoint` latched it in `beforeSwap` and
+                // `update` above never touches it, so this is still THIS block's starting tick. It
+                // is a warm SLOAD of the slot `lastTick` was just read from.
+                _custodyContext(key, params, delta, tickBefore, tickAfter, accumulator[id].blockStartTick)
+            )
         );
     }
 
@@ -966,7 +1077,8 @@ contract BondMeBro is BaseHook {
     ///
     /// @param collateralCurrency The VARIABLE leg's currency: output for exact-input, input for
     ///        exact-output.
-    /// @param collateralBps Model L rate from the realized tick impact, in bps of the variable leg.
+    /// @param collateralBps Model L rate from the EFFECTIVE tick impact (ADR-0008), in bps of the
+    ///        variable leg: `max(ownImpact, blockDisplacement)` through the frozen curve.
     /// @param inputDelta Pool delta for the input currency. Negative when the trader owes.
     /// @param outputDelta Pool delta for the output currency. Positive when the trader receives.
     /// @param tickAfter Pool tick immediately after the swap.
@@ -996,14 +1108,15 @@ contract BondMeBro is BaseHook {
         SwapParams calldata params,
         BalanceDelta delta,
         int24 tickBefore,
-        int24 tickAfter
+        int24 tickAfter,
+        int24 blockStartTick
     ) private pure returns (VLCustody memory c) {
         bool exactInput = params.amountSpecified < 0;
         bool collateralIsCurrency0 = _collateralIsCurrency0(params.zeroForOne, exactInput);
 
         c = VLCustody({
             collateralCurrency: collateralIsCurrency0 ? key.currency0 : key.currency1,
-            collateralBps: _collateralBpsFor(tickBefore, tickAfter),
+            collateralBps: _effectiveCollateralBps(tickBefore, tickAfter, blockStartTick),
             inputDelta: int256(params.zeroForOne ? delta.amount0() : delta.amount1()),
             outputDelta: int256(params.zeroForOne ? delta.amount1() : delta.amount0()),
             tickAfter: tickAfter,
@@ -1050,7 +1163,8 @@ contract BondMeBro is BaseHook {
         uint256 impactTicks = uint256(signedImpact < 0 ? -signedImpact : signedImpact);
 
         // ceil(impactTicks * COLLATERAL_SCALE / 100), integral throughout.
-        collateralBps = (impactTicks * uint256(COLLATERAL_SCALE) + 99) / 100;
+        collateralBps = (impactTicks * uint256(COLLATERAL_SCALE) + (COLLATERAL_SCALE_DENOMINATOR - 1))
+            / COLLATERAL_SCALE_DENOMINATOR;
 
         if (collateralBps > MAX_BOND_BPS) collateralBps = MAX_BOND_BPS;
     }
@@ -1080,6 +1194,104 @@ contract BondMeBro is BaseHook {
         return _collateralBpsFor(tickBefore, tickAfter);
     }
 
+    /// @notice The BLOCK-CUMULATIVE collateral rate actually charged (ADR-0008 § 3).
+    ///
+    /// @dev ```
+    ///          ownImpact       = |tickAfter - tickBefore|
+    ///          blockDisplacement = |tickAfter - blockStartTick|
+    ///          effectiveImpact = max(ownImpact, blockDisplacement)
+    ///          collateralBps   = min(MAX_BOND_BPS, ceil(effectiveImpact * SCALE / 100))
+    ///      ```
+    ///
+    ///      THE CURVE IS UNTOUCHED. `COLLATERAL_SCALE`, `MAX_BOND_BPS` and the `ceil` are the same
+    ///      frozen constants `_collateralBpsFor` uses; only the impact fed into them changes. That
+    ///      is what keeps this a mitigation rather than a re-calibration of ADR-0005's economics.
+    ///
+    ///      THE `max` IS LOAD-BEARING IN BOTH DIRECTIONS and neither term subsumes the other. A
+    ///      swap REVERTING a displaced block has a large own impact and a small block
+    ///      displacement; a swap adding a sliver to an already-displaced block has the reverse.
+    ///      Charging either term alone would leave a cheaper path open.
+    ///
+    ///      IT IS A NO-OP ON A BLOCK'S FIRST SWAP. Then `blockStartTick == tickBefore`, the two
+    ///      terms are equal, and this returns exactly what `_collateralBpsFor` returns —
+    ///      bit-identical to pre-ADR-0008 behaviour. `test/BlockCumulativeImpact.t.sol` asserts
+    ///      that equivalence across all four modes rather than leaving it to inspection.
+    ///
+    ///      MONOTONICITY, PRECISELY. This is NOT monotone in `ownImpact`: a trade reverting toward
+    ///      `blockStartTick` raises its own impact while lowering its block displacement, and the
+    ///      `max` has an interior minimum at the midpoint. That is why INV-L2-4 was superseded by
+    ///      INV-L2-4a/4b/4c — see ADR-0008 § 5. What IS guaranteed:
+    ///        - among trades moving FURTHER from `blockStartTick`, the rate is non-decreasing in
+    ///          own impact, because both terms are (INV-L2-4a);
+    ///        - the result is never below `_collateralBpsFor`'s, because `max(a, b) >= a`
+    ///          (INV-L2-4b).
+    ///
+    ///      O(1), like the function it wraps: two subtractions, two absolute values, a comparison,
+    ///      a multiply and a ceiling division. No tick walk, no bitmap read, no liquidity read.
+    ///
+    ///      Widened to `int256` before subtracting, per the project's signed-arithmetic rule: the
+    ///      differences are not representable in `int24` at the extremes of the tick range.
+    ///
+    /// @param tickBefore Pool tick immediately before the swap.
+    /// @param tickAfter Pool tick immediately after the swap.
+    /// @param blockStartTick Pool tick when this block's first swap was about to execute.
+    /// @return collateralBps Rate in bps of the variable leg, capped at `MAX_BOND_BPS`. Zero only
+    ///         when the swap moved the price by less than a tick AND left the pool exactly where
+    ///         the block started.
+    function _effectiveCollateralBps(int24 tickBefore, int24 tickAfter, int24 blockStartTick)
+        private
+        pure
+        returns (uint256 collateralBps)
+    {
+        int256 own = int256(tickAfter) - int256(tickBefore);
+        int256 displacement = int256(tickAfter) - int256(blockStartTick);
+
+        uint256 ownTicks = uint256(own < 0 ? -own : own);
+        uint256 displacementTicks = uint256(displacement < 0 ? -displacement : displacement);
+
+        uint256 effectiveTicks = ownTicks > displacementTicks ? ownTicks : displacementTicks;
+
+        // ceil(effectiveTicks * COLLATERAL_SCALE / 100), integral throughout. Identical arithmetic
+        // to `_collateralBpsFor`; only the numerator's source differs.
+        collateralBps = (effectiveTicks * uint256(COLLATERAL_SCALE) + (COLLATERAL_SCALE_DENOMINATOR - 1))
+            / COLLATERAL_SCALE_DENOMINATOR;
+
+        if (collateralBps > MAX_BOND_BPS) collateralBps = MAX_BOND_BPS;
+    }
+
+    /// @notice The block-cumulative rate for a hypothetical trade, exposed for callers and tests.
+    ///
+    /// @dev The ADR-0008 counterpart of `collateralBpsFor`. A caller sizing `maxBondAmount` can
+    ///      price a hypothetical impact against a hypothetical block displacement before sending —
+    ///      though ADR-0008 § 8 is explicit that the block displacement at EXECUTION is not
+    ///      knowable at quote time, and states the conservative policy that follows.
+    ///
+    ///      `blockStartTickOf` below returns the live latch, so an off-chain caller can read the
+    ///      pool's current block-start tick and feed it here.
+    function effectiveCollateralBpsFor(int24 tickBefore, int24 tickAfter, int24 blockStartTick)
+        external
+        pure
+        returns (uint256 collateralBps)
+    {
+        return _effectiveCollateralBps(tickBefore, tickAfter, blockStartTick);
+    }
+
+    /// @notice The tick this pool's current block started at, as the collateral rate will use it.
+    ///
+    /// @dev A convenience over the public `accumulator` getter, which returns four fields. NOTE
+    ///      that this reads the latch as it stands NOW: if no swap has touched the pool yet in the
+    ///      current block, the value still describes the PREVIOUS block and will be re-latched to
+    ///      `lastTick` by the next swap. A caller that needs the value a swap sent now would see
+    ///      must apply that rule itself — `lastUpdate < block.number` means "the next swap
+    ///      re-latches to `lastTick`".
+    function blockStartTickOf(PoolId id) external view returns (int24) {
+        TickAccumulatorLib.Accumulator memory acc = accumulator[id];
+
+        if (acc.lastUpdate != 0 && acc.lastUpdate < _blockNumber32()) return acc.lastTick;
+
+        return acc.blockStartTick;
+    }
+
     /// @notice The collateral actually held for a bond, recomputed from its record.
     ///
     /// @dev The record stores the realized VARIABLE LEG, not the collateral (ADR-0005 section
@@ -1089,10 +1301,17 @@ contract BondMeBro is BaseHook {
     ///          taken at custody : bond      = variableLeg * collateralBps / BPS
     ///          recomputed here  : collateral = variableLegAmount * collateralBps / BPS
     ///
-    ///      with `collateralBps` derived from the `tickBefore` / `tickAfter` the record froze.
+    ///      with `collateralBps` read from the record rather than recomputed.
     ///      `test_collateral_recomputationIsExact` pins this to the wei.
+    ///
+    ///      READING THE STORED RATE IS REQUIRED SINCE ADR-0008, not merely convenient. The
+    ///      effective rate depends on `blockStartTick`, which is per-pool state that every later
+    ///      block overwrites, so it is unrecoverable by the time anyone reads this bond.
+    ///      Recomputing from `tickBefore`/`tickAfter` would return the OWN-impact rate — a
+    ///      different, smaller number than the one physically taken — and would silently
+    ///      under-refund every bond opened behind another trade in its block.
     function _collateralOf(Bond memory bond) private pure returns (uint128) {
-        return uint128((uint256(bond.variableLegAmount) * _collateralBpsFor(bond.tickBefore, bond.tickAfter)) / BPS);
+        return uint128((uint256(bond.variableLegAmount) * uint256(bond.collateralBps)) / BPS);
     }
 
     /// @notice Sizes and takes the variable-leg collateral, returning the delta v4 must apply.
@@ -1130,7 +1349,7 @@ contract BondMeBro is BaseHook {
         PoolConfig storage cfg = poolConfig[id];
 
         // Bonding disabled: `_beforeSwap` wrote no provisional record either.
-        if (cfg.bondBps == 0) {
+        if (!cfg.bondingEnabled) {
             return int128(0);
         }
 
@@ -1218,7 +1437,7 @@ contract BondMeBro is BaseHook {
         bonds[bondId].collateralIsCurrency0 = _collateralIsCurrency0(c.zeroForOne, c.exactInput);
 
         // The record stores the realized VARIABLE LEG (ADR-0005 section 3.2), not the collateral.
-        _finalizeBond(id, bondId, uint128(variableLeg), c.tickAfter);
+        _finalizeBond(id, bondId, uint128(variableLeg), c.tickAfter, uint16(c.collateralBps));
 
         c.collateralCurrency.take(poolManager, address(this), bond, false);
 
@@ -1267,6 +1486,17 @@ contract BondMeBro is BaseHook {
     /// @param currentTick Pool tick read this block, used only to seed an unseeded accumulator.
     function _advanceAndCheckpoint(PoolId id, int24 currentTick) private {
         TickAccumulatorLib.Accumulator storage acc = accumulator[id];
+
+        // ADR-0008 § 3.3. THE ONLY STATE WRITE THIS MIGRATION ADDS TO THE SWAP PATH, and it must
+        // happen HERE — before `acc.update` below moves `lastUpdate` onto this block, and before
+        // `_afterSwap` moves `lastTick` onto the post-swap price. One comparison, plus a warm
+        // SSTORE into the accumulator's existing slot on a block's FIRST swap only; that slot is
+        // written by `update` in this same call regardless, so no cold write is introduced.
+        //
+        // Deliberately unconditional on `bondingEnabled`, exactly like the accumulator advance it
+        // sits next to: a pool whose owner enables bonding mid-block must not find its first
+        // bonded swap measuring displacement from a stale or unwritten latch.
+        acc.beginBlock(currentTick);
 
         uint32 lastUpdate = acc.lastUpdate;
 
@@ -1377,12 +1607,12 @@ contract BondMeBro is BaseHook {
         return keccak256(abi.encode(id, maturityBlock, indexInBucket));
     }
 
-    /// @notice Writes the provisional header for an exact-output bond, in `_beforeSwap`.
+    /// @notice Writes the provisional header for a bond, in `_beforeSwap`, for BOTH swap kinds.
     ///
     /// @dev ADR-0004 § 3. Everything knowable before the pool executes is written here — which is
-    ///      everything except `amount` and `tickAfter`, and both of those live in slot 1. So this
-    ///      pays the two cold SSTOREs in the callback that has ~140,000 of spare budget, and
-    ///      leaves `_afterSwap` a single warm update.
+    ///      everything except `variableLegAmount` and `tickAfter`, and both of those live in
+    ///      slot 1. So this pays the two cold SSTOREs in the callback with the larger spare budget
+    ///      and leaves `_afterSwap`, which must also move tokens, a single warm update.
     ///
     ///      This record is NOT a bond. Until `_finalizeBond` runs it is invisible to every
     ///      protocol path: `pendingBonds` is untouched, `getBond` reports it absent, and no claim,
@@ -1391,17 +1621,19 @@ contract BondMeBro is BaseHook {
     ///      If the transaction reverts for any reason, this write reverts with it.
     ///
     /// @param id Pool the swap is running against.
-    /// @param inputIsCurrency0 Whether the input currency is the pool's currency0.
+    /// @param provisionalCollateralIsCurrency0 The collateral-currency flag as the DIRECTION alone
+    ///        implies it. It is provisional because the swap KIND also decides — exact-input bonds
+    ///        in the output, exact-output in the input — and the kind is only acted on at
+    ///        finalization, which corrects this flag. Never observable in between (Rule 1).
     /// @param refundRecipient Refund owner from already-validated hookData.
-    /// @param tickBefore Pool tick immediately before the swap.
-    /// @param cumulativeAtOpen Accumulator value at the open block.
+    /// @param tickBefore Pool tick immediately before the swap: the displacement's zero, and the
+    ///        baseline every Model L2 late window is measured against.
     /// @return bondId Identifier the finalize or clear step will use.
     function _openProvisionalBond(
         PoolId id,
-        bool inputIsCurrency0,
+        bool provisionalCollateralIsCurrency0,
         address refundRecipient,
-        int24 tickBefore,
-        int56 cumulativeAtOpen
+        int24 tickBefore
     ) private returns (bytes32 bondId) {
         uint32 poolIndex = poolIndexOf[id];
 
@@ -1418,10 +1650,13 @@ contract BondMeBro is BaseHook {
             maturityBlock: maturityBlock,
             poolIndex: poolIndex,
             variableLegAmount: 0,
-            cumulativeAtOpen: cumulativeAtOpen,
             tickBefore: tickBefore,
             tickAfter: 0,
-            collateralIsCurrency0: inputIsCurrency0,
+            // Written at finalization, once the realized ticks and the block latch are known. A
+            // provisional record is invisible to every protocol path (ADR-0004 Rule 1), so the
+            // intermediate zero is never observable.
+            collateralBps: 0,
+            collateralIsCurrency0: provisionalCollateralIsCurrency0,
             state: BondState.PROVISIONAL
         });
     }
@@ -1439,13 +1674,23 @@ contract BondMeBro is BaseHook {
     ///
     /// @param id Pool the bond belongs to.
     /// @param bondId Identifier returned by `_openProvisionalBond`.
-    /// @param amount Collateral actually taken, raw input-currency units.
+    /// @param variableLegAmount Realized variable leg to record: the output for exact-input,
+    ///        the pool input for exact-output. The collateral is DERIVED from it and the two
+    ///        stored ticks, never stored alongside it (ADR-0005 s3.2).
     /// @param tickAfter Pool tick immediately after the swap.
-    function _finalizeBond(PoolId id, bytes32 bondId, uint128 amount, int24 tickAfter) private {
+    /// @param collateralBps The EFFECTIVE rate custody charged (ADR-0008 § 6). Safe to narrow to
+    ///        `uint16`: `_effectiveCollateralBps` caps at `MAX_BOND_BPS == 100`.
+    function _finalizeBond(PoolId id, bytes32 bondId, uint128 variableLegAmount, int24 tickAfter, uint16 collateralBps)
+        private
+    {
         Bond storage bond = bonds[bondId];
 
-        bond.variableLegAmount = amount;
+        bond.variableLegAmount = variableLegAmount;
         bond.tickAfter = tickAfter;
+        // ADR-0008 § 6. Same slot, same warm write as the two fields above it: no extra SSTORE.
+        // This is the rate custody is about to take tokens at, so settlement recomputing anything
+        // else would be a second source of truth for an amount that has already moved.
+        bond.collateralBps = collateralBps;
         bond.state = BondState.FINALIZED;
 
         uint32 maturityBlock = bond.maturityBlock;
@@ -1453,7 +1698,7 @@ contract BondMeBro is BaseHook {
         // Registration. Only now does a maturity obligation exist.
         maturity[id][maturityBlock].pendingBonds += 1;
 
-        emit BondOpened(bondId, id, bond.refundRecipient, amount, maturityBlock);
+        emit BondOpened(bondId, id, bond.refundRecipient, variableLegAmount, maturityBlock);
     }
 
     /// @notice Discards a provisional record when the exact-output swap turns out unbonded.
@@ -1558,11 +1803,15 @@ contract BondMeBro is BaseHook {
         int24 tickBefore = bond.tickBefore;
         int24 tickAfter = bond.tickAfter;
 
-        // ONE RATE FUNCTION, SHARED WITH CUSTODY. `_collateralBpsFor` is what `afterSwap` used to
-        // decide how much to take, so recomputing the collateral through it reproduces the amount
-        // physically taken to the wei -- exactly what ADR-0005 § 3.2 requires of a record that
-        // stores the variable leg rather than the collateral.
-        uint256 collateralBps = _collateralBpsFor(tickBefore, tickAfter);
+        // THE RATE CUSTODY ACTUALLY CHARGED, read from the record (ADR-0008 § 6).
+        //
+        // Before ADR-0008 this was recomputed from the two ticks, and reproduced the physically
+        // taken amount by construction because the rate was a pure function of them. The effective
+        // rate now also depends on `blockStartTick` -- per-pool state that later blocks overwrite
+        // -- so recomputation is no longer possible even in principle, and the record carries the
+        // rate instead. ADR-0005 § 3.2's requirement is unchanged: settlement must reproduce the
+        // amount physically taken to the wei. Only the mechanism for meeting it moved.
+        uint256 collateralBps = uint256(bond.collateralBps);
 
         // MODEL L2: two direction-aligned late windows, the larger clamped at zero, the D = 5
         // catch-up dead zone, and a token split whose denominator is the VARIABLE LEG rather than

@@ -68,6 +68,13 @@ import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 ///      GAP LENGTH BUYS AN ATTACKER NOTHING: K and L are identical to the gas unit, at 50 and
 ///      100,000 blocks. Neither does fan-in — see `test_gasM_fanInDoesNotChangeScanCost`, flat at
 ///      1 / 10 / 100 / 1,000 bonds in one maturity.
+///
+///      P-L2-7 RE-MEASURED: the figures above are pre-cleanup. After removing `cumulativeAtOpen`,
+///      `PersistenceMathLib`, `afterInitializeCount` and the two obsolete `PoolConfig` fields,
+///      `beforeSwap` fell by 127 gas everywhere and `afterSwap` rose by a uniform 222. The
+///      worst-case `beforeSwap` is now 106,878 against a 150,000 ceiling; the worst `afterSwap`
+///      73,447 against 100,000. See `P_L2_7_MIGRATION_REPORT.md` § 7 for the full table and for
+///      what the +222 is and is not attributable to.
 contract ObservationCheckpointGasTest is Test, Deployers {
     using StateLibrary for IPoolManager;
 
@@ -91,7 +98,7 @@ contract ObservationCheckpointGasTest is Test, Deployers {
     int256 internal constant NUDGE = -1e13;
 
     /// @dev `maturity` is at storage slot 3.
-    uint256 internal constant SLOT_MATURITY = 3;
+    uint256 internal constant SLOT_MATURITY = 2;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -115,7 +122,7 @@ contract ObservationCheckpointGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -145,7 +152,7 @@ contract ObservationCheckpointGasTest is Test, Deployers {
 
     function _lastUpdate() internal view returns (uint32 lastUpdate) {
         // slither-disable-next-line unused-return
-        (, lastUpdate,) = hook.accumulator(id_);
+        (, lastUpdate,,) = hook.accumulator(id_);
     }
 
     /// @dev Opens `n` bonds in `n` consecutive blocks, filling `n` consecutive maturity buckets.

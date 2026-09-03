@@ -42,8 +42,8 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     ///      from `forge inspect BondMeBro storage-layout`. Raw access is required because Rule 1
     ///      deliberately makes PROVISIONAL indistinguishable from absent through the public API —
     ///      which is the property under test.
-    uint256 internal constant BONDS_SLOT = 4;
-    uint256 internal constant STATE_BYTE_OFFSET = 30;
+    uint256 internal constant BONDS_SLOT = 3;
+    uint256 internal constant STATE_BYTE_OFFSET = 25;
     uint8 internal constant STATE_PROVISIONAL = 1;
 
     /// @dev First cumulative the invariant ever observed for a frozen bucket, used to prove
@@ -101,7 +101,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
 
         handler = new BondCustodyHandler(IPoolManager(address(manager)), swapRouter, hook, key_, currency0, currency1);
 
@@ -119,14 +119,33 @@ contract BondCustodyInvariantsTest is Test, Deployers {
 
         vm.stopPrank();
 
-        // Restrict the stateful campaign to the handler's two swap actions.
-        bytes4[] memory selectors = new bytes4[](3);
+        // THE CAMPAIGN'S ACTION SET, and `settleABond` was MISSING from it.
+        //
+        // P-L2-8 § 7 recorded that the campaign never reached settlement and attributed it to the
+        // walk needing to both pass maturity and select that action. The real cause is simpler and
+        // worse: the selector was never registered, so settlement was STRUCTURALLY unreachable
+        // rather than merely improbable. Every settlement-side invariant in this file was
+        // therefore vacuous for the campaign's whole life.
+        //
+        // Registered twice, deliberately. Foundry picks uniformly across this array, and a bond
+        // only becomes settleable ten blocks after it opens — a single entry leaves settlement
+        // rare enough that the settlement invariants stay near-vacuous. The counters printed by
+        // `afterInvariant` are what this weighting is tuned against.
+        bytes4[] memory selectors = new bytes4[](6);
 
         selectors[0] = BondCustodyHandler.swapExactInput.selector;
 
         selectors[1] = BondCustodyHandler.swapExactOutput.selector;
 
         selectors[2] = BondCustodyHandler.advanceBlocks.selector;
+
+        selectors[3] = BondCustodyHandler.settleABond.selector;
+
+        selectors[4] = BondCustodyHandler.settleABond.selector;
+
+        // A second swap entry keeps same-block sequences frequent, which is what exercises
+        // ADR-0008's block term at all.
+        selectors[5] = BondCustodyHandler.swapExactInput.selector;
 
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
 
@@ -255,6 +274,108 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         );
     }
 
+    /// @notice NON-VACUITY GUARD for the raw state decoder.
+    ///
+    /// @dev THIS TEST EXISTS BECAUSE THE DECODER WAS SILENTLY BROKEN. `STATE_BYTE_OFFSET` was 30
+    ///      here, which is past every field a `Bond` has ever had — in the pre-ADR-0008 layout as
+    ///      well as this one. `_rawBondState` therefore always returned 0, and
+    ///      `invariant_noProvisionalRecordSurvives` compared 0 against `STATE_PROVISIONAL == 1` and
+    ///      passed unconditionally. The invariant was VACUOUS for its whole life and no failure
+    ///      could ever have surfaced it, because a decoder that reads the wrong byte does not
+    ///      error — it returns a plausible value.
+    ///
+    ///      The offset is now 25, from the compiler's own layout, and this pins it by driving a
+    ///      bond to a state the decoder must actually see. A future field insertion that shifts
+    ///      `state` again fails HERE, loudly, rather than turning the invariant back into a no-op.
+    function test_rawBondStateDecoderIsNotVacuous() public {
+        uint32 m = uint32(block.number) + hook.OBSERVATION_BLOCKS();
+
+        // slither-disable-next-line unused-return
+        (,,, uint32 pending,) = hook.maturity(id_, m);
+
+        bytes32 bondId = _bondId(m, pending);
+
+        // An ODD seed: `_sizeStraddlingThreshold` puts odd seeds at or above the bonding
+        // threshold, which is what makes this drive a FINALIZED record rather than an unbonded one.
+        handler.swapExactInput(1, true, false);
+
+        assertTrue(hook.bondExists(bondId), "the fixture did not finalize a bond");
+
+        assertEq(uint256(_rawBondState(bondId)), 2, "the raw decoder does not read Bond.state (FINALIZED == 2)");
+
+        // And an id that was never written must decode as NONE, so the decoder is not simply
+        // returning a constant.
+        assertEq(uint256(_rawBondState(keccak256("never written"))), 0, "an absent record did not decode as NONE");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                   ADR-0008 -- INV-L2-4b AND THE STORED RATE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice INV-L2-4b, statefully. Every bond's stored rate is at least the own-impact rate.
+    ///
+    /// @dev `max(ownImpact, blockDisplacement) >= ownImpact`, so the block model can never charge
+    ///      LESS than the pre-migration model for the same realized trade. That is what makes
+    ///      INV-L2-4a's restriction to outward trades safe rather than a loophole, and it is
+    ///      checkable directly from the record: `tickBefore` and `tickAfter` give the own-impact
+    ///      rate, and `collateralBps` is what was actually charged.
+    ///
+    ///      Holds over every bond the campaign ever created, settled or not — `openBondIds` is
+    ///      pruned on settlement, so this walks `allBondIds` instead.
+    function invariant_inv_L2_4b_storedRateNeverBelowOwnImpact() public view {
+        uint256 n = handler.allBondCount();
+
+        for (uint256 i = 0; i < n; i++) {
+            // Every id in `allBondIds` was FINALIZED when it was recorded, and `getBond` reads
+            // FINALIZED and SETTLED alike -- a settled bond stays auditable, which is what lets
+            // this invariant cover a bond's whole life rather than only its open phase.
+            BondMeBro.Bond memory bond = hook.getBond(handler.allBondAt(i));
+
+            assertGe(
+                uint256(bond.collateralBps),
+                ModelLReference.collateralBps(bond.tickBefore, bond.tickAfter),
+                "INV-L2-4b: a stored rate is below the own-impact rate"
+            );
+        }
+    }
+
+    /// @notice Every stored rate is inside the frozen band, and never zero on a finalized bond.
+    ///
+    /// @dev INV-L2-2 restated over the stored field rather than the recomputed one, plus the half
+    ///      of INV-NOOP-VL that a rate can express: a bond that finalized with a zero rate would be
+    ///      a maturity obligation with nothing behind it, which ADR-0004 Rule 1 forbids.
+    function invariant_storedRateIsInsideTheFrozenBand() public view {
+        uint256 n = handler.allBondCount();
+
+        for (uint256 i = 0; i < n; i++) {
+            BondMeBro.Bond memory bond = hook.getBond(handler.allBondAt(i));
+
+            assertGt(uint256(bond.collateralBps), 0, "a finalized bond stored a zero rate");
+            assertLe(uint256(bond.collateralBps), hook.MAX_BOND_BPS(), "a stored rate exceeded the cap");
+        }
+    }
+
+    /// @notice Settlement reproduces the collateral the record says was taken.
+    ///
+    /// @dev ADR-0008 § 6. The migration moved settlement from recomputation to the stored rate, and
+    ///      this is the property that move exists to preserve: `collateralAmountOf` must equal
+    ///      `leg * storedBps / BPS` for every live bond, at every point in the campaign.
+    function invariant_collateralIsTheStoredRateTimesTheLeg() public view {
+        uint256 n = handler.openBondCount();
+
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 bondId = handler.openBondAt(i);
+
+            BondMeBro.Bond memory bond = hook.getBond(bondId);
+
+            assertEq(
+                uint256(hook.collateralAmountOf(bondId)),
+                (uint256(bond.variableLegAmount) * uint256(bond.collateralBps)) / hook.BPS(),
+                "collateralAmountOf does not equal leg * storedBps / BPS"
+            );
+        }
+    }
+
     /// @notice The hook must not hold PoolManager claim tokens after a completed swap.
 
     /// @dev BondMeBro uses physical token custody with `claims = false`. A non-zero ERC-6909 claim balance would mean some custody was represented as a claim against PoolManager instead of real ERC-20 tokens held by the hook.
@@ -374,7 +495,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         assertFalse(handler.ghostMissedMaturity(), "a registered maturity fell behind the cursor unfrozen");
 
         // Half two: anything due but not yet resolved.
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         uint256 count = handler.activeMaturityCount();
 
@@ -471,7 +592,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     ///      unrecoverable, `cumulativeAt` reverts rather than guessing, and every bond in that
     ///      cohort becomes unsettleable.
     function invariant_inv_L2_8_everyDueEndpointIsFrozenAndExact() public view {
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         uint32 obs = hook.OBSERVATION_BLOCKS();
 
@@ -571,7 +692,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
     ///      `invariant_inv_L2_8_everyDueEndpointIsFrozenAndExact` covers. This one is about the
     ///      upper edge.
     function invariant_noOccupiedUnfrozenBucketAboveTheHorizon() public view {
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         uint32 horizon = lastUpdate + hook.OBSERVATION_BLOCKS();
 
@@ -620,19 +741,122 @@ contract BondCustodyInvariantsTest is Test, Deployers {
                          CAMPAIGN COVERAGE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Prints how many times each custody path was exercised during the invariant campaign.
-
-    /// @dev Reporting only. Path reachability is tested separately by `test_handlerExercisesAllFourCustodyPaths` so invariant shrinking cannot turn a coverage assertion into an unrelated failure.
+    /// @notice Reports everything the campaign reached. REPORTING ONLY, deliberately.
+    ///
+    /// @dev P-L2-8 § 27 asks that "a passing invariant campaign that never reaches the interesting
+    ///      state FAILS". That requirement is met — but NOT by asserting here, and the reason is
+    ///      worth recording because the obvious implementation is wrong.
+    ///
+    ///      `afterInvariant` observes whatever sequence the run happened to produce, including a
+    ///      SHRUNK one after a failure and a thin one when the random selector draw happens not to
+    ///      settle anything. Asserting reachability here therefore turns an unrelated invariant
+    ///      failure into a confusing second failure, and makes the campaign flaky on seeds that are
+    ///      perfectly healthy. Measured directly: with hard assertions here, a default-profile run
+    ///      reported all seventeen invariants failing with "nothing ever settled" — none of which
+    ///      was true of the mechanism.
+    ///
+    ///      So reachability is proven DETERMINISTICALLY instead, by
+    ///      `test_campaignCanReachEveryInterestingState`, which drives the handler by hand through
+    ///      every state the invariants are conditional on. That is a stronger guarantee than a
+    ///      probabilistic one: it does not depend on the seed at all.
+    ///
+    ///      The counters are still printed, because a reviewer reading a campaign log should be
+    ///      able to see the coverage it actually achieved rather than trust that it achieved any.
     function afterInvariant() public view {
         console2.log("exact-input  bonded  :", handler.exactInputBonded());
-
         console2.log("exact-input  unbonded:", handler.exactInputUnbonded());
-
         console2.log("exact-output bonded  :", handler.exactOutputBonded());
-
         console2.log("exact-output unbonded:", handler.exactOutputUnbonded());
-
         console2.log("reverted             :", handler.reverted());
+        console2.log("settled              :", handler.settledCount());
+        console2.log("settlements priced   :", handler.settlementsChecked());
+        console2.log("full refunds         :", handler.fullRefundCount());
+        console2.log("partial slashes      :", handler.partialSlashCount());
+        console2.log("full slashes         :", handler.fullSlashCount());
+        console2.log("mask union observed  :", uint256(handler.observedMaskUnion()));
+
+        // ADR-0008 REACH. `blockTermDecidedBonds` is the sharpest of the three: zero would mean the
+        // campaign never produced a bond whose rate came from the block term rather than its own
+        // impact, so every ADR-0008 invariant above would have been asserted only on the old
+        // model's behaviour. It is reported rather than asserted, because `afterInvariant` also
+        // observes shrunk sequences after a failure and asserting here would misreport those.
+        console2.log("first-in-block swaps :", handler.firstInBlockSwaps());
+        console2.log("same-block swaps     :", handler.sameBlockSwaps());
+        console2.log("block-term bonds     :", handler.blockTermDecidedBonds());
+        console2.log("bonds ever created   :", handler.allBondCount());
+    }
+
+    /// @notice DETERMINISTIC NON-VACUITY: every state the invariants are conditional on is
+    ///         reachable through the handler's own actions.
+    ///
+    /// @dev THE POINT OF P-L2-8 § 27, proven without depending on a seed. Almost every invariant in
+    ///      this file is a conditional, and each is satisfied trivially by a campaign that bonded
+    ///      nothing. This drives the handler by hand until each state has been visited, so a
+    ///      regression that quietly stopped the campaign bonding, settling or freezing would fail
+    ///      HERE — loudly and in one place — rather than turning the whole suite silently green.
+    function test_campaignCanReachEveryInterestingState() public {
+        // All four custody modes. Odd seeds land at or above the threshold, even below.
+        handler.swapExactInput(3, true, false);
+        handler.swapExactInput(3, false, false);
+        handler.swapExactInput(2, true, false);
+        handler.swapExactOutput(3, true, false);
+        handler.swapExactOutput(3, false, false);
+        handler.swapExactOutput(2, false, false);
+
+        assertGt(handler.exactInputBonded(), 0, "NON-VACUITY: exact-input never bonded");
+        assertGt(handler.exactOutputBonded(), 0, "NON-VACUITY: exact-output never bonded");
+        assertGt(handler.exactInputUnbonded(), 0, "NON-VACUITY: exact-input was never unbonded");
+        assertGt(handler.exactOutputUnbonded(), 0, "NON-VACUITY: exact-output was never unbonded");
+
+        // Both collateral currencies were taken: the four modes above span both.
+        assertGt(currency0.balanceOf(address(hook)) + currency1.balanceOf(address(hook)), 0, "no collateral taken");
+
+        // Advance past maturity and flush so every checkpoint bit freezes.
+        handler.advanceBlocks(11);
+        handler.swapExactInput(2, true, false);
+
+        assertEq(
+            handler.observedMaskUnion() & hook.FROZEN_ALL(),
+            0,
+            "the mask union is only updated at settlement; it should still be empty here"
+        );
+
+        // Settle everything the campaign opened.
+        for (uint256 i = 0; i < 12; i++) {
+            handler.settleABond(i);
+        }
+
+        assertGt(handler.settledCount(), 0, "NON-VACUITY: nothing ever settled");
+        assertGt(handler.settlementsChecked(), 0, "NON-VACUITY: no settlement was priced against the reference");
+        assertGt(handler.settledAfterMaturity(), 0, "NON-VACUITY: nothing settled at or after maturity");
+
+        assertEq(
+            handler.observedMaskUnion() & hook.FROZEN_ALL(),
+            hook.FROZEN_ALL(),
+            "NON-VACUITY: some checkpoint endpoint was never frozen"
+        );
+
+        assertTrue(
+            handler.settledInCurrency(currency0) || handler.settledInCurrency(currency1),
+            "NON-VACUITY: no settlement was attributed to a currency"
+        );
+
+        // At least one settlement outcome was reached, and the breakdown is reported. Which
+        // outcome depends on the price path, so the bar here is existence rather than all three.
+        uint256 outcomes = (handler.fullRefundCount() > 0 ? 1 : 0) + (handler.partialSlashCount() > 0 ? 1 : 0)
+            + (handler.fullSlashCount() > 0 ? 1 : 0);
+
+        assertGt(outcomes, 0, "NON-VACUITY: no settlement outcome was classified");
+
+        console2.log("REACHABLE full refunds   :", handler.fullRefundCount());
+        console2.log("REACHABLE partial slashes:", handler.partialSlashCount());
+        console2.log("REACHABLE full slashes   :", handler.fullSlashCount());
+        console2.log("REACHABLE mask union     :", uint256(handler.observedMaskUnion()));
+
+        // And the invariants still hold on the state this test built.
+        assertFalse(handler.ghostConservationViolated(), "conservation broke on the reachable path");
+        assertFalse(handler.ghostSettlementMismatch(), "a settlement disagreed with Model L2");
+        assertFalse(handler.ghostDoubleSettlement(), "a double settlement occurred");
     }
 
     /// @notice Proves that the handler can reach all four custody paths.
@@ -746,7 +970,7 @@ contract BondCustodyInvariantsTest is Test, Deployers {
         handler.advanceBlocks(11);
         handler.swapExactInput(2, true, false);
 
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         uint32 open = m - obs;
 

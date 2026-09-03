@@ -41,7 +41,12 @@ contract HookWiringTest is Test, Deployers {
     function test_permissionBitsMatchAddress() public view {
         // If this holds, the CREATE2 salt mining worked and PoolManager will accept the hook.
         Hooks.validateHookPermissions(IHooks(address(hook)), hook.getHookPermissions());
-        assertEq(hook.afterInitializeCount(), 1, "afterInitialize did not fire");
+        // `afterInitialize` proved by the state it actually writes, not by a counter kept for
+        // tests. P-L2-7 removed `afterInitializeCount`: it was production storage whose own comment
+        // admitted it existed only so a test could read it. `poolIndexOf` is set in the same
+        // callback and IS needed — every bond references its pool through it — so asserting on it
+        // proves the same thing while testing something the protocol depends on.
+        assertGt(hook.poolIndexOf(key_.toId()), 0, "afterInitialize did not register the pool");
     }
 
     /// @notice The anti-drift test. `HOOK_FLAGS` is what the salt is mined against;
@@ -124,7 +129,7 @@ contract HookWiringTest is Test, Deployers {
         );
 
         // The accumulator replaced the lastTickBefore/lastTickAfter diagnostics in T5.1.
-        (int24 effectiveTick, uint32 lastUpdate,) = hook.accumulator(key_.toId());
+        (int24 effectiveTick, uint32 lastUpdate,,) = hook.accumulator(key_.toId());
 
         console2.log("effective tick after swap", effectiveTick);
 

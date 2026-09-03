@@ -66,6 +66,13 @@ import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 ///      than arithmetic: it is the only path that both credits the insurance pot (a cold write on
 ///      the first slash in a currency) AND transfers a refund. Full slash skips the transfer; full
 ///      refund skips the pot.
+///
+///      P-L2-7 RE-MEASURED: the figures above are pre-cleanup. After removing `cumulativeAtOpen`,
+///      `PersistenceMathLib`, `afterInitializeCount` and the two obsolete `PoolConfig` fields,
+///      `beforeSwap` fell by 127 gas everywhere and `afterSwap` rose by a uniform 222. The
+///      worst-case `beforeSwap` is now 106,878 against a 150,000 ceiling; the worst `afterSwap`
+///      73,447 against 100,000. See `P_L2_7_MIGRATION_REPORT.md` § 7 for the full table and for
+///      what the +222 is and is not attributable to.
 contract ModelL2SettlementGasTest is Test, Deployers {
     using StateLibrary for IPoolManager;
 
@@ -110,7 +117,7 @@ contract ModelL2SettlementGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     function _hookData() internal pure returns (bytes memory) {

@@ -80,7 +80,7 @@ contract MaturityCheckpointGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     function _swap(int256 amountSpecified, bool zeroForOne, bytes memory hookData) internal {
@@ -264,7 +264,7 @@ contract MaturityCheckpointGasTest is Test, Deployers {
         }
 
         // The cursor sits at the last opening block.
-        (, uint32 l,) = hook.accumulator(id_);
+        (, uint32 l,,) = hook.accumulator(id_);
 
         // All ten maturities are ahead of the cursor and still unfrozen.
         for (uint32 i = 0; i < ob; i++) {

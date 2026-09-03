@@ -144,7 +144,7 @@ contract BondThresholdsTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, THRESHOLD_0, THRESHOLD_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, THRESHOLD_0, THRESHOLD_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -329,15 +329,15 @@ contract BondThresholdsTest is Test, Deployers {
 
     /// @notice The maximum `uint96` currency1 threshold can be stored without truncating or corrupting neighbouring packed fields.
     function test_setPoolConfig_acceptsMaxUint96Threshold() public {
-        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, type(uint128).max, type(uint96).max, true);
 
-        (uint128 min0, uint96 min1, uint16 bondBps,) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, bool bondingEnabled) = hook.poolConfig(id_);
 
         assertEq(min1, type(uint96).max, "uint96 threshold was truncated");
 
         assertEq(min0, type(uint128).max, "neighbouring uint128 field was corrupted");
 
-        assertEq(bondBps, BOND_BPS, "neighbouring uint16 field was corrupted");
+        assertTrue(bondingEnabled, "the neighbouring enable flag was corrupted");
     }
 
     /// @notice Raw calldata containing a value larger than `uint96` must be rejected rather than silently truncated.
@@ -355,13 +355,13 @@ contract BondThresholdsTest is Test, Deployers {
         assertFalse(success, "an oversized uint96 threshold was accepted through raw calldata");
 
         // Rejected calldata must leave the existing configuration unchanged.
-        (uint128 min0, uint96 min1, uint16 bondBps,) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, bool bondingEnabled) = hook.poolConfig(id_);
 
         assertEq(min0, THRESHOLD_0, "config was mutated by a rejected call");
 
         assertEq(min1, THRESHOLD_1, "config was mutated by a rejected call");
 
-        assertEq(bondBps, BOND_BPS, "config was mutated by a rejected call");
+        assertTrue(bondingEnabled, "config was mutated by a rejected call");
     }
 
     /// @notice Equivalent raw calldata with an in-range `uint96` value succeeds.
@@ -371,15 +371,14 @@ contract BondThresholdsTest is Test, Deployers {
             key_,
             uint256(THRESHOLD_0),
             uint256(type(uint96).max),
-            uint256(BOND_BPS),
-            uint256(REFUND_TOL)
+            uint256(1) // bondingEnabled == true, ABI-encoded as a full word
         );
 
         (bool success,) = address(hook).call(goodCalldata);
 
         assertTrue(success, "a valid raw-calldata config was rejected");
 
-        (, uint96 min1,,) = hook.poolConfig(id_);
+        (, uint96 min1,) = hook.poolConfig(id_);
 
         assertEq(min1, type(uint96).max, "raw-calldata config did not take effect");
     }
@@ -451,7 +450,7 @@ contract BondThresholdsTest is Test, Deployers {
         // which would make this a partial-fill test rather than a threshold-selection one.
         uint256 amount = bound(uint256(rawAmount), 1e6, 1e9);
 
-        hook.setPoolConfig(key_, min0, min1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, min0, min1, true);
 
         uint256 applicable = zeroForOne ? uint256(min0) : uint256(min1);
 

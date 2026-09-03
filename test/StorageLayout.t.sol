@@ -60,26 +60,41 @@ contract StorageLayoutTest is Test, Deployers {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Top-level slot assignments, from `forge inspect BondMeBro storage-layout`.
+    /// @dev EVERY SLOT SHIFTED DOWN BY ONE IN P-L2-7. `afterInitializeCount` occupied slot 1 and
+    ///      was production storage that existed only so a test could assert `afterInitialize` had
+    ///      fired — its own NatSpec said so. Removing it moved everything below it up.
+    ///
+    ///      That is a deliberate layout change on a contract that has never been deployed, and it
+    ///      is why several suites carry their own copy of these numbers: they read bond and bucket
+    ///      slots directly to observe state ADR-0004 Rule 1 hides from the public API. This file is
+    ///      the authority; the copies name it.
     uint256 internal constant SLOT_POOL_CONFIG = 0;
-    uint256 internal constant SLOT_AFTER_INITIALIZE_COUNT = 1;
-    uint256 internal constant SLOT_ACCUMULATOR = 2;
-    uint256 internal constant SLOT_MATURITY = 3;
-    uint256 internal constant SLOT_BONDS = 4;
-    uint256 internal constant SLOT_POOL_REF_BY_INDEX = 5;
-    uint256 internal constant SLOT_POOL_INDEX_OF = 6;
-    uint256 internal constant SLOT_POOL_COUNT = 7;
-    uint256 internal constant SLOT_INSURANCE_POT = 8;
+    uint256 internal constant SLOT_ACCUMULATOR = 1;
+    uint256 internal constant SLOT_MATURITY = 2;
+    uint256 internal constant SLOT_BONDS = 3;
+    uint256 internal constant SLOT_POOL_REF_BY_INDEX = 4;
+    uint256 internal constant SLOT_POOL_INDEX_OF = 5;
+    uint256 internal constant SLOT_POOL_COUNT = 6;
+    uint256 internal constant SLOT_INSURANCE_POT = 7;
 
     /// @dev Byte offset of `Bond.state` within the record's SECOND slot.
     ///
-    ///      `variableLegAmount` 16 + `cumulativeAtOpen` 7 + `tickBefore` 3 + `tickAfter` 3 +
-    ///      `collateralIsCurrency0` 1 = 30, so `state` starts at byte 30 and the slot uses 31 of
-    ///      its 32 bytes. The spare byte is headroom, not waste: one more `uint8` could be added
-    ///      to a `Bond` without costing a slot.
-    uint256 internal constant BOND_STATE_BYTE_OFFSET = 30;
+    ///      `variableLegAmount` 16 + `tickBefore` 3 + `tickAfter` 3 + `collateralIsCurrency0` 1
+    ///      = 23, so `state` starts at byte 23 and the slot uses 24 of its 32 bytes.
+    ///
+    ///      MOVED IN P-L2-7, from 30 to 23. Removing `cumulativeAtOpen` (an `int56`) freed SEVEN
+    ///      bytes from the middle of the slot and shifted everything above it down. The record is
+    ///      still exactly two slots, and slot 1 now has 8 spare bytes rather than 1 — real headroom
+    ///      for a future field rather than a rounding accident.
+    uint256 internal constant BOND_STATE_BYTE_OFFSET = 25;
 
     /// @dev Byte offset of `Bond.collateralIsCurrency0` within the second slot.
-    uint256 internal constant BOND_CURRENCY_FLAG_BYTE_OFFSET = 29;
+    uint256 internal constant BOND_CURRENCY_FLAG_BYTE_OFFSET = 24;
+
+    /// @dev ADR-0008's stored effective rate, `uint16` at bytes 22-23 of slot 1. It pushed
+    ///      `collateralIsCurrency0` from 22 to 24 and `state` from 23 to 25, which is why those
+    ///      two constants moved with it. Slot 1 now uses 26 of 32 bytes.
+    uint256 internal constant BOND_COLLATERAL_BPS_BYTE_OFFSET = 22;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -103,7 +118,7 @@ contract StorageLayoutTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -152,38 +167,31 @@ contract StorageLayoutTest is Test, Deployers {
             uint96(uint256(cfgWord) >> 128), MIN_BONDED_1, "poolConfig.minBondedAmount1 is not at slot 0 offset 16"
         );
 
-        assertEq(uint16(uint256(cfgWord) >> 224), BOND_BPS, "poolConfig.bondBps is not at slot 0 offset 28");
+        // P-L2-7 replaced `bondBps` (offset 28) and `refundToleranceTicks` (offset 30) with a
+        // single `bondingEnabled` bool at offset 28. The slot now uses 29 of its 32 bytes.
+        assertTrue((uint8(uint256(cfgWord) >> 224) & 0xFF) != 0, "poolConfig.bondingEnabled is not at slot 0 offset 28");
 
-        assertEq(
-            uint16(uint256(cfgWord) >> 240), REFUND_TOL, "poolConfig.refundToleranceTicks is not at slot 0 offset 30"
-        );
+        assertEq(uint24(uint256(cfgWord) >> 232), 0, "poolConfig's freed high bytes are not zero");
 
-        // `afterInitializeCount` at slot 1, a plain uint256.
-        assertEq(
-            uint256(vm.load(address(hook), bytes32(SLOT_AFTER_INITIALIZE_COUNT))),
-            hook.afterInitializeCount(),
-            "afterInitializeCount is not at slot 1"
-        );
-
-        // `poolCount` at slot 7, low four bytes.
+        // `poolCount` at slot 6, low four bytes.
         assertEq(
             uint32(uint256(vm.load(address(hook), bytes32(SLOT_POOL_COUNT)))),
             hook.poolCount(),
-            "poolCount is not at slot 7 offset 0"
+            "poolCount is not at slot 6 offset 0"
         );
 
         // `poolIndexOf` at slot 6.
         assertEq(
             uint32(uint256(vm.load(address(hook), keccak256(abi.encode(id_, SLOT_POOL_INDEX_OF))))),
             hook.poolIndexOf(id_),
-            "poolIndexOf is not at slot 6"
+            "poolIndexOf is not at slot 5"
         );
 
         // `insurancePot` at slot 8, a nested mapping.
         bytes32 potSlot = keccak256(abi.encode(currency0, keccak256(abi.encode(id_, SLOT_INSURANCE_POT))));
 
         assertEq(
-            uint256(vm.load(address(hook), potSlot)), hook.insurancePot(id_, currency0), "insurancePot is not at slot 8"
+            uint256(vm.load(address(hook), potSlot)), hook.insurancePot(id_, currency0), "insurancePot is not at slot 7"
         );
     }
 
@@ -221,20 +229,33 @@ contract StorageLayoutTest is Test, Deployers {
         assertEq(uint32(word0 >> 192), bond.maturityBlock, "maturityBlock is not at slot 0 offset 24");
         assertEq(uint32(word0 >> 224), bond.poolIndex, "poolIndex is not at slot 0 offset 28");
 
-        // SLOT 1 -- uint128 16 + int56 7 + int24 3 + int24 3 + bool 1 + enum 1 = 31 bytes.
+        // SLOT 1 -- uint128 16 + int24 3 + int24 3 + uint16 2 + bool 1 + enum 1 = 26 bytes, 6 spare.
         assertEq(uint128(word1), bond.variableLegAmount, "variableLegAmount is not at slot 1 offset 0");
-        assertEq(int56(uint56(word1 >> 128)), bond.cumulativeAtOpen, "cumulativeAtOpen is not at slot 1 offset 16");
-        assertEq(int24(uint24(word1 >> 184)), bond.tickBefore, "tickBefore is not at slot 1 offset 23");
-        assertEq(int24(uint24(word1 >> 208)), bond.tickAfter, "tickAfter is not at slot 1 offset 26");
+        assertEq(int24(uint24(word1 >> 128)), bond.tickBefore, "tickBefore is not at slot 1 offset 16");
+        assertEq(int24(uint24(word1 >> 152)), bond.tickAfter, "tickAfter is not at slot 1 offset 19");
+
+        assertEq(
+            uint16(word1 >> (8 * BOND_COLLATERAL_BPS_BYTE_OFFSET)),
+            bond.collateralBps,
+            "collateralBps is not at slot 1 offset 22"
+        );
 
         assertEq(
             uint8(word1 >> (8 * BOND_CURRENCY_FLAG_BYTE_OFFSET)) & 0xFF,
             bond.collateralIsCurrency0 ? 1 : 0,
-            "collateralIsCurrency0 is not at slot 1 offset 29"
+            "collateralIsCurrency0 is not at slot 1 offset 24"
         );
 
         assertEq(
-            uint8(word1 >> (8 * BOND_STATE_BYTE_OFFSET)) & 0xFF, uint8(bond.state), "state is not at slot 1 offset 30"
+            uint8(word1 >> (8 * BOND_STATE_BYTE_OFFSET)) & 0xFF, uint8(bond.state), "state is not at slot 1 offset 25"
+        );
+
+        // SLOT 1'S REMAINING SPARE must actually be zero, not merely unread. A stale
+        // `cumulativeAtOpen` left behind by P-L2-7's incomplete removal would sit here, and so
+        // would any accidental widening of ADR-0008's `collateralBps`. Six bytes now rather than
+        // eight, because the rate took two of them.
+        assertEq(
+            uint48(word1 >> 208), 0, "slot 1's spare high bytes are not zero: something is writing past the stored rate"
         );
 
         // THE COMMITMENT.
@@ -278,9 +299,9 @@ contract StorageLayoutTest is Test, Deployers {
         // Everything else must be exactly as before, which is what proves the write was confined.
         BondMeBro.Bond memory expected = _decodeSlot1(original);
 
-        assertEq(after_.cumulativeAtOpen, expected.cumulativeAtOpen, "cumulativeAtOpen moved");
         assertEq(after_.tickBefore, expected.tickBefore, "tickBefore moved");
         assertEq(after_.tickAfter, expected.tickAfter, "tickAfter moved");
+        assertEq(after_.collateralBps, expected.collateralBps, "collateralBps moved");
         assertEq(after_.collateralIsCurrency0, expected.collateralIsCurrency0, "collateralIsCurrency0 moved");
         assertEq(uint8(after_.state), uint8(expected.state), "state moved");
     }
@@ -288,9 +309,9 @@ contract StorageLayoutTest is Test, Deployers {
     /// @dev Decodes the fields of a `Bond`'s second slot from a raw word, by the pinned offsets.
     function _decodeSlot1(uint256 word) internal pure returns (BondMeBro.Bond memory bond) {
         bond.variableLegAmount = uint128(word);
-        bond.cumulativeAtOpen = int56(uint56(word >> 128));
-        bond.tickBefore = int24(uint24(word >> 184));
-        bond.tickAfter = int24(uint24(word >> 208));
+        bond.tickBefore = int24(uint24(word >> 128));
+        bond.tickAfter = int24(uint24(word >> 152));
+        bond.collateralBps = uint16(word >> (8 * BOND_COLLATERAL_BPS_BYTE_OFFSET));
         bond.collateralIsCurrency0 = (uint8(word >> (8 * BOND_CURRENCY_FLAG_BYTE_OFFSET)) & 0xFF) != 0;
         bond.state = BondMeBro.BondState(uint8(word >> (8 * BOND_STATE_BYTE_OFFSET)) & 0xFF);
     }
@@ -318,14 +339,18 @@ contract StorageLayoutTest is Test, Deployers {
             "PoolConfig spilled into a second slot: every swap now pays an extra SLOAD"
         );
 
-        (uint128 min0, uint96 min1, uint16 bps, uint16 tol) = hook.poolConfig(id_);
+        (uint128 min0, uint96 min1, bool bondingEnabled) = hook.poolConfig(id_);
 
         uint256 word = uint256(vm.load(address(hook), base));
 
         assertEq(uint128(word), min0, "minBondedAmount0 offset");
         assertEq(uint96(word >> 128), min1, "minBondedAmount1 offset");
-        assertEq(uint16(word >> 224), bps, "bondBps offset");
-        assertEq(uint16(word >> 240), tol, "refundToleranceTicks offset");
+        assertEq((uint8(word >> 224) & 0xFF) != 0, bondingEnabled, "bondingEnabled is not at offset 28");
+
+        // P-L2-7 replaced two `uint16` economic fields with one `bool`, so the slot now uses 29
+        // of its 32 bytes rather than all 32. The three freed bytes must read as zero: a stale
+        // `refundToleranceTicks` left behind by an incomplete removal would sit exactly there.
+        assertEq(uint24(word >> 232), 0, "PoolConfig's freed high bytes are not zero");
     }
 
     /// @notice `MaturityCheckpoint` occupies exactly one slot, with all FIVE fields at the offsets

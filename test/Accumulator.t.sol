@@ -72,7 +72,7 @@ contract AccumulatorTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -97,7 +97,9 @@ contract AccumulatorTest is Test, Deployers {
     }
 
     function _acc() internal view returns (int24 lastTick, uint32 lastUpdate, int56 tickCumulative) {
-        return hook.accumulator(id_);
+        // `blockStartTick` (ADR-0008) is skipped: this helper's three-field shape is what every
+        // caller here reasons about, and the latch has its own dedicated coverage.
+        (lastTick, lastUpdate,, tickCumulative) = hook.accumulator(id_);
     }
 
     function _poolTick() internal view returns (int24 tick) {
@@ -138,7 +140,7 @@ contract AccumulatorTest is Test, Deployers {
         });
         manager.initialize(freshKey, TickMath.getSqrtPriceAtTick(INIT_TICK));
 
-        (int24 lastTick, uint32 lastUpdate, int56 tickCumulative) = hook.accumulator(freshKey.toId());
+        (int24 lastTick, uint32 lastUpdate,, int56 tickCumulative) = hook.accumulator(freshKey.toId());
 
         assertEq(lastTick, INIT_TICK, "fresh pool did not seed from its real tick");
         assertEq(lastUpdate, uint32(block.number), "fresh pool not stamped at its init block");
@@ -244,7 +246,7 @@ contract AccumulatorTest is Test, Deployers {
     /// @notice An unconfigured pool — which can never bond — must still advance its accumulator.
     /// @dev The cheapest path in the contract, and the one most likely to acquire an early return.
     function test_unconfiguredPool_stillAdvancesAccumulator() public {
-        hook.setPoolConfig(key_, 0, 0, 0, 0);
+        hook.setPoolConfig(key_, 0, 0, false);
         _assertSwapAdvances(-1e16, true, "");
     }
 

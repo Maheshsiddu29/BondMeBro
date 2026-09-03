@@ -69,7 +69,7 @@ contract SettlementTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -359,7 +359,7 @@ contract SettlementTest is Test, Deployers {
         //
         // The shift is derived from `test/StorageLayout.t.sol`, which fails first and by name if
         // these offsets ever move again.
-        bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(3)))));
+        bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(2)))));
         vm.store(address(hook), slot, bytes32(uint256(pending) << 168));
 
         (,,, uint32 pendingAfter, uint8 frozenAfterMask) = hook.maturity(id_, m);
@@ -368,7 +368,7 @@ contract SettlementTest is Test, Deployers {
         assertEq(pendingAfter, pending, "fixture: pendingBonds must survive the corruption");
         assertFalse(frozenAfter, "fixture: checkpoint should now read unfrozen");
 
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
         assertGt(lastUpdate, m, "fixture: cursor must be past M for this to be unrecoverable");
 
         // THE NAMED ENDPOINT CHANGED IN P-L2-6, and the change is the point.
@@ -482,7 +482,7 @@ contract SettlementTest is Test, Deployers {
     function test_quietPool_settlementDerivesAndFreezesM() public {
         (bytes32 bondId, uint32 m) = _openBond();
 
-        (int24 tickAfterOpen, uint32 lastUpdate, int56 cumAtOpen) = hook.accumulator(id_);
+        (int24 tickAfterOpen, uint32 lastUpdate,, int56 cumAtOpen) = hook.accumulator(id_);
 
         // Nothing happens at all, well past maturity.
         vm.roll(uint256(m) + 3_000);

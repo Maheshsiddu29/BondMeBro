@@ -3,7 +3,6 @@ pragma solidity 0.8.26;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {TickAccumulatorLib} from "../src/libraries/TickAccumulatorLib.sol";
-import {PersistenceMathLib} from "../src/libraries/PersistenceMathLib.sol";
 
 /// @dev Thin harness: the library writes to a storage pointer, so it needs a stateful host.
 contract AccumulatorHost {
@@ -58,19 +57,26 @@ contract TickAccumulatorLibTest is Test {
         assertEq(TickAccumulatorLib.twaTick(open, nowC, 10), int24(100));
     }
 
-    /// @notice Quiet pool: no swaps at all during the window. Extrapolation must hold the
-    ///         last tick, so the TWA equals tickAfter and the bond slashes fully. This is
-    ///         the correct answer under the thesis — price moved, nobody reverted it — and
-    ///         it is why there is no "invalid reference -> auto-refund" branch to grind.
-    function test_quietPool_TwaHoldsLastTick_AndSlashes() public {
+    /// @notice Quiet pool: no swaps at all during the window. Extrapolation holds the last tick,
+    ///         so the average across the window equals the post-swap tick exactly.
+    ///
+    /// @dev This is the accumulator half of the quiet-pool rule: silence is not an absence of data,
+    ///      it is a constant. The SETTLEMENT half — that a quiet pool is never auto-refunded, and a
+    ///      persistent displacement is still slashed — moved to Model L2 and is proven in
+    ///      `ModelL2SettlementIntegration.t.sol::test_quietPool_persistentDisplacementIsStillSlashed`.
+    ///
+    ///      The Model B slash assertion that used to live here was deleted with
+    ///      `PersistenceMathLib` in P-L2-7. What it claimed is still true; it is simply no longer
+    ///      this library's business, and asserting it here would have tested a curve the protocol
+    ///      does not run.
+    function test_quietPool_TwaHoldsLastTick() public {
         host.update(950); // the swap set tick to 950, then silence
         int56 open = host.observe();
 
         vm.roll(block.number + 5);
         int24 twa = TickAccumulatorLib.twaTick(open, host.observe(), 5);
 
-        assertEq(twa, int24(950));
-        assertEq(PersistenceMathLib.computeBps(1000, 950, twa, 5), 10_000, "quiet pool must slash");
+        assertEq(twa, int24(950), "extrapolation must hold the last tick across a quiet window");
     }
 
     /// @notice Averaging works over multiple segments with unequal durations.
@@ -99,9 +105,19 @@ contract TickAccumulatorLibTest is Test {
         assertEq(TickAccumulatorLib.twaTick(open, host.observe(), 10), int24(100));
     }
 
-    /// @notice The reason spot settlement was removed. An attacker who pushes the price back
-    ///         for one block out of a ten-block window recovers only a fraction of the bond,
-    ///         where spot settlement would have handed back the lot.
+    /// @notice A one-block push out of ten is diluted by the average: the reference barely moves.
+    ///
+    /// @dev THE REASON SPOT SETTLEMENT WAS REMOVED, stated as a property of the ACCUMULATOR rather
+    ///      than of any slash curve. An attacker who shoves the price back for a single block sees
+    ///      the time-weighted reference move by roughly a tenth of the push, where a spot reading
+    ///      would have moved the whole way.
+    ///
+    ///      The Model B assertions that used to close this test — `computeBps` under TWA versus
+    ///      spot — went with `PersistenceMathLib` in P-L2-7. Model L2 makes the same point far more
+    ///      strongly and at the level that now matters:
+    ///      `ModelL2Settlement.t.sol::test_residual_singleOpposingBlockCannotEraseTheCharge` shows a
+    ///      single opposing block cannot reduce the charge AT ALL, because it cannot touch both
+    ///      late windows.
     function test_shortManipulationIsDiluted() public {
         host.update(950); // post-swap tick
         int56 open = host.observe();
@@ -111,19 +127,25 @@ contract TickAccumulatorLibTest is Test {
         vm.roll(block.number + 1); // held for exactly 1 block
         int24 twa = TickAccumulatorLib.twaTick(open, host.observe(), 10);
 
-        uint16 twaResult = PersistenceMathLib.computeBps(1000, 950, twa, 5);
-        uint16 spotResult = PersistenceMathLib.computeBps(1000, 950, 1000, 5);
+        // Nine blocks at 950 and one at 1000 average to 955.
+        assertEq(twa, int24(955), "a one-block push must be diluted by the nine that preceded it");
 
-        assertEq(spotResult, 0, "spot settlement would refund the whole bond");
-        assertGt(twaResult, 8_000, "TWA must still slash most of it");
+        assertLt(twa, int24(1000), "the reference must not follow the push to spot");
 
         console2.log("TWA tick after 1/10 blocks manipulated:", twa);
-        console2.log("persistence under TWA (bps): ", twaResult);
-        console2.log("persistence under spot (bps):", spotResult);
     }
 
-    /// @notice Sustained manipulation still works — TWA raises the cost, it does not remove
-    ///         the attack. Holding the push for most of the window recovers most of the bond.
+    /// @notice Sustained manipulation moves the reference — the average raises the cost, it does
+    ///         not remove the attack.
+    ///
+    /// @dev A KNOWN LIMITATION, kept deliberately. Holding the push for nine of ten blocks drags
+    ///      the reference most of the way back, and no averaging window can prevent that: the
+    ///      attacker is paying for real price exposure across almost the whole window.
+    ///
+    ///      Model L2 does not claim otherwise. Its own equivalent — the two-block straddle — is
+    ///      documented as a limitation in ADR-0005 § 6.1 and asserted as one in
+    ///      `ModelL2Settlement.t.sol::test_documentedLimitation_twoBlockStraddleErasesTheCharge`.
+    ///      Manipulation is never described as impossible anywhere in this repository.
     function test_sustainedManipulationStillWorks_KnownLimitation() public {
         host.update(950);
         int56 open = host.observe();
@@ -133,7 +155,11 @@ contract TickAccumulatorLibTest is Test {
         vm.roll(block.number + 9); // and held for 9 of 10 blocks
 
         int24 twa = TickAccumulatorLib.twaTick(open, host.observe(), 10);
-        assertLt(PersistenceMathLib.computeBps(1000, 950, twa, 5), 2_000);
+
+        // One block at 950 and nine at 1000 average to 995 — nearly all the way back.
+        assertEq(twa, int24(995), "a sustained push must drag the reference most of the way back");
+
+        assertGt(twa, int24(990), "the limitation is that the reference DOES follow a sustained push");
     }
 
     /// @notice A zero-length window must revert rather than divide by zero. Unreachable

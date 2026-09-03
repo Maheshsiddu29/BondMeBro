@@ -114,7 +114,7 @@ contract BondCustodyTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -572,7 +572,7 @@ contract BondCustodyTest is Test, Deployers {
         // reproduces the identical tick move and identical leg measured above.
         vm.revertToState(baseline);
 
-        hook.setPoolConfig(thinKey, 1, 1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(thinKey, 1, 1, true);
 
         vm.expectRevert(
             _wrappedIn(
@@ -842,7 +842,7 @@ contract BondCustodyTest is Test, Deployers {
         // The accumulator confirms both swap callbacks executed. `beforeSwap` advances it
         // unconditionally, before any bonded/unbonded branch; `afterSwap` writes the post-swap
         // tick into it. This replaces the lastTickBefore/lastTickAfter diagnostics removed in T5.1.
-        (int24 effectiveTick, uint32 lastUpdate,) = hook.accumulator(id_);
+        (int24 effectiveTick, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         assertEq(lastUpdate, uint32(block.number), "beforeSwap did not advance the accumulator");
 
@@ -882,7 +882,7 @@ contract BondCustodyTest is Test, Deployers {
 
     /// @notice A pool with bonding disabled never takes collateral.
     function test_unconfiguredPool_neverBonds() public {
-        hook.setPoolConfig(key_, 0, 0, 0, 0);
+        hook.setPoolConfig(key_, 0, 0, false);
 
         uint256 hookBefore = currency0.balanceOf(address(hook));
 
@@ -902,7 +902,7 @@ contract BondCustodyTest is Test, Deployers {
 
     /// @notice Exact-output swaps on a pool with bonding disabled do not require hookData.
     function test_exactOutput_onDisabledPool_needsNoHookData() public {
-        hook.setPoolConfig(key_, 0, 0, 0, 0);
+        hook.setPoolConfig(key_, 0, 0, false);
 
         uint256 hookBefore0 = currency0.balanceOf(address(hook));
 
@@ -919,58 +919,66 @@ contract BondCustodyTest is Test, Deployers {
                       CONFIG & ACCESS CONTROL
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice `bondBps` cannot exceed the compile-time safety cap.
-    function test_setPoolConfig_rejectsBondBpsAboveCap() public {
-        vm.expectRevert(abi.encodeWithSelector(BondMeBro.BondBpsAboveCap.selector, uint16(101), uint16(100)));
-
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 101, REFUND_TOL);
+    /// @notice Enabling bonding requires BOTH direction thresholds.
+    ///
+    /// @dev A ZERO THRESHOLD IS NOT "DISABLE THIS DIRECTION". Eligibility is
+    ///      `consumedInput >= threshold`, so a zero threshold bonds every positive swap in that
+    ///      direction — the most aggressive setting the contract can hold, reachable by omitting a
+    ///      field. Requiring both explicitly keeps the most punitive configuration from being the
+    ///      easiest typo.
+    ///
+    ///      This replaced `test_setPoolConfig_rejectsPartialConfigurations` in P-L2-7. That test
+    ///      guarded a four-field all-or-nothing rule over `bondBps` and `refundToleranceTicks`;
+    ///      both fields are gone, so only the two thresholds remain to be complete about.
+    function test_setPoolConfig_enablingRequiresBothThresholds() public {
+        _expectIncomplete(0, MIN_BONDED_1);
+        _expectIncomplete(MIN_BONDED, 0);
+        _expectIncomplete(0, 0);
     }
 
-    /// @notice The maximum allowed bond rate itself is valid.
-    function test_setPoolConfig_acceptsBondBpsAtCap() public {
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, 100, REFUND_TOL);
+    /// @dev Asserts one incomplete enable is rejected, reporting both thresholds back.
+    function _expectIncomplete(uint128 min0, uint96 min1) internal {
+        vm.expectRevert(abi.encodeWithSelector(BondMeBro.IncompleteBondingConfig.selector, min0, min1));
 
-        (,, uint16 bondBps,) = hook.poolConfig(id_);
-
-        assertEq(bondBps, 100, "config at the cap was rejected");
+        hook.setPoolConfig(key_, min0, min1, true);
     }
 
-    /// @notice Pool configuration must either set all three bonding fields or clear all three.
+    /// @notice Disabling ignores the thresholds passed alongside it, and clears what was stored.
+    ///
+    /// @dev Two claims. First, `false` is a complete instruction on its own — no sentinel value is
+    ///      needed and none is checked, so disabling can never fail for an unrelated reason.
+    ///      Second, disabling CLEARS the stored thresholds, so a pool that is later re-enabled
+    ///      cannot silently inherit numbers set months earlier by someone else.
+    function test_setPoolConfig_disablingClearsTheThresholds() public {
+        // Enabled with real thresholds first, so there is something to clear.
+        (uint128 before0, uint96 before1, bool enabledBefore) = hook.poolConfig(id_);
 
-    /// @dev A zero threshold does not disable one direction because `grossInput >= 0` is true for every positive swap. Partial configurations are therefore rejected.
-    function test_setPoolConfig_rejectsPartialConfigurations() public {
-        // One field set, three zero.
-        _expectIncomplete(MIN_BONDED, 0, 0, 0);
-        _expectIncomplete(0, MIN_BONDED_1, 0, 0);
-        _expectIncomplete(0, 0, BOND_BPS, 0);
-        _expectIncomplete(0, 0, 0, REFUND_TOL);
+        assertTrue(enabledBefore, "fixture: the pool should start enabled");
+        assertGt(before0, 0, "fixture: the pool should start with a currency0 threshold");
+        assertGt(before1, 0, "fixture: the pool should start with a currency1 threshold");
 
-        // Three set, one missing — including the case T5B introduced: everything configured
-        // except the tolerance, which is the most plausible real-world omission.
-        _expectIncomplete(0, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
-        _expectIncomplete(MIN_BONDED, 0, BOND_BPS, REFUND_TOL);
-        _expectIncomplete(MIN_BONDED, MIN_BONDED_1, 0, REFUND_TOL);
-        _expectIncomplete(MIN_BONDED, MIN_BONDED_1, BOND_BPS, 0);
+        // Non-zero thresholds passed alongside `false` must be ignored, not stored.
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, false);
+
+        (uint128 min0, uint96 min1, bool enabled) = hook.poolConfig(id_);
+
+        assertFalse(enabled, "bonding was not disabled");
+        assertEq(min0, 0, "currency0 threshold was not cleared on disable");
+        assertEq(min1, 0, "currency1 threshold was not cleared on disable");
     }
 
-    /// @dev Asserts one partial configuration is rejected, reporting all four fields back.
-    function _expectIncomplete(uint128 min0, uint96 min1, uint16 bps, uint16 tol) internal {
-        vm.expectRevert(abi.encodeWithSelector(BondMeBro.IncompletePoolConfig.selector, min0, min1, bps, tol));
+    /// @notice A disabled pool takes no collateral, in either swap kind.
+    function test_disabledPool_bondsNothing() public {
+        hook.setPoolConfig(key_, 0, 0, false);
 
-        hook.setPoolConfig(key_, min0, min1, bps, tol);
-    }
+        uint256 hook0 = currency0.balanceOf(address(hook));
+        uint256 hook1 = currency1.balanceOf(address(hook));
 
-    /// @notice `(0, 0, 0)` is the valid way to disable bonding for a pool.
-    function test_setPoolConfig_allZeroDisables() public {
-        hook.setPoolConfig(key_, 0, 0, 0, 0);
+        _swap(BONDED_INPUT, true, "");
+        _swap(int256(BONDED_GROSS), true, "");
 
-        (uint128 min0, uint96 min1, uint16 bondBps,) = hook.poolConfig(id_);
-
-        assertEq(min0, 0, "currency0 threshold not cleared");
-
-        assertEq(min1, 0, "currency1 threshold not cleared");
-
-        assertEq(bondBps, 0, "bond rate not cleared");
+        assertEq(currency0.balanceOf(address(hook)), hook0, "a disabled pool took currency0");
+        assertEq(currency1.balanceOf(address(hook)), hook1, "a disabled pool took currency1");
     }
 
     /// @notice Deployment rejects a zero owner because ownership is immutable and nobody could configure pools afterward.
@@ -989,7 +997,7 @@ contract BondCustodyTest is Test, Deployers {
 
         vm.expectRevert(BondMeBro.NotOwner.selector);
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     /// @notice Swap callbacks cannot be called directly by arbitrary addresses.

@@ -80,6 +80,13 @@ import {HookDataCodec} from "../src/libraries/HookDataCodec.sol";
 ///      be said about it: it is bounded (INV-L2-12 measures callback cost as flat from 4 to 64
 ///      pending bonds, 134,916 against 134,772), it is reproducible in the campaign, and even the
 ///      unexplained figure sits 24.9% under the ceiling. It is reported rather than rounded away.
+///
+///      P-L2-7 RE-MEASURED: the figures above are pre-cleanup. After removing `cumulativeAtOpen`,
+///      `PersistenceMathLib`, `afterInitializeCount` and the two obsolete `PoolConfig` fields,
+///      `beforeSwap` fell by 127 gas everywhere and `afterSwap` rose by a uniform 222. The
+///      worst-case `beforeSwap` is now 106,878 against a 150,000 ceiling; the worst `afterSwap`
+///      73,447 against 100,000. See `P_L2_7_MIGRATION_REPORT.md` § 7 for the full table and for
+///      what the +222 is and is not attributable to.
 contract VariableLegGasTest is Test, Deployers {
     using StateLibrary for IPoolManager;
 
@@ -124,7 +131,7 @@ contract VariableLegGasTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
     }
 
     function _hookData() internal pure returns (bytes memory) {

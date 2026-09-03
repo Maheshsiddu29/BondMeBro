@@ -94,7 +94,7 @@ contract ModelL2SettlementIntegrationTest is Test, Deployers {
             ""
         );
 
-        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, BOND_BPS, REFUND_TOL);
+        hook.setPoolConfig(key_, MIN_BONDED, MIN_BONDED_1, true);
 
         refPoints.push(RefPoint({blockNumber: uint32(block.number), tickFrom: _poolTick()}));
     }
@@ -270,7 +270,7 @@ contract ModelL2SettlementIntegrationTest is Test, Deployers {
         (,,, uint32 pending,) = hook.maturity(id_, m);
 
         // Wipe every endpoint and the mask, keeping the liability. `pendingBonds` sits at byte 21.
-        bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(3)))));
+        bytes32 slot = keccak256(abi.encode(uint256(m), keccak256(abi.encode(id_, uint256(2)))));
 
         vm.store(address(hook), slot, bytes32(uint256(pending) << 168));
 
@@ -279,7 +279,7 @@ contract ModelL2SettlementIntegrationTest is Test, Deployers {
         _swapTracked(NUDGE, true, "");
 
         // slither-disable-next-line unused-return
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -462,7 +462,7 @@ contract ModelL2SettlementIntegrationTest is Test, Deployers {
         vm.roll(uint256(m) + 60);
 
         // slither-disable-next-line unused-return
-        (, uint32 lastUpdate,) = hook.accumulator(id_);
+        (, uint32 lastUpdate,,) = hook.accumulator(id_);
 
         assertEq(lastUpdate, openBlock, "fixture: the pool must be silent since the bond opened");
 

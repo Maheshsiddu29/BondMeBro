@@ -120,7 +120,18 @@ library HookDataCodec {
 
     /// @dev This function either returns a valid non-zero refund recipient and bond ceiling or reverts. There is no fallback or lenient decoding path.
 
-    /// `maxBondAmount` is bond-specific execution protection. Pool thresholds and `bondBps` are owner-configurable, so the bond required when a transaction executes may differ from the value shown when the transaction was prepared. The trader-provided ceiling prevents BondMeBro from silently taking more collateral than the trader allowed.
+    /// `maxBondAmount` is bond-specific execution protection, and it matters MORE under the current
+    /// architecture than it did when this field was designed.
+
+    /// The collateral is sized from the swap's REALIZED price impact, which nobody knows until the
+    /// pool executes. A caller cannot compute it in advance and cannot be sure a quote still holds:
+    /// the pool may move between quoting and execution, and a pool owner may change which trades
+    /// participate at all. The trader-provided ceiling is the one bound that binds regardless -- it
+    /// is checked against the collateral actually about to be taken, and the swap reverts rather
+    /// than exceeding it.
+
+    /// Note what it does NOT protect against: the rate itself is a compile-time constant and is not
+    /// owner-configurable, so there is no governance action that can raise the cost of a trade.
 
     /// This function only reads and validates `maxBondAmount`. The actual ceiling check happens later when the hook has calculated the bond:
     ///
