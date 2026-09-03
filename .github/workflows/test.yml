@@ -19,8 +19,14 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      # PINNED to match ci.yml. Left unpinned, this job could install a different Foundry build
+      # than the rest of CI for the same commit -- which makes test counts and unoptimized gas
+      # figures incomparable between jobs, and is the most likely source of a CI run reporting a
+      # test total that no local invocation reproduces.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
 
       - name: Show Forge version
         run: forge --version

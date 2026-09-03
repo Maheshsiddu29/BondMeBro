@@ -543,12 +543,34 @@ contract ObservationCheckpointGasTest is Test, Deployers {
                    27  ADVERSARIAL AMPLIFICATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice The victim's callback stays far inside the ceiling on the worst arrangement.
+    /// @notice The victim's `beforeSwap` CALLBACK FRAME stays inside the 150,000 ceiling on the
+    ///         worst arrangement an attacker can build.
     ///
     /// @dev Reports the amplification an attacker can actually buy: the ratio between an ordinary
-    ///      swap's callback and the callback of a trader who arrives after the worst opening
-    ///      pattern. The bound that matters is not the ratio but the absolute headroom, because a
-    ///      swap that reverts on gas is the actual harm.
+    ///      swap's cost and that of a trader who arrives after the worst opening pattern. The bound
+    ///      that matters is not the ratio but the absolute headroom, because a swap that reverts on
+    ///      gas is the actual harm.
+    ///
+    ///      THE ASSERTION MEASURES THE CALLBACK FRAME, NOT THE WHOLE SWAP, and the distinction is
+    ///      the entire point of this test. An earlier version wrapped `gasleft()` around
+    ///      `swapRouter.swap(...)` and asserted the result against the `beforeSwap` ceiling. That
+    ///      total also contains the router, `PoolManager.unlock`, the pool's own swap math,
+    ///      `afterSwap` and token settlement -- none of which the 150,000 limit governs.
+    ///
+    ///      It is the wrong direction for an assertion. A PASS is sound (a superset under the
+    ///      limit implies the subset is), but a FAIL says nothing about the callback at all. And it
+    ///      failed for exactly that reason: under `forge coverage`, which builds WITHOUT the
+    ///      optimizer, the whole-swap figure inflates past 150,000 while the callback itself is
+    ///      unchanged -- turning an environment artifact into a false production gas alarm.
+    ///      P-L2-8 § 4 records the same mistake being made and corrected once already.
+    ///
+    ///      `vm.lastCallGas()` reports the callee-side gas of the last CALL, so invoking
+    ///      `beforeSwap` directly -- pranked as the `PoolManager`, which is what `onlyPoolManager`
+    ///      checks -- measures precisely the frame the ceiling is written about. The hook state is
+    ///      the real post-attack state, built by the same `_fillConsecutiveBuckets` arrangement, so
+    ///      the scan this frame performs is the scan the victim would have paid for.
+    ///
+    ///      The 150,000 threshold is UNCHANGED. Only the quantity compared against it is.
     function test_adversarial_victimCallbackStaysInsideTheCeiling() public {
         // WARM THE POOL FIRST, in both arms. Without this the baseline is the pool's very first
         // swap and pays cold-storage costs everywhere -- measured, it came out HIGHER than the
@@ -578,17 +600,63 @@ contract ObservationCheckpointGasTest is Test, Deployers {
 
         vm.roll(block.number + 100_000);
 
+        // MEASURED BEFORE THE VICTIM'S SWAP RUNS, and the order is load-bearing. `beforeSwap`
+        // freezes the checkpoints it scans, so a frame measured AFTER the victim swap finds the
+        // work already done and reports a few thousand gas -- which would be a silently vacuous
+        // assertion. `_measureBeforeSwapFrame` snapshots and restores, so the arrangement below is
+        // untouched.
+        (uint256 victimBeforeSwapFrame, uint256 victimFrameCalleeSide) = _measureBeforeSwapFrame();
+
         before = gasleft();
 
         _swap(NUDGE, true, "");
 
         uint256 victimGas = before - gasleft();
 
-        console2.log("baseline swap gas", baselineGas);
-        console2.log("victim swap gas  ", victimGas);
-        console2.log("amplification x100", (victimGas * 100) / baselineGas);
+        console2.log("baseline whole swap gas   ", baselineGas);
+        console2.log("victim   whole swap gas   ", victimGas);
+        console2.log("amplification x100        ", (victimGas * 100) / baselineGas);
+        console2.log("victim beforeSwap FRAME   ", victimBeforeSwapFrame);
+        console2.log("  (callee-side figure)    ", victimFrameCalleeSide);
+        console2.log("ceiling                   ", uint256(150_000));
 
-        // The transaction-level figure bounds the callback frame, which is what the ceiling is on.
-        assertLt(victimGas, 150_000, "the victim's whole swap exceeded the beforeSwap ceiling");
+        assertLt(victimBeforeSwapFrame, 150_000, "the victim's beforeSwap CALLBACK exceeded its ceiling");
+    }
+
+    /// @dev The `beforeSwap` callback frame, in isolation, against the hook's CURRENT state.
+    ///
+    ///      Pranked as the `PoolManager` because that is the only thing `BaseHook.onlyPoolManager`
+    ///      checks. `beforeSwap` reads `getSlot0` (a view) and writes only hook storage -- it takes
+    ///      no currency and returns no delta -- so it is well-defined outside `unlock`, which is
+    ///      what makes this measurement possible at all. `afterSwap` would NOT be, since it
+    ///      settles tokens.
+    ///
+    ///      Deliberately UNBONDED (`NUDGE`, empty hookData): the ceiling is set by the checkpoint
+    ///      scan, and this isolates it from bond-record writes. A state snapshot is taken and
+    ///      restored so the measurement leaves the caller's arrangement untouched.
+    function _measureBeforeSwapFrame() internal returns (uint256 charged, uint256 calleeSide) {
+        uint256 snap = vm.snapshotState();
+
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: NUDGE, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1});
+
+        // The prank is set up OUTSIDE the measured window so its own cost is not counted.
+        vm.prank(address(manager));
+
+        uint256 g0 = gasleft();
+
+        // slither-disable-next-line unused-return
+        hook.beforeSwap(address(swapRouter), key_, params, "");
+
+        charged = g0 - gasleft();
+
+        // TWO FIGURES, AND THEY ARE NOT THE SAME NUMBER. `lastCallGas` reports the CALLEE-side
+        // execution; the `gasleft()` delta is what the CALLER is charged, which additionally
+        // carries the CALL opcode and this frame's calldata/memory expansion. The traces the
+        // 106,878 / 107,543 ceilings were read from show the CALLER-charged figure, so that is the
+        // one asserted -- it is the larger of the two and the conservative choice.
+        calleeSide = vm.lastCallGas().gasTotalUsed;
+
+        vm.revertToState(snap);
     }
 }

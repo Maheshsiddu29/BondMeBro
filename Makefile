@@ -1,4 +1,4 @@
-.PHONY: install build test fmt fmt-check snapshot coverage slither ci demo clean
+.PHONY: install build test fmt fmt-check snapshot snapshot-check coverage slither ci demo clean
 
 install:
 	forge install Uniswap/v4-periphery
@@ -17,18 +17,47 @@ fmt:
 fmt-check:
 	forge fmt --check
 
+# WHAT THE SNAPSHOT TRACKS, AND WHAT IT DELIBERATELY DOES NOT.
+#
+# Two classes of test have gas figures that move without any executable change, so tracking them
+# turns the snapshot into a source of false alarms rather than a regression signal:
+#
+#   testFuzz_*   Foundry reports mean and median across the fuzz corpus. Those drift run to run --
+#                measured up to 2.06% on an unchanged tree, which is past any tolerance tight
+#                enough to still catch a real regression. `--fuzz-seed` does NOT fix it: with a
+#                pinned seed the medians match and the means still move.
+#
+#   test_constructor_rejectsZeroOwner
+#                calls HookMiner.find INSIDE the measured body. Salt search is brute force over
+#                CREATE2 candidates, and the candidates depend on the creation-code hash -- which
+#                every comment and NatSpec edit changes, because comments change compiler metadata.
+#                Its entry was 63,315,366 gas of address mining. That is not production behaviour.
+#                The test itself is a CORRECTNESS test and is untouched; only its uselessness as a
+#                gas metric is removed. `make test` still runs it.
+#
+# What remains is 431 deterministic entries -- bonded and unbonded swaps, the beforeSwap and
+# afterSwap worst cases, settlement in every shape, checkpoint scanning, settleMany batches --
+# verified byte-identical across three independent generations.
+SNAPSHOT_EXCLUDE := ^(testFuzz_.*|test_constructor_rejectsZeroOwner\(\))$$
+
 snapshot:
-	forge snapshot
+	forge snapshot --no-match-test '$(SNAPSHOT_EXCLUDE)'
+
+snapshot-check:
+	forge snapshot --check --no-match-test '$(SNAPSHOT_EXCLUDE)'
 
 # The pattern is ANCHORED. An unanchored "lib" also matches src/libraries/, which silently
 # excluded every library in this repo from the coverage report — the numbers looked fine
 # because the only file left was the hook. Do not un-anchor it.
-# Coverage disables optimization. Exclude only this gas-ceiling assertion, whose gas
-# measurement is meaningful in the optimized test run, not in a coverage build.
-# `make test` still runs it unchanged, along with every other gas and adversarial test.
-# Foundry matches the full function signature, including (). Make needs $$ for a literal $.
+#
+# NO TEST IS EXCLUDED ANY MORE. `test_adversarial_victimCallbackStaysInsideTheCeiling` used to be
+# skipped here because it wrapped `gasleft()` around a whole swap and compared the total against
+# the `beforeSwap` CALLBACK ceiling — a total that inflates under coverage's unoptimized build and
+# failed for reasons that had nothing to do with the hook. The test now measures the callback frame
+# itself, which is small enough to stay inside 150,000 even unoptimized, so it runs here too.
+# Coverage now executes the identical test set as `make test`.
 coverage:
-	forge coverage --no-match-coverage "^(lib|test|script)/" --no-match-test '^test_adversarial_victimCallbackStaysInsideTheCeiling[(][)]$$' --report summary
+	forge coverage --no-match-coverage "^(lib|test|script)/" --report summary
 
 slither:
 	slither . --exclude-dependencies --filter-paths "lib/"

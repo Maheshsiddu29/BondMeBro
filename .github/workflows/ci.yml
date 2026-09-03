@@ -11,8 +11,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  FOUNDRY_PROFILE: ci
+# NO WORKFLOW-WIDE `FOUNDRY_PROFILE`. It used to be set to `ci` here, which applied the deep
+# profile to EVERY job -- including the gas job, whose committed snapshot is generated under the
+# default profile. `forge snapshot --check` then compared fuzz 5000 / invariant 512x100 figures
+# against 256 / 64x32 ones and diffed on essentially every fuzz and invariant entry.
+#
+# The deep profile is now scoped to the single command that wants it: the deep invariant run in
+# the `test` job below.
 
 jobs:
   lint:
@@ -79,8 +84,20 @@ jobs:
             cache
           key: build-${{ github.sha }}
 
-      - name: Run tests
+      # STEP B -- the optimized production suite, under the DEFAULT release profile.
+      # This includes `test_adversarial_victimCallbackStaysInsideTheCeiling`; no gas assertion is
+      # skipped here.
+      - name: Run tests (default profile)
         run: forge test -vvv
+
+      # STEP C -- the invariant suite at the default profile's depth.
+      - name: Run invariants (default profile)
+        run: forge test --match-path 'test/invariant/*' -vv
+
+      # STEP D -- the deep campaign. The ONLY command that gets the ci profile, and it is scoped to
+      # this command rather than exported to the job.
+      - name: Run invariants (deep, ci profile)
+        run: FOUNDRY_PROFILE=ci forge test --match-path 'test/invariant/*' -vv
 
   coverage:
     name: Coverage
@@ -96,8 +113,9 @@ jobs:
         with:
           version: stable
 
-      # Share the exact coverage-only gas-test exclusion with the local gate.
-      # The optimized test job still runs that assertion, with its original ceiling.
+      # Runs the SAME test set as the optimized job -- no test is excluded from coverage any more.
+      # The gas-ceiling assertion measures a callback frame rather than a whole swap, so it is
+      # valid unoptimized too.
       - name: Run coverage
         run: |
           make coverage | tee coverage.txt
@@ -126,5 +144,9 @@ jobs:
 
       # Fails if gas costs moved without the committed snapshot being updated.
       # This is what turns "we optimised the hook" into a reviewable diff.
+      #
+      # Runs the SHARED Makefile target so the exclusion set cannot drift between local and CI, and
+      # under the DEFAULT profile so the comparison is like for like. No `--tolerance`: the tracked
+      # entries are deterministic, so any difference is a real one worth looking at.
       - name: Check gas snapshot
-        run: forge snapshot --check --tolerance 1
+        run: make snapshot-check
