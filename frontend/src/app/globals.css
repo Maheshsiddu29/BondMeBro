@@ -4847,3 +4847,100 @@ h2 {
 .overview-grid-single {
   grid-template-columns: 1fr;
 }
+
+/* Larger bond detail typography for readability. */
+.detail-card .eyebrow,
+.user-bonds-card .eyebrow,
+.claims-card .eyebrow {
+  font-size: 13px;
+}
+
+.detail-card h2,
+.user-bonds-card h2,
+.claims-card h2 {
+  font-size: 42px;
+  line-height: 1;
+}
+
+.detail-hero strong {
+  font-size: 62px;
+  line-height: 1;
+}
+
+.detail-hero small {
+  font-size: 13px;
+}
+
+.detail-id span,
+.detail-id b {
+  font-size: 13px;
+}
+
+.timeline-step span,
+.timeline-step b {
+  font-size: 13px;
+}
+
+.timeline-step i {
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
+}
+
+.detail-info-grid span,
+.settlement-preview span,
+.user-bond-record-grid span,
+.settlement-result span,
+.claim-row span {
+  font-size: 12px;
+}
+
+.detail-info-grid strong,
+.user-bond-record-grid strong,
+.user-bond-record-grid a,
+.settlement-result strong,
+.claim-row strong {
+  font-size: 17px;
+}
+
+.settlement-preview strong {
+  font-size: 20px;
+}
+
+.settlement-preview p,
+.detail-actions > span,
+.refund-delivery-note,
+.card-copy {
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.user-bond-record-top strong {
+  font-size: 18px;
+}
+
+.bond-record-pair {
+  font-size: 11px;
+}
+
+.bond-progress b {
+  font-size: 13px;
+}
+
+.transaction-message,
+.inline-empty,
+.empty-card span {
+  font-size: 14px;
+}
+
+@media (max-width: 760px) {
+  .detail-card h2,
+  .user-bonds-card h2,
+  .claims-card h2 {
+    font-size: 32px;
+  }
+
+  .detail-hero strong {
+    font-size: 44px;
+  }
+}
