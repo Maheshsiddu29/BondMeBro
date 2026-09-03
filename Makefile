@@ -38,5 +38,8 @@ slither:
 ci: fmt-check slither build test coverage
 	@echo "All CI checks passed locally."
 
+demo:
+	forge test --match-path test/Demo.t.sol -vv
+
 clean:
 	forge clean

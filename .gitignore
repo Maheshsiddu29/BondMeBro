@@ -11,7 +11,6 @@ crytic-export/
 # Env & secrets — never commit a deployer key
 .env
 .env.*
-!.env.example
 .env.example
 
 # OS / editor
@@ -68,6 +67,8 @@ P_L2_8_1_SPLIT_RESISTANCE_RESEARCH_REPORT.md
 P_L2_8_1B_BLOCK_IMPACT_INVARIANT_REVIEW.md
 P_L2_8_2_MIGRATION_REPORT.md
 P_L2_8_ADVERSARIAL_REPORT.md
+INTEGRATION.md
+P_L2_9_RELEASE_GATE_REPORT.md
 
 
 
