@@ -57,6 +57,27 @@ const poolKeyType = {
   ],
 } as const;
 
+const quoteExactInputSingleType = {
+  type: "tuple",
+  components: [
+    { name: "poolKey", ...poolKeyType },
+    { name: "zeroForOne", type: "bool" },
+    { name: "exactAmount", type: "uint128" },
+    { name: "hookData", type: "bytes" },
+  ],
+} as const;
+
+/** Canonical Uniswap v4 Sepolia Quoter interface. It returns through a simulated revert. */
+export const v4QuoterAbi = [
+  {
+    type: "function",
+    name: "quoteExactInputSingle",
+    stateMutability: "nonpayable",
+    inputs: [{ name: "params", ...quoteExactInputSingleType }],
+    outputs: [{ name: "amountOut", type: "uint256" }, { name: "gasEstimate", type: "uint256" }],
+  },
+] as const;
+
 const exactInputSingleType = {
   type: "tuple",
   components: [

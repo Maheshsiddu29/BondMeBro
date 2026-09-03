@@ -18,8 +18,9 @@ import { sepolia } from "wagmi/chains";
 import { bondMeBroAbi } from "@/lib/abi";
 import { deployment, explorerAddress, explorerTx, shortenHash } from "@/lib/config";
 import { isConfiguredPair, tokenOptions, type TokenOption } from "@/lib/tokens";
-import { encodeExactInputRouterPlan, erc20Abi, permit2Abi, universalRouterAbi } from "@/lib/swap";
+import { encodeBondHookData, encodeExactInputRouterPlan, erc20Abi, permit2Abi, universalRouterAbi, v4QuoterAbi } from "@/lib/swap";
 
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Address;
 const ZERO_HASH = `0x${"0".repeat(64)}` as Hex;
 const eventDescriptors = [
   {
@@ -882,7 +883,8 @@ function SwapScreen({
 }) {
   const [paySymbol, setPaySymbol] = useState("ETH");
   const [receiveSymbol, setReceiveSymbol] = useState("WETH");
-  const [minimumOutput, setMinimumOutput] = useState("0");
+  const [minimumOutput, setMinimumOutput] = useState("");
+  const [minimumOutputEdited, setMinimumOutputEdited] = useState(false);
   const [transactionState, setTransactionState] = useState<TransactionState>("idle");
   const [transactionHash, setTransactionHash] = useState<Hex | undefined>();
   const [transactionError, setTransactionError] = useState("");
@@ -915,11 +917,100 @@ function SwapScreen({
   });
   const payBalance = payToken.kind === "native" ? nativeBalance.data?.value : tokenBalanceRead.data as bigint | undefined;
   const maxBondAmount = estimatedBond > 0n ? estimatedBond + estimatedBond / 10n + 1n : 1n;
-  const routerConfigured = deployment.universalRouter !== "0x0000000000000000000000000000000000000000";
+  const routerConfigured = deployment.universalRouter.toLowerCase() !== ZERO_ADDRESS;
+  const quoterConfigured = deployment.quoter.toLowerCase() !== ZERO_ADDRESS;
+  const quoteHookData = encodeBondHookData(address ?? deployment.hook, maxBondAmount);
+  const quoteArgs = useMemo(
+    () => [{
+      poolKey: {
+        currency0: deployment.currency0,
+        currency1: deployment.currency1,
+        fee: deployment.poolFee,
+        tickSpacing: deployment.tickSpacing,
+        hooks: deployment.hook,
+      },
+      zeroForOne,
+      exactAmount: amountIn ?? 0n,
+      hookData: quoteHookData,
+    }] as const,
+    [amountIn, quoteHookData, zeroForOne],
+  );
+  const quoteEnabled = Boolean(
+    isConnected
+    && networkCorrect
+    && rpcOnline
+    && !poolConfigLoading
+    && !poolConfigError
+    && swapMode === "exactIn"
+    && supportedDirection
+    && amountIn !== undefined
+    && amountIn > 0n
+    && quoterConfigured,
+  );
+  const quoteRead = useReadContract({
+    address: deployment.quoter,
+    abi: v4QuoterAbi,
+    functionName: "quoteExactInputSingle",
+    args: quoteArgs,
+    query: {
+      enabled: quoteEnabled,
+      refetchInterval: 5_000,
+    },
+  });
+  const quoteAmountOut = quoteEnabled && swapMode === "exactIn"
+    ? asBigInt(tupleItem(quoteRead.data, 0, "amountOut"))
+    : undefined;
+  const quoteLoading = quoteEnabled && (quoteRead.isLoading || quoteRead.isFetching);
+  const quoteError = quoteEnabled && quoteRead.isError;
+  const quoteHasNoLiquidity = quoteEnabled
+    && !quoteLoading
+    && (quoteAmountOut === 0n || (quoteError && isLiquidityQuoteError(quoteRead.error)));
+  const quoteReady = quoteEnabled
+    && !quoteLoading
+    && !quoteError
+    && quoteAmountOut !== undefined
+    && quoteAmountOut > 0n;
   const amountFitsBalance = payBalance === undefined || (amountIn !== undefined && amountIn <= payBalance);
-  const canSubmit = isConnected && networkCorrect && rpcOnline && !poolConfigLoading && !poolConfigError && swapMode === "exactIn" && supportedDirection && routerConfigured && bondingEnabledForSwap(poolConfig) && amountIn !== undefined && amountIn > 0n && minimumAmountOut > 0n && amountFitsBalance && transactionState !== "approving" && transactionState !== "sending";
+
+  useEffect(() => {
+    setMinimumOutputEdited(false);
+    setMinimumOutput("");
+  }, [swapAmount, paySymbol, receiveSymbol, swapMode]);
+
+  useEffect(() => {
+    if (minimumOutputEdited) return;
+
+    if (
+      swapMode !== "exactIn"
+      || !quoteEnabled
+      || quoteRead.isError
+      || quoteAmountOut === undefined
+      || quoteAmountOut <= 0n
+    ) {
+      setMinimumOutput("");
+      return;
+    }
+
+    // Keep the existing 0.50% protection while using the live v4 quote as the source
+    // amount. The editable field lets an advanced user tighten the bound explicitly.
+    if (quoteRead.isFetching) return;
+    const protectedOutput = (quoteAmountOut * 9_950n) / 10_000n;
+    setMinimumOutput(formatUnits(protectedOutput, receiveToken.decimals));
+  }, [
+    amountIn,
+    minimumOutputEdited,
+    paySymbol,
+    quoteAmountOut,
+    quoteEnabled,
+    quoteRead.isError,
+    quoteRead.isFetching,
+    receiveToken.decimals,
+    swapMode,
+  ]);
+
+  const canSubmit = isConnected && networkCorrect && rpcOnline && !poolConfigLoading && !poolConfigError && swapMode === "exactIn" && supportedDirection && routerConfigured && bondingEnabledForSwap(poolConfig) && amountIn !== undefined && amountIn > 0n && quoteReady && minimumAmountOut > 0n && amountFitsBalance && transactionState !== "approving" && transactionState !== "sending";
   const actionDisabled = transactionState === "approving" || transactionState === "sending" || (isConnected && networkCorrect && !canSubmit);
-  const status = getSwapStatus({ isConnected, networkCorrect, rpcOnline, poolConfigLoading, poolConfigError, supportedDirection, routerConfigured, poolConfig, amountIn, minimumAmountOut, amountFitsBalance, payBalance, transactionState });
+  const status = getSwapStatus({ isConnected, networkCorrect, rpcOnline, poolConfigLoading, poolConfigError, supportedDirection, routerConfigured, quoterConfigured, poolConfig, amountIn, minimumAmountOut, amountFitsBalance, payBalance, swapMode, quoteLoading, quoteError, quoteHasNoLiquidity, quoteAmountOut, transactionState });
 
   async function submitSwap() {
     if (!canSubmit || !address || !publicClient || amountIn === undefined) return;
@@ -1004,11 +1095,11 @@ function SwapScreen({
           <div className="swap-mode-row"><div className="segmented-control"><button type="button" className={swapMode === "exactIn" ? "segment-active" : ""} onClick={() => setSwapMode("exactIn")}>Exact in</button><button type="button" className={swapMode === "exactOut" ? "segment-active" : ""} onClick={() => setSwapMode("exactOut")}>Exact out</button></div><span className="swap-route-label">Single-hop route</span></div>
           <div className="swap-token-panel swap-sell-panel"><div className="field-label uniswap-field-label"><span>Sell</span><span>Balance {payBalance === undefined ? "—" : `${formatToken(payBalance, payToken.decimals)} ${payToken.symbol}`}</span></div><div className="amount-line uniswap-amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" placeholder="0.00" /><select aria-label="Pay token" className="token-select" value={payToken.symbol} onChange={(event) => setPaySymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div></div>
           <button type="button" className="direction-button swap-direction-button" aria-label="Switch swap direction" onClick={() => { const oldPay = paySymbol; setPaySymbol(receiveSymbol); setReceiveSymbol(oldPay); }}>↕</button>
-          <div className="swap-token-panel swap-buy-panel"><div className="field-label uniswap-field-label"><span>Buy</span><span>Minimum output / protected</span></div><div className="amount-line uniswap-amount-line"><input aria-label="Minimum output" value={minimumOutput} onChange={(event) => setMinimumOutput(event.target.value)} inputMode="decimal" placeholder="0.00" /><select aria-label="Receive token" className="token-select" value={receiveToken.symbol} onChange={(event) => setReceiveSymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div></div>
+          <div className="swap-token-panel swap-buy-panel"><div className="field-label uniswap-field-label"><span>Buy</span><span>{quoteLoading ? "Updating live quote…" : "Estimated output"}</span></div><div className="amount-line uniswap-amount-line"><strong className="quoted-output-value" aria-live="polite">{quoteAmountOut !== undefined && quoteAmountOut > 0n && !quoteError ? formatToken(quoteAmountOut, receiveToken.decimals) : quoteLoading ? "…" : "—"}</strong><select aria-label="Receive token" className="token-select" value={receiveToken.symbol} onChange={(event) => setReceiveSymbol(event.target.value)}>{tokenOptions.map((token) => <option value={token.symbol} key={token.symbol}>{token.icon} {token.symbol}</option>)}</select></div><div className="minimum-output-control"><div><span>Minimum received</span><small>Auto · 0.50% slippage</small></div><input aria-label="Minimum output" value={minimumOutput} onChange={(event) => { setMinimumOutput(event.target.value); setMinimumOutputEdited(true); }} inputMode="decimal" placeholder="Waiting for quote" /></div></div>
           <div className="swap-settings swap-settings-uniswap"><span>Slippage <b>0.50%</b></span><span>Bond rate <b>{bondBps.toString()} bps</b></span><span>Pool fee <b>0.30%</b></span></div>
-          {!rpcOnline && <div className="pair-warning">RPC is offline, so the pool configuration cannot be read. Click “RPC offline · retry” above after starting the frontend with a valid SEPOLIA_RPC_URL.</div>}{rpcOnline && poolConfigLoading && <div className="pair-warning">Reading the live BondMeBro pool configuration…</div>}{rpcOnline && poolConfigError && <div className="pair-warning">The live pool configuration could not be read. Retry the RPC connection before sending.</div>}{swapMode === "exactIn" && minimumAmountOut === 0n && <div className="pair-warning">Set a positive minimum output before submitting. A zero minimum disables slippage protection.</div>}{!supportedDirection && <div className="pair-warning">This deployment currently has a BondMeBro pool only for ETH / WETH. Select that pair for a live test; other token pairs need their own initialized pool and liquidity.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is available in the backend script and remains a browser preview until its quote and max-input UI are wired.</div>}{!routerConfigured && <div className="pair-warning">Set the network&apos;s Universal Router address in the frontend environment before sending transactions.</div>}
+          {!rpcOnline && <div className="pair-warning">RPC is offline, so the pool configuration cannot be read. Click “RPC offline · retry” above after starting the frontend with a valid SEPOLIA_RPC_URL.</div>}{rpcOnline && poolConfigLoading && <div className="pair-warning">Reading the live BondMeBro pool configuration…</div>}{rpcOnline && poolConfigError && <div className="pair-warning">The live pool configuration could not be read. Retry the RPC connection before sending.</div>}{swapMode === "exactIn" && quoteLoading && <div className="pair-warning">Getting a live Uniswap v4 quote for this input. The output and minimum received will update automatically.</div>}{swapMode === "exactIn" && quoteHasNoLiquidity && <div className="pair-warning">The live quote returned no usable liquidity for this direction. The pool must have active in-range liquidity before the swap can be sent.</div>}{swapMode === "exactIn" && quoteError && !quoteHasNoLiquidity && <div className="pair-warning">The live Uniswap v4 quote is unavailable for this pool key or hook simulation. Sending is disabled until a valid quote is returned.</div>}{swapMode === "exactIn" && quoteEnabled && !quoteLoading && !quoteError && !quoteHasNoLiquidity && quoteAmountOut === undefined && <div className="pair-warning">The live quote could not be decoded. No fallback estimate is used, and sending remains disabled.</div>}{swapMode === "exactIn" && quoteReady && minimumAmountOut === 0n && <div className="pair-warning">Minimum received is empty or invalid. Enter a positive value before submitting; the automatic value uses 0.50% slippage.</div>}{!supportedDirection && <div className="pair-warning">This deployment currently has a BondMeBro pool only for ETH / WETH. Select that pair for a live test; other token pairs need their own initialized pool and liquidity.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is available in the backend script and remains a browser preview until its quote and max-input UI are wired.</div>}{!routerConfigured && <div className="pair-warning">Set the network&apos;s Universal Router address in the frontend environment before sending transactions.</div>}{!quoterConfigured && <div className="pair-warning">Set the network&apos;s Uniswap v4 Quoter address in the frontend environment before sending transactions.</div>}
           <div className={`swap-status swap-status-${status.tone}`}><StatusDot live={status.tone === "ready" || status.tone === "success"} /><div><strong>{status.title}</strong><span>{status.detail}</span></div></div>
-          <button type="button" className="primary-button large-button full-button swap-submit-button" disabled={actionDisabled} onClick={() => { if (!isConnected) onConnect(); else if (!networkCorrect) onSwitchNetwork(); else void submitSwap(); }}>{transactionState === "approving" ? "Approving token…" : transactionState === "sending" ? "Sending swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !rpcOnline ? "RPC offline" : poolConfigLoading ? "Reading pool config…" : poolConfigError ? "Retry pool config" : !supportedDirection ? "Pool not configured" : !bondingEnabledForSwap(poolConfig) ? "Pool config pending" : minimumAmountOut <= 0n && swapMode === "exactIn" ? "Set minimum output" : !amountFitsBalance && payBalance !== undefined ? "Insufficient balance" : swapMode === "exactOut" ? "Exact-out preview" : "Review and swap"} <span>→</span></button>
+          <button type="button" className="primary-button large-button full-button swap-submit-button" disabled={actionDisabled} onClick={() => { if (!isConnected) onConnect(); else if (!networkCorrect) onSwitchNetwork(); else void submitSwap(); }}>{transactionState === "approving" ? "Approving token…" : transactionState === "sending" ? "Sending swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !rpcOnline ? "RPC offline" : poolConfigLoading ? "Reading pool config…" : poolConfigError ? "Retry pool config" : !supportedDirection ? "Pool not configured" : !bondingEnabledForSwap(poolConfig) ? "Pool config pending" : swapMode === "exactOut" ? "Exact-out preview" : quoteLoading ? "Getting live quote" : quoteError || quoteHasNoLiquidity || !quoteReady ? "Quote unavailable" : minimumAmountOut <= 0n ? "Set minimum output" : !amountFitsBalance && payBalance !== undefined ? "Insufficient balance" : "Review and swap"} <span>→</span></button>
           {transactionState === "error" && <div className="transaction-message transaction-error">{transactionError}</div>}{transactionState === "success" && transactionHash && <div className="transaction-message transaction-success">Confirmed. <a href={explorerTx(transactionHash)} target="_blank" rel="noreferrer">View transaction ↗</a><button type="button" className="text-button success-next-button" onClick={onViewBonds}>Track this bond →</button></div>}
           <span className="readonly-note">Exact-input uses the BondMeBro hook payload and the configured Universal Router.</span>
         </article>
@@ -1030,6 +1121,14 @@ function parseSwapAmount(value: string, decimals: number): bigint | undefined {
 
 function bondingEnabledForSwap(config?: ConfigTuple) {
   return Boolean(config && config[0] > 0n && config[1] > 0n && config[2] > 0n);
+}
+
+function isLiquidityQuoteError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+  return lower.includes("notenoughliquidity")
+    || lower.includes("insufficient liquidity")
+    || lower.includes("no liquidity");
 }
 
 function friendlyTransactionError(error: unknown) {
@@ -1061,11 +1160,17 @@ function getSwapStatus({
   poolConfigError,
   supportedDirection,
   routerConfigured,
+  quoterConfigured,
   poolConfig,
   amountIn,
   minimumAmountOut,
   amountFitsBalance,
   payBalance,
+  swapMode,
+  quoteLoading,
+  quoteError,
+  quoteHasNoLiquidity,
+  quoteAmountOut,
   transactionState,
 }: {
   isConnected: boolean;
@@ -1075,11 +1180,17 @@ function getSwapStatus({
   poolConfigError: boolean;
   supportedDirection: boolean;
   routerConfigured: boolean;
+  quoterConfigured: boolean;
   poolConfig?: ConfigTuple;
   amountIn?: bigint;
   minimumAmountOut: bigint;
   amountFitsBalance: boolean;
   payBalance?: bigint;
+  swapMode: "exactIn" | "exactOut";
+  quoteLoading: boolean;
+  quoteError: boolean;
+  quoteHasNoLiquidity: boolean;
+  quoteAmountOut?: bigint;
   transactionState: TransactionState;
 }) {
   if (transactionState === "approving") return { tone: "pending", title: "Approvals in progress", detail: "Confirm the token and Permit2 approvals in your wallet." };
@@ -1095,10 +1206,16 @@ function getSwapStatus({
   if (!routerConfigured) return { tone: "warning", title: "Router address missing", detail: "Configure the network Universal Router address first." };
   if (!bondingEnabledForSwap(poolConfig)) return { tone: "warning", title: "Pool configuration pending", detail: "Enable both thresholds and the bond rate before trading." };
   if (amountIn === undefined || amountIn <= 0n) return { tone: "warning", title: "Enter an amount", detail: "Use a positive amount in the selected input token." };
-  if (minimumAmountOut <= 0n && transactionState === "idle") return { tone: "warning", title: "Set minimum output", detail: "A positive minimum keeps this swap protected from excessive slippage." };
+  if (swapMode === "exactOut") return { tone: "warning", title: "Exact-output preview", detail: "Browser execution is disabled until exact-output quote and max-input protection are wired." };
+  if (!quoterConfigured) return { tone: "warning", title: "Quoter address missing", detail: "Configure the official Uniswap v4 Quoter before submitting a swap." };
+  if (quoteLoading) return { tone: "pending", title: "Getting live quote", detail: "Simulating this BondMeBro pool through the Uniswap v4 Quoter." };
+  if (quoteHasNoLiquidity) return { tone: "warning", title: "Pool has no liquidity", detail: "The live quote returned no usable output for this direction." };
+  if (quoteError) return { tone: "error", title: "Quote unavailable", detail: "The deployed Quoter could not simulate this pool key and hook payload." };
+  if (quoteAmountOut === undefined) return { tone: "error", title: "Quote unavailable", detail: "No fallback estimate is used; wait for a valid live quote before sending." };
+  if (minimumAmountOut <= 0n && transactionState === "idle") return { tone: "warning", title: "Set minimum output", detail: "The automatic minimum is empty or invalid. A positive value protects this swap from excessive slippage." };
   if (!amountFitsBalance && payBalance !== undefined) return { tone: "warning", title: "Insufficient balance", detail: "Lower the input amount or fund this wallet." };
   if (transactionState === "idle") return { tone: "ready", title: "Ready to review", detail: "The wallet will confirm the swap and any required approvals." };
-  return { tone: "ready", title: "Ready", detail: "Review the bond before submitting." };
+  return { tone: "ready", title: "Ready", detail: "Review the live quote and bond before submitting." };
 }
 
 function BondsScreen({

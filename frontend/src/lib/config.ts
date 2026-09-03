@@ -9,6 +9,7 @@ export const deployment = {
   poolId: (process.env.NEXT_PUBLIC_POOL_ID ?? "0xc8e54122692652e0b9ccad2f46f8bf0f01f4325e544a5dfceb75b0ffd5ea694e") as Hex,
   poolManager: (process.env.NEXT_PUBLIC_POOL_MANAGER ?? "0xE03A1074c86CFeDd5C142C4F04F1a1536e203543") as Address,
   universalRouter: (process.env.NEXT_PUBLIC_UNIVERSAL_ROUTER ?? "0x7dfd4f31be6814d2906bde155c3e1b146eac1468") as Address,
+  quoter: (process.env.NEXT_PUBLIC_QUOTER ?? "0x61b3f2011a92d183c7dbadbda940a7555ccf9227") as Address,
   permit2: (process.env.NEXT_PUBLIC_PERMIT2 ?? "0x000000000022D473030F116dDEE9F6B43aC78BA3") as Address,
   currency0: (process.env.NEXT_PUBLIC_CURRENCY0 ?? "0x0000000000000000000000000000000000000000") as Address,
   currency1: (process.env.NEXT_PUBLIC_CURRENCY1 ?? "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14") as Address,

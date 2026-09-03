@@ -4371,3 +4371,79 @@ h2 {
     margin-top: 16px;
   }
 }
+
+/* Live quote treatment: the buy amount is read-only from the v4 Quoter, while the
+   protected minimum remains visible and editable for deliberate slippage choices. */
+.quoted-output-value {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--app-ink);
+  font-size: 38px;
+  font-weight: 500;
+  letter-spacing: -0.07em;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.minimum-output-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-top: 13px;
+  margin-top: 14px;
+  border-top: 1px solid var(--app-border);
+}
+
+.minimum-output-control > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.minimum-output-control span {
+  color: var(--app-ink-soft);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.minimum-output-control small {
+  color: var(--app-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.minimum-output-control input {
+  width: min(48%, 190px);
+  min-width: 125px;
+  padding: 9px 10px;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  outline: none;
+  background: var(--app-surface);
+  color: var(--app-ink);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
+.minimum-output-control input:focus {
+  border-color: rgba(255, 107, 26, 0.55);
+  box-shadow: 0 0 0 3px rgba(255, 107, 26, 0.1);
+}
+
+@media (max-width: 760px) {
+  .quoted-output-value {
+    font-size: 29px;
+  }
+
+  .minimum-output-control input {
+    min-width: 112px;
+    font-size: 10px;
+  }
+}

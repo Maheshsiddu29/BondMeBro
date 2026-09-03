@@ -19,8 +19,11 @@ key is not exposed in client-side JavaScript.
 
 ## Browser lifecycle
 
-1. **Swap** — submit an exact-input ETH/WETH swap through the configured Universal
-   Router. The BondMeBro hook receives the 37-byte recipient and bond-limit payload.
+1. **Swap** — the dashboard asks the official Sepolia Uniswap v4 Quoter for an
+   exact-input ETH/WETH estimate as the amount changes, then submits through the
+   configured Universal Router. The BondMeBro hook receives the 37-byte recipient
+   and bond-limit payload. The exact output is read-only; minimum received is
+   automatically set to the quote less 0.50% slippage and can be tightened manually.
 2. **Bond opened** — after confirmation, the dashboard refreshes `BondOpened` events
    and filters the recent bond history to the connected wallet.
 3. **Observe** — the bond remains active until the configured observation window has
