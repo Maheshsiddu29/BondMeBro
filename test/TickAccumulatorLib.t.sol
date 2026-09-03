@@ -6,13 +6,29 @@ import {TickAccumulatorLib} from "../src/libraries/TickAccumulatorLib.sol";
 import {PersistenceMathLib} from "../src/libraries/PersistenceMathLib.sol";
 
 /// @dev Thin harness: the library writes to a storage pointer, so it needs a stateful host.
+///      `update` uses a de-facto unbounded cap (pre-truncation semantics) so every original
+///      test below pins the unchanged averaging math; `updateCapped` exercises the clamp.
 contract AccumulatorHost {
     using TickAccumulatorLib for TickAccumulatorLib.Accumulator;
+
+    uint24 internal constant NO_CLAMP = type(uint24).max;
 
     TickAccumulatorLib.Accumulator internal acc;
 
     function update(int24 newTick) external returns (int56) {
-        return acc.update(newTick);
+        return acc.update(newTick, NO_CLAMP);
+    }
+
+    function updateCapped(int24 newTick, uint24 maxAbsTickDelta) external returns (int56) {
+        return acc.update(newTick, maxAbsTickDelta);
+    }
+
+    function initialize(int24 initialTick) external {
+        acc.initialize(initialTick);
+    }
+
+    function lastUpdate() external view returns (uint48) {
+        return acc.lastUpdate;
     }
 
     function observe() external view returns (int56) {
@@ -128,7 +144,7 @@ contract TickAccumulatorLibTest is Test {
     }
 
     /// @notice A zero-length window must revert rather than divide by zero. Unreachable
-    ///         through settleBond (maturity is enforced first), but the library is reusable
+    ///         through settleBonds (maturity is enforced first), but the library is reusable
     ///         surface and must be safe for any caller.
     function test_twaTick_RevertsOnZeroWindow() public {
         vm.expectRevert(TickAccumulatorLib.ZeroWindow.selector);
@@ -163,5 +179,100 @@ contract TickAccumulatorLibTest is Test {
         int24 hi = a < b ? int24(b) : int24(a);
         assertGe(twa, lo - 1); // -1/+1 absorbs truncation toward zero
         assertLe(twa, hi + 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Truncation defense (Problem 3, manipulation half)
+    // ------------------------------------------------------------------
+
+    /// @notice A pool-seeded accumulator applies the clamp to its first swap too.
+    function test_initialize_FirstSwapIsClamped() public {
+        host.initialize(0);
+        vm.roll(block.number + 1);
+        host.updateCapped(20_000, 500);
+        assertEq(host.lastTick(), int24(500));
+    }
+
+    /// @notice The wider block-number field survives the uint32 wrap horizon without
+    /// resetting the accumulator's elapsed interval.
+    function test_blockNumberBeyondUint32_DoesNotWrap() public {
+        host.updateCapped(100, type(uint24).max);
+        uint256 afterUint32 = (uint256(1) << 32) + 10;
+        vm.roll(afterUint32);
+        host.updateCapped(100, type(uint24).max);
+        assertEq(host.lastUpdate(), uint48(afterUint32));
+        int56 expected = int56(int256(100) * int256(afterUint32 - 1000));
+        assertEq(host.observe(), expected);
+    }
+
+    /// @notice The clamp caps the recorded move per touched block, no matter how violent the
+    ///         raw swap was. This is what turns a capital attack into a time attack.
+    function test_clamp_CapsRecordedMove() public {
+        host.updateCapped(0, 500); // seed at tick 0, cap 500/block
+        assertEq(host.lastTick(), 0, "init defines the baseline unclamped");
+
+        vm.roll(block.number + 1);
+        host.updateCapped(20_000, 500); // a 20k-tick nuke
+        assertEq(host.lastTick(), int24(500), "flash push must record only the clamp width");
+    }
+
+    /// @notice The notes' claim, replayed exactly: a 20,000-tick one-block push over a
+    ///         300-block window. WITHOUT truncation the push leaks 66 ticks into the TWA;
+    ///         WITH a 500-tick clamp it leaks 1 tick (integer truncation does the rest).
+    function test_clamp_FlashPushAlmostVanishesFromTwa() public {
+        AccumulatorHost raw = new AccumulatorHost(); // control: pre-truncation behaviour
+
+        // Both accumulators see: 1 block at 0, attacker pushes 20k for exactly 1 block,
+        // attacker un-pushes, then quiet for the rest of the 300-block window.
+        host.updateCapped(0, 500);
+        raw.update(0);
+        int56 openCapped = host.observe();
+        int56 openRaw = raw.observe();
+
+        vm.roll(block.number + 1);
+        host.updateCapped(20_000, 500); // records 500
+        raw.update(20_000); // records 20_000
+
+        vm.roll(block.number + 1); // the push survives one boundary
+        host.updateCapped(0, 500);
+        raw.update(0);
+
+        vm.roll(block.number + 298); // window ends
+        int24 twaCapped = TickAccumulatorLib.twaTick(openCapped, host.observe(), 300);
+        int24 twaRaw = TickAccumulatorLib.twaTick(openRaw, raw.observe(), 300);
+
+        assertEq(twaCapped, int24(1), "clamped push should register ~1 tick"); // 500/300 = 1.66 -> 1
+        assertEq(twaRaw, int24(66), "unclamped push would leak 66 ticks"); // 20000/300 = 66.6 -> 66
+    }
+
+    /// @notice Once per block: later same-block swaps are ignored, so an attacker cannot
+    ///         ratchet the recorded tick past the clamp with a burst of small same-block
+    ///         swaps and have it credited to all later blocks.
+    function test_oncePerBlock_SameBlockSwapsIgnored() public {
+        host.updateCapped(0, 500); // first observation of this block wins
+
+        host.updateCapped(500, 500);
+        host.updateCapped(1_000, 500);
+        host.updateCapped(100_000, 500);
+
+        assertEq(host.lastTick(), 0, "same-block updates must be ignored");
+
+        vm.roll(block.number + 1);
+        host.updateCapped(100_000, 500);
+        assertEq(host.lastTick(), int24(500), "next block moves at most one clamp width");
+    }
+
+    /// @notice The accepted trade-off, pinned: an honest violent move converges at the clamp
+    ///         rate — one clamp width per touched block — instead of registering instantly.
+    function test_clamp_HonestGapConvergesGradually() public {
+        host.updateCapped(0, 500);
+        vm.roll(block.number + 10); // quiet gap, real market gapped +2_000 meanwhile
+
+        host.updateCapped(2_000, 500);
+        assertEq(host.lastTick(), int24(500), "fixed per-block cap, not scaled by the gap");
+
+        vm.roll(block.number + 1);
+        host.updateCapped(2_000, 500);
+        assertEq(host.lastTick(), int24(1_000));
     }
 }

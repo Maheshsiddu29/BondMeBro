@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
+
 /// @title PersistenceMathLib
 /// @notice The single slash model for BondMeBro. Given the tick before a swap, the tick
 ///         immediately after it, and a settlement reference tick observed later, returns the
@@ -24,6 +26,8 @@ pragma solidity 0.8.26;
 ///      only lever here that improves signal-to-noise: impact is instantaneous, drift
 ///      accumulates with elapsed time. See `test_driftDominatesSignal_KnownLimitation`.
 library PersistenceMathLib {
+    using SafeCast for uint256;
+
     /// @notice Basis-point denominator. 10_000 == 100% of the bond slashed.
     uint256 internal constant BPS = 10_000;
 
@@ -94,7 +98,7 @@ library PersistenceMathLib {
         pure
         returns (uint128 slashAmount, uint128 refundAmount)
     {
-        slashAmount = uint128((uint256(bondAmount) * uint256(persistenceBps)) / BPS);
+        slashAmount = ((uint256(bondAmount) * uint256(persistenceBps)) / BPS).toUint128();
         refundAmount = bondAmount - slashAmount;
     }
 }
