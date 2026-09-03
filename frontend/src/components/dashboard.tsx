@@ -27,37 +27,37 @@ const eventDescriptors = [
   {
     topic: keccak256(toBytes("BondOpened(bytes32,bytes32,address,address,uint128,int24,int24,uint48)")),
     kind: "OPENED" as const,
-    detail: "Bond opened and added to the FIFO queue",
+    detail: "Bond opened",
     poolScoped: true,
   },
   {
     topic: keccak256(toBytes("BondSettled(bytes32,bytes32,address,address,uint128,uint128,uint128,int24,uint16)")),
     kind: "SETTLED" as const,
-    detail: "Bond settled against the pool-local TWA",
+    detail: "Bond settled",
     poolScoped: true,
   },
   {
     topic: keccak256(toBytes("PoolConfigUpdated(bytes32,uint96,uint96,uint16,address)")),
     kind: "CONFIG" as const,
-    detail: "Pool custody thresholds updated",
+    detail: "Pool config updated",
     poolScoped: true,
   },
   {
     topic: keccak256(toBytes("PotDonated(bytes32,address,uint256,address)")),
     kind: "DONATED" as const,
-    detail: "Insurance pot donated to in-range LPs",
+    detail: "Pot donated",
     poolScoped: true,
   },
   {
     topic: keccak256(toBytes("PaymentDeferred(address,address,uint256)")),
     kind: "DEFERRED" as const,
-    detail: "A settlement payment was deferred for later claiming",
+    detail: "Payment deferred",
     poolScoped: false,
   },
   {
     topic: keccak256(toBytes("PaymentsClaimed(address,address,uint256)")),
     kind: "CLAIMED" as const,
-    detail: "A deferred settlement payment was claimed",
+    detail: "Payment claimed",
     poolScoped: false,
   },
 ] as const;
@@ -748,12 +748,12 @@ export function Dashboard() {
         </nav>
 
         <div className="sidebar-section-label sidebar-flow-label">PROTOCOL FLOW</div>
-        <div className="sidebar-flow-card" aria-label="BondMeBro protocol flow">
-          <div className={`sidebar-flow-step ${screen === "swap" ? "sidebar-flow-step-active" : ""}`}><span>01</span><div><strong>Swap</strong><small>Trade with context</small></div><i>↕</i></div>
-          <div className={`sidebar-flow-step ${screen === "bonds" ? "sidebar-flow-step-active" : ""}`}><span>02</span><div><strong>Bond</strong><small>Temporary collateral</small></div><i>◈</i></div>
-          <div className={`sidebar-flow-step ${screen === "bonds" ? "sidebar-flow-step-active" : ""}`}><span>03</span><div><strong>Settle</strong><small>Checkpoint outcome</small></div><i>✓</i></div>
-          <div className="sidebar-flow-step"><span>04</span><div><strong>Refund</strong><small>Paid automatically</small></div><i>↗</i></div>
-          <div className={`sidebar-flow-step ${screen === "pools" ? "sidebar-flow-step-active" : ""}`}><span>05</span><div><strong>Donate</strong><small>Support in-range LPs</small></div><i>♢</i></div>
+        <div className="sidebar-flow-card" aria-label="BondMeBro flow">
+          <div className={`sidebar-flow-step ${screen === "swap" ? "sidebar-flow-step-active" : ""}`}><span>01</span><div><strong>Swap</strong><small>Quote</small></div><i>↕</i></div>
+          <div className={`sidebar-flow-step ${screen === "bonds" ? "sidebar-flow-step-active" : ""}`}><span>02</span><div><strong>Bond</strong><small>Bond</small></div><i>◈</i></div>
+          <div className={`sidebar-flow-step ${screen === "bonds" ? "sidebar-flow-step-active" : ""}`}><span>03</span><div><strong>Settle</strong><small>Settle</small></div><i>✓</i></div>
+          <div className="sidebar-flow-step"><span>04</span><div><strong>Refund</strong><small>Refund</small></div><i>↗</i></div>
+          <div className={`sidebar-flow-step ${screen === "pools" ? "sidebar-flow-step-active" : ""}`}><span>05</span><div><strong>Donate</strong><small>Donate</small></div><i>♢</i></div>
         </div>
 
         <div className="sidebar-spacer" />
@@ -784,7 +784,7 @@ export function Dashboard() {
         </header>
 
         <section className="protocol-status-bar" aria-label="Protocol status" aria-live="polite">
-          <div className="protocol-status-intro"><span className={`protocol-pulse ${rpcOnline ? "protocol-pulse-live" : ""}`} /><div><strong>BondMeBro protocol</strong><small>{rpcOnline ? "Live on Sepolia" : "Waiting for RPC"}</small></div></div>
+          <div className="protocol-status-intro"><span className={`protocol-pulse ${rpcOnline ? "protocol-pulse-live" : ""}`} /><div><strong>BondMeBro</strong><small>{rpcOnline ? "Sepolia live" : "RPC wait"}</small></div></div>
           <div className="protocol-status-item"><span>Pool</span><strong>ETH / WETH</strong></div>
           <div className="protocol-status-item"><span>Bond rate</span><strong>{config?.[2]?.toString() ?? "—"} bps</strong></div>
           <div className="protocol-status-item"><span>Observation</span><strong>{observationBlocks.toString()} blocks</strong></div>
@@ -798,13 +798,13 @@ export function Dashboard() {
                 <div className="welcome-copy">
                   <span className="eyebrow">GOOD AFTERNOON / {deployment.networkName.toUpperCase()}</span>
                   <h1>Swap.<br /><em>Settle.</em></h1>
-                  <p>Qualifying swaps post a temporary bond. Reverted impact refunds; persistent impact funds LP cover.</p>
+                  <p>Bonded swaps refund or fund LP cover.</p>
                   <div className="welcome-actions"><button type="button" className="primary-button large-button" onClick={() => goTo("swap")}>Swap now <span>↗</span></button><button type="button" className="text-button" onClick={() => goTo("learn")}>Learn <span>→</span></button></div>
                 </div>
                 <div className="hero-visual">
                   <div className="hero-orb"><span>01</span><div className="orb-ring orb-ring-one" /><div className="orb-ring orb-ring-two" /><div className="orb-dot" /></div>
                   <div className="floating-card floating-swap"><div className="floating-card-label">SWAP PREVIEW <span>↗</span></div><div className="floating-token-row"><div className="token-bubble token-orange">Ξ</div><div><strong>0.001 ETH</strong><span>ETH → WETH / exact input</span></div><b>→</b></div><div className="floating-result"><span>EST. BOND</span><strong>0.0000025 ETH</strong></div></div>
-                  <div className="floating-card floating-status"><div className="floating-card-label">BOND STATUS</div><div className="status-line"><StatusDot live /><strong>Active</strong><span>matures after checkpoint</span></div></div>
+                  <div className="floating-card floating-status"><div className="floating-card-label">BOND STATUS</div><div className="status-line"><StatusDot live /><strong>Active</strong><span>maturing</span></div></div>
                 </div>
               </section>
 
@@ -818,7 +818,7 @@ export function Dashboard() {
               <section className="content-grid overview-grid">
                 <article className="neo-card active-bonds-card">
                   <div className="card-heading"><div><span className="eyebrow">01 / PORTFOLIO</span><h2>Active bonds</h2></div><button className="card-link" type="button" onClick={() => goTo("bonds")}>View all <span>→</span></button></div>
-                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div className="pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card"><div className="empty-icon">◈</div><strong>No active bonds</strong><span>Qualifying swaps will appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
+                  {headBond ? <div className="bond-table"><div className="bond-table-head"><span>POOL</span><span>BOND</span><span>MATURITY</span><span>STATUS</span></div><div className="bond-table-row"><div className="pool-cell"><div className="pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><small>{shortenHash(headId ?? ZERO_HASH, 7, 5)}</small></div></div><strong className="orange-text">{formatToken(headBond[6])} {headCurrency}</strong><div><strong>Block {formatBlock(maturityBlock)}</strong><small>opened {formatBlock(headBond[1])}</small></div><Badge tone={maturityProgress >= 100 ? "orange" : "neutral"}>{maturityProgress >= 100 ? "READY" : "ACTIVE"}</Badge></div></div> : <div className="empty-card"><div className="empty-icon">◈</div><strong>No active bonds</strong><span>New bonds appear here.</span><button type="button" className="text-button" onClick={() => goTo("swap")}>Preview a swap →</button></div>}
                   <div className="card-footer"><span>{queueLength > 0n ? `${formatInteger(queueLength)} bond${queueLength === 1n ? "" : "s"} in queue` : "Queue is clear"}</span><span className="footer-status"><StatusDot live={rpcOnline} /> synced</span></div>
                 </article>
                 <article className="glass-card portfolio-card">
@@ -831,7 +831,7 @@ export function Dashboard() {
                 </article>
               </section>
 
-              <section className="process-strip"><div><span className="eyebrow">THE MECHANISM</span><h2>Swap <i>→</i> Bond <i>→</i> Settle</h2></div><p>Temporary collateral makes price impact accountable without an external classifier.</p><button type="button" className="round-arrow" onClick={() => goTo("learn")}>↗</button></section>
+              <section className="process-strip"><div><span className="eyebrow">THE MECHANISM</span><h2>Swap <i>→</i> Bond <i>→</i> Settle</h2></div><p>Bond makes price impact accountable without an external classifier.</p><button type="button" className="round-arrow" onClick={() => goTo("learn")}>↗</button></section>
               <ActivityPreview activity={activity} activityError={activityError} onViewAll={() => goTo("activity")} />
             </>
           )}
@@ -852,7 +852,7 @@ export function Dashboard() {
 
 function ActivityPreview({ activity, activityError, onViewAll }: { activity: Activity[]; activityError: boolean; onViewAll: () => void }) {
   return (
-    <section className="activity-preview"><div className="card-heading"><div><span className="eyebrow">03 / ACTIVITY</span><h2>Recent activity</h2></div><button type="button" className="card-link" onClick={onViewAll}>View activity <span>→</span></button></div>{activity.length === 0 ? <div className="inline-empty">{activityError ? "Event history is unavailable. Start the RPC connection to load it." : "No protocol events in the recent block window."}</div> : <>{activityError && <div className="inline-empty activity-cache-note">Live RPC is unavailable. Showing saved recent activity.</div>}<div className="activity-rows">{activity.slice(0, 4).map((item, index) => <a className="activity-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-icon event-${item.kind.toLowerCase()}`}>{item.kind === "OPENED" ? "◈" : item.kind === "SETTLED" ? "✓" : item.kind === "DONATED" ? "♢" : item.kind === "CLAIMED" ? "$" : item.kind === "DEFERRED" ? "!" : "⌁"}</span><div><strong>{item.detail}</strong><small>Block {item.block}</small></div><span className="activity-row-hash">{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div></>}</section>
+    <section className="activity-preview"><div className="card-heading"><div><span className="eyebrow">03 / ACTIVITY</span><h2>Recent activity</h2></div><button type="button" className="card-link" onClick={onViewAll}>View activity <span>→</span></button></div>{activity.length === 0 ? <div className="inline-empty">{activityError ? "RPC unavailable." : "No recent events."}</div> : <>{activityError && <div className="inline-empty activity-cache-note">Showing saved activity.</div>}<div className="activity-rows">{activity.slice(0, 4).map((item, index) => <a className="activity-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-icon event-${item.kind.toLowerCase()}`}>{item.kind === "OPENED" ? "◈" : item.kind === "SETTLED" ? "✓" : item.kind === "DONATED" ? "♢" : item.kind === "CLAIMED" ? "$" : item.kind === "DEFERRED" ? "!" : "⌁"}</span><div><strong>{item.detail}</strong><small>Block {item.block}</small></div><span className="activity-row-hash">{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div></>}</section>
   );
 }
 
@@ -904,10 +904,7 @@ function SwapScreen({
   const [transactionError, setTransactionError] = useState("");
   const publicClient = usePublicClient({ chainId: sepolia.id });
   const { writeContractAsync } = useWriteContract();
-  const swapTokenOptions = tokenOptions.filter((token) =>
-    token.address.toLowerCase() === deployment.currency0.toLowerCase()
-    || token.address.toLowerCase() === deployment.currency1.toLowerCase(),
-  );
+  const swapTokenOptions = tokenOptions;
 
   const payToken = swapTokenOptions.find((token) => token.symbol === paySymbol) ?? swapTokenOptions[0];
   const receiveToken = swapTokenOptions.find((token) => token.symbol === receiveSymbol) ?? swapTokenOptions[1];
@@ -1139,30 +1136,30 @@ function SwapScreen({
   return (
     <div className="swap-screen-uniswap">
       <section className="screen-intro">
-        <div><span className="eyebrow">01 / TRADE WITH CONTEXT</span><h1>Make a swap.<br /><em>See the bond first.</em></h1></div>
-        <p>The bond is temporary collateral carved from qualifying input. Review the protected output before confirming.</p>
+        <div><span className="eyebrow">01 / TRADE WITH CONTEXT</span><h1>Swap.<br /><em>One confirm.</em></h1></div>
+        <p>Live quote, editable minimum, bond preview.</p>
       </section>
-      <section className="swap-steps" aria-label="Swap steps"><div className="swap-step swap-step-done"><span>01</span><div><strong>Connect</strong><small>Wallet</small></div><i>✓</i></div><div className="swap-step"><span>02</span><div><strong>Review</strong><small>Protected quote</small></div><i>2</i></div><div className="swap-step"><span>03</span><div><strong>Confirm</strong><small>Wallet signature</small></div><i>3</i></div><div className="swap-step"><span>04</span><div><strong>Track</strong><small>Settlement</small></div><i>4</i></div></section>
+      <section className="swap-steps" aria-label="Swap steps"><div className="swap-step swap-step-done"><span>01</span><div><strong>Connect</strong><small>Wallet</small></div><i>✓</i></div><div className="swap-step"><span>02</span><div><strong>Review</strong><small>Quote</small></div><i>2</i></div><div className="swap-step"><span>03</span><div><strong>Confirm</strong><small>Confirm</small></div><i>3</i></div><div className="swap-step"><span>04</span><div><strong>Track</strong><small>Settlement</small></div><i>4</i></div></section>
       <section className="swap-layout swap-layout-uniswap">
         <article className="neo-card swap-card">
           <div className="swap-card-top swap-card-heading">
             <div><span className="eyebrow">SEPOLIA / V4 ROUTE</span><h2>Swap</h2></div>
             <div className="swap-card-tools"><Badge tone={swapMode === "exactIn" ? "green" : "muted"}>{swapMode === "exactIn" ? "EXACT IN" : "EXACT OUT PREVIEW"}</Badge><span className="swap-settings-icon" aria-hidden="true">⚙</span></div>
           </div>
-          <div className="swap-card-subtitle">ETH / WETH · BondMeBro protected pool</div>
+          <div className="swap-card-subtitle">BondMeBro pool</div>
           <div className="swap-mode-row"><div className="segmented-control"><button type="button" className={swapMode === "exactIn" ? "segment-active" : ""} onClick={() => setSwapMode("exactIn")}>Exact in</button><button type="button" className={swapMode === "exactOut" ? "segment-active" : ""} onClick={() => setSwapMode("exactOut")}>Exact out</button></div><span className="swap-route-label">Single-hop route</span></div>
           <div className="swap-token-panel swap-sell-panel"><div className="field-label uniswap-field-label"><span>Sell</span><span>Balance {payBalance === undefined ? "—" : `${formatToken(payBalance, payToken.decimals)} ${payToken.symbol}`}</span></div><div className="amount-line uniswap-amount-line"><input aria-label="Swap amount" value={swapAmount} onChange={(event) => setSwapAmount(event.target.value)} inputMode="decimal" placeholder="0.00" /><TokenPicker label="Pay token" token={payToken} options={swapTokenOptions} onChange={choosePayToken} /></div></div>
           <button type="button" className="direction-button swap-direction-button" aria-label="Switch swap direction" onClick={() => { const oldPay = paySymbol; setPaySymbol(receiveSymbol); setReceiveSymbol(oldPay); }}>↕</button>
           <div className="swap-token-panel swap-buy-panel"><div className="field-label uniswap-field-label"><span>Buy</span><span>{quoteLoading ? "Updating quote…" : "Estimated output"}</span></div><div className="amount-line uniswap-amount-line"><strong className="quoted-output-value" aria-live="polite">{quoteAmountOut !== undefined && quoteAmountOut > 0n && !quoteError ? formatToken(quoteAmountOut, receiveToken.decimals) : quoteLoading ? "…" : "—"}</strong><TokenPicker label="Receive token" token={receiveToken} options={swapTokenOptions} onChange={chooseReceiveToken} /></div><div className="minimum-output-control"><div><span>Minimum received</span><small>Auto · 0.50%</small></div><input aria-label="Minimum output" value={minimumOutput} onChange={(event) => { setMinimumOutput(event.target.value); setMinimumOutputEdited(true); }} inputMode="decimal" placeholder="Waiting for quote" /></div></div>
           <div className="swap-settings swap-settings-uniswap"><span>Slippage <b>0.50%</b></span><span>Bond rate <b>{bondBps.toString()} bps</b></span><span>Pool fee <b>0.30%</b></span></div>
-          {!rpcOnline && <div className="pair-warning">RPC is offline, so the pool configuration cannot be read. Click “RPC offline · retry” above after starting the frontend with a valid SEPOLIA_RPC_URL.</div>}{rpcOnline && poolConfigLoading && <div className="pair-warning">Reading the live BondMeBro pool configuration…</div>}{rpcOnline && poolConfigError && <div className="pair-warning">The live pool configuration could not be read. Retry the RPC connection before sending.</div>}{swapMode === "exactIn" && quoteLoading && <div className="pair-warning">Getting a live Uniswap v4 quote for this input. The output and minimum received will update automatically.</div>}{swapMode === "exactIn" && quoteHasNoLiquidity && <div className="pair-warning">The live quote returned no usable liquidity for this direction. The pool must have active in-range liquidity before the swap can be sent.</div>}{swapMode === "exactIn" && quoteError && !quoteHasNoLiquidity && <div className="pair-warning">The live Uniswap v4 quote is unavailable for this pool key or hook simulation. Sending is disabled until a valid quote is returned.</div>}{swapMode === "exactIn" && quoteEnabled && !quoteLoading && !quoteError && !quoteHasNoLiquidity && quoteAmountOut === undefined && <div className="pair-warning">The live quote could not be decoded. No fallback estimate is used, and sending remains disabled.</div>}{swapMode === "exactIn" && quoteReady && minimumAmountOut === 0n && <div className="pair-warning">Minimum received is empty or invalid. Enter a positive value before submitting; the automatic value uses 0.50% slippage.</div>}{!supportedDirection && <div className="pair-warning">This deployment currently has a BondMeBro pool only for ETH / WETH. Select that pair for a live test; other token pairs need their own initialized pool and liquidity.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is preview-only.</div>}{payToken.kind === "erc20" && amountIn !== undefined && amountIn > 0n && !tokenSpendingReady && <div className="pair-warning">Approve WETH first. After that, each swap opens only one MetaMask transaction.</div>}{!routerConfigured && <div className="pair-warning">Set the Universal Router address before sending.</div>}{!quoterConfigured && <div className="pair-warning">Set the network&apos;s Uniswap v4 Quoter address in the frontend environment before sending transactions.</div>}
+          {!rpcOnline && <div className="pair-warning">RPC offline.</div>}{rpcOnline && poolConfigLoading && <div className="pair-warning">Reading pool config…</div>}{rpcOnline && poolConfigError && <div className="pair-warning">Pool config unavailable.</div>}{swapMode === "exactIn" && quoteLoading && <div className="pair-warning">Getting quote…</div>}{swapMode === "exactIn" && quoteHasNoLiquidity && <div className="pair-warning">No usable liquidity.</div>}{swapMode === "exactIn" && quoteError && !quoteHasNoLiquidity && <div className="pair-warning">Quote unavailable.</div>}{swapMode === "exactIn" && quoteEnabled && !quoteLoading && !quoteError && !quoteHasNoLiquidity && quoteAmountOut === undefined && <div className="pair-warning">Quote decode failed.</div>}{swapMode === "exactIn" && quoteReady && minimumAmountOut === 0n && <div className="pair-warning">Set a positive minimum.</div>}{!supportedDirection && <div className="pair-warning">Only ETH/WETH is live now. Other tokens need pools.</div>}{swapMode === "exactOut" && <div className="pair-warning">Exact-output is preview-only.</div>}{payToken.kind === "erc20" && supportedDirection && amountIn !== undefined && amountIn > 0n && !tokenSpendingReady && <div className="pair-warning">Approve {payToken.symbol} first. Swaps then need one confirmation.</div>}{!routerConfigured && <div className="pair-warning">Set the Universal Router address before sending.</div>}{!quoterConfigured && <div className="pair-warning">Set Quoter address.</div>}
           <div className={`swap-status swap-status-${status.tone}`}><StatusDot live={status.tone === "ready" || status.tone === "success"} /><div><strong>{status.title}</strong><span>{status.detail}</span></div></div>
-          {payToken.kind === "erc20" && amountIn !== undefined && amountIn > 0n && !tokenSpendingReady && isConnected && networkCorrect && <button type="button" className="outline-button full-button prepare-token-button" disabled={transactionState === "approving" || transactionState === "sending"} onClick={() => void prepareTokenSpending()}>{transactionState === "approving" ? "Approving WETH…" : "Approve WETH once"}</button>}
-          <button type="button" className="primary-button large-button full-button swap-submit-button" disabled={actionDisabled} onClick={() => { if (!isConnected) onConnect(); else if (!networkCorrect) onSwitchNetwork(); else void submitSwap(); }}>{transactionState === "approving" ? "Approving WETH…" : transactionState === "sending" ? "Confirming swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !rpcOnline ? "RPC offline" : poolConfigLoading ? "Reading pool config…" : poolConfigError ? "Retry pool config" : !supportedDirection ? "Pool not configured" : !bondingEnabledForSwap(poolConfig) ? "Pool config pending" : swapMode === "exactOut" ? "Exact-out preview" : quoteLoading ? "Getting quote" : quoteError || quoteHasNoLiquidity || !quoteReady ? "Quote unavailable" : minimumAmountOut <= 0n ? "Set minimum output" : !amountFitsBalance && payBalance !== undefined ? "Insufficient balance" : !tokenSpendingReady ? "Approve first" : "Swap"} <span>→</span></button>
+          {payToken.kind === "erc20" && supportedDirection && amountIn !== undefined && amountIn > 0n && !tokenSpendingReady && isConnected && networkCorrect && <button type="button" className="outline-button full-button prepare-token-button" disabled={transactionState === "approving" || transactionState === "sending"} onClick={() => void prepareTokenSpending()}>{transactionState === "approving" ? `Approving ${payToken.symbol}…` : `Approve ${payToken.symbol} once`}</button>}
+          <button type="button" className="primary-button large-button full-button swap-submit-button" disabled={actionDisabled} onClick={() => { if (!isConnected) onConnect(); else if (!networkCorrect) onSwitchNetwork(); else void submitSwap(); }}>{transactionState === "approving" ? `Approving ${payToken.symbol}…` : transactionState === "sending" ? "Confirming swap…" : transactionState === "success" ? "Swap complete" : !isConnected ? "Connect wallet" : !networkCorrect ? "Switch to Sepolia" : !rpcOnline ? "RPC offline" : poolConfigLoading ? "Reading pool config…" : poolConfigError ? "Retry pool config" : !supportedDirection ? "Pool not configured" : !bondingEnabledForSwap(poolConfig) ? "Pool config pending" : swapMode === "exactOut" ? "Exact-out preview" : quoteLoading ? "Getting quote" : quoteError || quoteHasNoLiquidity || !quoteReady ? "Quote unavailable" : minimumAmountOut <= 0n ? "Set minimum output" : !amountFitsBalance && payBalance !== undefined ? "Insufficient balance" : !tokenSpendingReady ? "Approve first" : "Swap"} <span>→</span></button>
           {transactionState === "error" && <div className="transaction-message transaction-error">{transactionError}</div>}{transactionState === "success" && transactionHash && <div className="transaction-message transaction-success">Confirmed. <a href={explorerTx(transactionHash)} target="_blank" rel="noreferrer">View transaction ↗</a><button type="button" className="text-button success-next-button" onClick={onViewBonds}>Track this bond →</button></div>}
-          <span className="readonly-note">Swap submit sends one wallet transaction. WETH approval is separate only if your allowance is missing.</span>
+          <span className="readonly-note">Swap uses one confirmation after allowance is ready.</span>
         </article>
-        <aside className="swap-context"><article className="glass-card bond-preview-card"><div className="card-heading"><div><span className="eyebrow">BOND PREVIEW</span><h2>Accountability, up front.</h2></div><span className="preview-lock">⌁</span></div><div className="preview-amount"><span>ESTIMATED BOND</span><strong>{formatToken(estimatedBond, payToken.decimals)} <small>{payToken.symbol}</small></strong></div><div className="preview-rows"><div><span>Gross input</span><strong>{amountIn === undefined ? "—" : `${formatToken(amountIn, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Pool input after bond</span><strong>{amountIn === undefined ? "—" : `${formatToken(effectivePoolInput, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Bond rate</span><strong>{bondBps.toString()} bps</strong></div><div><span>Maturity checkpoint</span><strong>{observationBlocks.toString()} blocks</strong></div><div><span>Refund recipient</span><strong>{address ? formatAddress(address) : "Connect wallet"}</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>This is temporary collateral, not a guaranteed refund. Settlement is permissionless and uses the protocol-defined outcome rule.</p></div></article><button type="button" className="learn-link" onClick={onLearn}>Why is there a bond? <span>→</span></button></aside>
+        <aside className="swap-context"><article className="glass-card bond-preview-card"><div className="card-heading"><div><span className="eyebrow">BOND PREVIEW</span><h2>Bond preview</h2></div><span className="preview-lock">⌁</span></div><div className="preview-amount"><span>ESTIMATED BOND</span><strong>{formatToken(estimatedBond, payToken.decimals)} <small>{payToken.symbol}</small></strong></div><div className="preview-rows"><div><span>Gross input</span><strong>{amountIn === undefined ? "—" : `${formatToken(amountIn, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Pool input after bond</span><strong>{amountIn === undefined ? "—" : `${formatToken(effectivePoolInput, payToken.decimals)} ${payToken.symbol}`}</strong></div><div><span>Bond rate</span><strong>{bondBps.toString()} bps</strong></div><div><span>Maturity</span><strong>{observationBlocks.toString()} blocks</strong></div><div><span>Refund recipient</span><strong>{address ? formatAddress(address) : "Connect wallet"}</strong></div></div><div className="risk-callout"><span>ⓘ</span><p>Refund depends on settlement outcome.</p></div></article><button type="button" className="learn-link" onClick={onLearn}>Why bond? <span>→</span></button></aside>
       </section>
     </div>
   );
@@ -1256,30 +1253,30 @@ function getSwapStatus({
   quoteAmountOut?: bigint;
   transactionState: TransactionState;
 }) {
-  if (transactionState === "approving") return { tone: "pending", title: "WETH approval", detail: "Prepare allowance once, then swap in one confirmation." };
+  if (transactionState === "approving") return { tone: "pending", title: "Token approval", detail: "Approve once, then one-confirm swap." };
   if (transactionState === "sending") return { tone: "pending", title: "Confirm swap", detail: "One Universal Router transaction is being submitted." };
-  if (transactionState === "success") return { tone: "success", title: "Swap confirmed", detail: "Your BondOpened event is being indexed. Open My bonds to track maturity." };
-  if (transactionState === "error") return { tone: "error", title: "Swap not completed", detail: "Review the message below and try again when ready." };
-  if (!isConnected) return { tone: "warning", title: "Connect your wallet", detail: "Your wallet becomes the swap payer and refund recipient." };
-  if (!networkCorrect) return { tone: "warning", title: "Switch to Sepolia", detail: "This deployment is currently running on Ethereum Sepolia." };
-  if (!rpcOnline) return { tone: "warning", title: "RPC offline", detail: "Start the frontend with SEPOLIA_RPC_URL or retry the live data connection." };
-  if (poolConfigLoading) return { tone: "pending", title: "Reading pool configuration", detail: "Waiting for the deployed hook configuration from Sepolia." };
-  if (poolConfigError) return { tone: "error", title: "Pool configuration unavailable", detail: "Retry the RPC connection before submitting a swap." };
-  if (!supportedDirection) return { tone: "warning", title: "Pool not configured", detail: "Only the deployed ETH / WETH pool can be traded here." };
-  if (!routerConfigured) return { tone: "warning", title: "Router address missing", detail: "Configure the network Universal Router address first." };
-  if (!bondingEnabledForSwap(poolConfig)) return { tone: "warning", title: "Pool configuration pending", detail: "Enable both thresholds and the bond rate before trading." };
-  if (amountIn === undefined || amountIn <= 0n) return { tone: "warning", title: "Enter an amount", detail: "Use a positive amount in the selected input token." };
-  if (swapMode === "exactOut") return { tone: "warning", title: "Exact-output preview", detail: "Browser execution is disabled until exact-output quote and max-input protection are wired." };
-  if (!quoterConfigured) return { tone: "warning", title: "Quoter address missing", detail: "Configure the official Uniswap v4 Quoter before submitting a swap." };
-  if (quoteLoading) return { tone: "pending", title: "Getting live quote", detail: "Simulating this BondMeBro pool through the Uniswap v4 Quoter." };
-  if (quoteHasNoLiquidity) return { tone: "warning", title: "Pool has no liquidity", detail: "The live quote returned no usable output for this direction." };
-  if (quoteError) return { tone: "error", title: "Quote unavailable", detail: "The deployed Quoter could not simulate this pool key and hook payload." };
-  if (quoteAmountOut === undefined) return { tone: "error", title: "Quote unavailable", detail: "No fallback estimate is used; wait for a valid live quote before sending." };
-  if (minimumAmountOut <= 0n && transactionState === "idle") return { tone: "warning", title: "Set minimum output", detail: "Use a positive slippage-protected minimum." };
-  if (!amountFitsBalance && payBalance !== undefined) return { tone: "warning", title: "Insufficient balance", detail: "Lower the amount or fund this wallet." };
-  if (payTokenKind === "erc20" && !tokenSpendingReady) return { tone: "warning", title: "Approve WETH once", detail: "Approval is separate; the swap itself is one confirmation after allowance is ready." };
-  if (transactionState === "idle") return { tone: "ready", title: "Ready", detail: "One MetaMask confirmation submits the swap." };
-  return { tone: "ready", title: "Ready", detail: "Review the live quote and bond before submitting." };
+  if (transactionState === "success") return { tone: "success", title: "Swap confirmed", detail: "Indexing bond event." };
+  if (transactionState === "error") return { tone: "error", title: "Swap not completed", detail: "Check message and retry." };
+  if (!isConnected) return { tone: "warning", title: "Connect your wallet", detail: "Wallet is payer and recipient." };
+  if (!networkCorrect) return { tone: "warning", title: "Switch to Sepolia", detail: "Use Sepolia." };
+  if (!rpcOnline) return { tone: "warning", title: "RPC offline", detail: "Retry RPC." };
+  if (poolConfigLoading) return { tone: "pending", title: "Reading pool configuration", detail: "Reading hook config." };
+  if (poolConfigError) return { tone: "error", title: "Pool configuration unavailable", detail: "Retry RPC." };
+  if (!supportedDirection) return { tone: "warning", title: "Pool not configured", detail: "Live pool: ETH/WETH only." };
+  if (!routerConfigured) return { tone: "warning", title: "Router address missing", detail: "Set router address." };
+  if (!bondingEnabledForSwap(poolConfig)) return { tone: "warning", title: "Pool configuration pending", detail: "Enable pool config." };
+  if (amountIn === undefined || amountIn <= 0n) return { tone: "warning", title: "Enter an amount", detail: "Enter amount." };
+  if (swapMode === "exactOut") return { tone: "warning", title: "Exact-output preview", detail: "Preview only." };
+  if (!quoterConfigured) return { tone: "warning", title: "Quoter address missing", detail: "Set Quoter address." };
+  if (quoteLoading) return { tone: "pending", title: "Getting live quote", detail: "Quoting route." };
+  if (quoteHasNoLiquidity) return { tone: "warning", title: "Pool has no liquidity", detail: "No liquidity." };
+  if (quoteError) return { tone: "error", title: "Quote unavailable", detail: "Quote failed." };
+  if (quoteAmountOut === undefined) return { tone: "error", title: "Quote unavailable", detail: "Wait for quote." };
+  if (minimumAmountOut <= 0n && transactionState === "idle") return { tone: "warning", title: "Set minimum output", detail: "Set minimum." };
+  if (!amountFitsBalance && payBalance !== undefined) return { tone: "warning", title: "Insufficient balance", detail: "Low balance." };
+  if (payTokenKind === "erc20" && !tokenSpendingReady) return { tone: "warning", title: "Approve WETH once", detail: "Approve once, then one-confirm swap." };
+  if (transactionState === "idle") return { tone: "ready", title: "Ready", detail: "One confirmation submits." };
+  return { tone: "ready", title: "Ready", detail: "Review and swap." };
 }
 
 function BondsScreen({
@@ -1371,7 +1368,7 @@ function BondsScreen({
       }) : undefined;
       const settlementDetail = decodedReceiptSettlement?.settlement
         ? `Bond settled · refund ${formatToken(decodedReceiptSettlement.settlement.refundAmount)} · slash ${formatToken(decodedReceiptSettlement.settlement.slashAmount)}`
-        : "Bond settled against the pool-local TWA";
+        : "Bond settled";
       onSettlementConfirmed(
         { kind: "SETTLED", block: receipt.blockNumber.toString(), hash, detail: settlementDetail },
         decodedReceiptSettlement?.id ?? headId,
@@ -1388,18 +1385,18 @@ function BondsScreen({
   return (
     <>
       <section className="screen-intro">
-        <div><span className="eyebrow">02 / PORTFOLIO</span><h1>My bonds<br /><em>in one view.</em></h1></div>
-        <p>Track, settle, and claim your bond outcomes.</p>
+        <div><span className="eyebrow">02 / PORTFOLIO</span><h1>My bonds.<br /><em>Track.</em></h1></div>
+        <p>Track and settle outcomes.</p>
       </section>
       <section className="bond-summary-grid">
-        <MetricCard label="YOUR OPEN BONDS" value={formatInteger(BigInt(activeUserBonds.length))} detail="from recent chain history" icon="◈" accent />
-        <MetricCard label="READY TO SETTLE" value={headMatured ? "1" : "0"} detail="current FIFO head" icon="✓" />
-        <MetricCard label="SETTLED BONDS" value={formatInteger(BigInt(settledUserBonds.length))} detail="recent outcomes" icon="↗" />
+        <MetricCard label="YOUR OPEN BONDS" value={formatInteger(BigInt(activeUserBonds.length))} detail="recent history" icon="◈" accent />
+        <MetricCard label="READY TO SETTLE" value={headMatured ? "1" : "0"} detail="FIFO head" icon="✓" />
+        <MetricCard label="SETTLED BONDS" value={formatInteger(BigInt(settledUserBonds.length))} detail="settled history" icon="↗" />
       </section>
 
       <article className="neo-card detail-card">
         <div className="card-heading">
-          <div><span className="eyebrow">BOND QUEUE / FIFO HEAD</span><h2>{headBond ? "Settlement checkpoint" : "Queue is clear"}</h2></div>
+          <div><span className="eyebrow">FIFO HEAD</span><h2>{headBond ? "Settle bond" : "Queue is clear"}</h2></div>
           <Badge tone={headMatured ? "orange" : headBond ? "neutral" : "green"}>{headBond ? headMatured ? "READY" : "ACTIVE" : "CLEAR"}</Badge>
         </div>
         {headBond ? (
@@ -1411,8 +1408,8 @@ function BondsScreen({
             <div className="timeline">
               <div className="timeline-line"><span style={{ width: `${maturityProgress}%` }} /></div>
               <div className="timeline-step timeline-done"><i>✓</i><span>Swap submitted</span><b>Block {formatBlock(headBond[1])}</b></div>
-              <div className={headMatured ? "timeline-step timeline-done" : "timeline-step"}><i>{headMatured ? "✓" : "2"}</i><span>Maturity checkpoint</span><b>Block {formatBlock(maturityBlock)}</b></div>
-              <div className={headMatured ? "timeline-step timeline-ready" : "timeline-step"}><i>{headMatured ? "3" : "3"}</i><span>Settlement</span><b>{headMatured ? "Ready now" : `${maturityProgress}% complete`}</b></div>
+              <div className={headMatured ? "timeline-step timeline-done" : "timeline-step"}><i>{headMatured ? "✓" : "2"}</i><span>Maturity</span><b>Block {formatBlock(maturityBlock)}</b></div>
+              <div className={headMatured ? "timeline-step timeline-ready" : "timeline-step"}><i>{headMatured ? "3" : "3"}</i><span>Settlement</span><b>{headMatured ? "Ready" : `${maturityProgress}% complete`}</b></div>
             </div>
             <div className="detail-info-grid">
               <div><span>REFUND RECIPIENT</span><strong>{formatAddress(headBond[0])}</strong></div>
@@ -1431,7 +1428,7 @@ function BondsScreen({
                   {settlementState === "sending" ? "Confirm in wallet…" : settlementState === "submitted" ? "Settlement pending…" : settlementState === "success" ? "Settlement confirmed" : headMatured ? "Settle next matured bond" : `Wait ${Math.max(0, Number((maturityBlock ?? 0n) - (currentBlock ?? 0n)))} blocks`} <span>→</span>
                 </button>
               )}
-              <span>Settlement is permissionless. The caller earns the configured fee only from any slash, never from a refund.</span>
+              <span>Anyone can settle; fees come from slashes.</span>
             </div>
             {settlementState === "error" && <div className="transaction-message transaction-error">{settlementError}</div>}
             {settlementState === "success" && settlementHash && <div className="transaction-message transaction-success">Confirmed. <a href={explorerTx(settlementHash)} target="_blank" rel="noreferrer">View settlement ↗</a></div>}
@@ -1448,17 +1445,17 @@ function BondsScreen({
           </div>
         ) : (
           <div className="empty-card large-empty">
-            <div className="empty-icon">◈</div><strong>Your bond queue is empty</strong><span>New qualifying swaps will appear here after the BondOpened event is indexed.</span><button type="button" className="primary-button" onClick={onSwap}>Make a swap →</button>
+            <div className="empty-icon">◈</div><strong>Your bond queue is empty</strong><span>New bonds appear after indexing.</span><button type="button" className="primary-button" onClick={onSwap}>Make a swap →</button>
           </div>
         )}
       </article>
 
       <article className="neo-card user-bonds-card">
-        <div className="card-heading"><div><span className="eyebrow">YOUR HISTORY / RECENT EVENTS</span><h2>Bond records</h2></div><Badge tone={isConnected ? "green" : "muted"}>{isConnected ? "WALLET FILTERED" : "CONNECT TO FILTER"}</Badge></div>
+        <div className="card-heading"><div><span className="eyebrow">YOUR HISTORY</span><h2>Bond records</h2></div><Badge tone={isConnected ? "green" : "muted"}>{isConnected ? "WALLET FILTERED" : "CONNECT TO FILTER"}</Badge></div>
         {!isConnected ? (
-          <div className="inline-empty"><button type="button" className="text-button" onClick={onConnect}>Connect your wallet</button> to load bonds attributed to this refund recipient.</div>
+          <div className="inline-empty"><button type="button" className="text-button" onClick={onConnect}>Connect wallet</button> to load bonds.</div>
         ) : userBonds.length === 0 ? (
-          <div className="inline-empty">No BondOpened events for this wallet in the recent 5,000-block window.</div>
+          <div className="inline-empty">No recent bonds for this wallet.</div>
         ) : (
           <div className="user-bond-list">
             {userBonds.map((bond) => {
@@ -1480,7 +1477,7 @@ function BondsScreen({
                     <div><span>SWAP TX</span><a href={bond.hash ? explorerTx(bond.hash) : "#"} target="_blank" rel="noreferrer">{bond.hash ? shortenHash(bond.hash) : "—"} ↗</a></div>
                   </div>
                   {!settled && <div className="bond-progress"><span><i style={{ width: `${progress}%` }} /></span><b>{progress}% through observation window</b></div>}
-                  {settled && <div className={`settlement-result ${settled.slashAmount > 0n ? "settlement-result-slash" : "settlement-result-refund"}`}><div><span>REFUND SENT</span><strong>{formatToken(settled.refundAmount, decimals)} {symbol}</strong></div><div><span>SLASHED TO POT</span><strong>{formatToken(settled.slashAmount, decimals)} {symbol}</strong></div><div><span>PERSISTENCE</span><strong>{settled.persistenceBps.toString()} bps</strong></div><a href={settled.hash ? explorerTx(settled.hash) : "#"} target="_blank" rel="noreferrer">Settlement tx ↗</a><p className="refund-delivery-note">{settled.refundAmount > 0n ? `The hook sent this refund to ${formatAddress(bond.owner)} inside the settlement transaction. No second approval is required.` : "No refund was due; the bond outcome was allocated to the insurance pot."}</p></div>}
+                  {settled && <div className={`settlement-result ${settled.slashAmount > 0n ? "settlement-result-slash" : "settlement-result-refund"}`}><div><span>REFUND SENT</span><strong>{formatToken(settled.refundAmount, decimals)} {symbol}</strong></div><div><span>SLASHED TO POT</span><strong>{formatToken(settled.slashAmount, decimals)} {symbol}</strong></div><div><span>PERSISTENCE</span><strong>{settled.persistenceBps.toString()} bps</strong></div><a href={settled.hash ? explorerTx(settled.hash) : "#"} target="_blank" rel="noreferrer">Settlement tx ↗</a><p className="refund-delivery-note">{settled.refundAmount > 0n ? `Refund sent to ${formatAddress(bond.owner)}.` : "No refund; sent to pot."}</p></div>}
                 </div>
               );
             })}
@@ -1632,23 +1629,23 @@ function PoolsScreen({
 
   return (
     <>
-      <section className="screen-intro"><div><span className="eyebrow">03 / POOL ANALYTICS</span><h1>Pool health.<br /><em>Live.</em></h1></div><p>Current hook state for the selected Sepolia pool.</p></section>
+      <section className="screen-intro"><div><span className="eyebrow">03 / POOL ANALYTICS</span><h1>Pool health.<br /><em>Live.</em></h1></div><p>Live pool state.</p></section>
       <section className="content-grid pool-analytics-grid">
-        <article className="neo-card analytics-card"><div className="card-heading"><div><span className="eyebrow">SELECTED POOL</span><h2>ETH / WETH</h2></div><Badge tone={poolConnected ? "green" : "neutral"}><StatusDot live={poolConnected} /> {poolConnected ? "HOOK ACTIVE" : "CHECKING"}</Badge></div><div className="pool-identity-large"><div className="large-pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><span>PoolManager bound · Sepolia</span></div></div><div className="pool-stat-grid"><div><span>FEE TIER</span><strong>0.30%</strong></div><div><span>TICK SPACING</span><strong>60</strong></div><div><span>QUEUE</span><strong>{formatInteger(queueLength)}</strong></div><div><span>LAST TICK</span><strong>{accumulator?.[0]?.toString() ?? "—"}</strong></div></div><a className="outline-button full-button button-as-link" href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">View hook contract ↗</a></article>
-        <article className="glass-card configuration-card"><div className="card-heading"><div><span className="eyebrow">BOND CONFIGURATION</span><h2>Pool parameters</h2></div><Badge tone={!rpcOnline ? "muted" : config && config[2] > 0n ? "orange" : "muted"}>{!rpcOnline ? "RPC OFFLINE" : config && config[2] > 0n ? "ENABLED" : "DISABLED"}</Badge></div>{!rpcOnline && <div className="pair-warning">Pool configuration is unavailable because the server-side RPC is offline. Use the Retry control in the top bar after configuring SEPOLIA_RPC_URL.</div>}<div className="config-list"><div><span>Bond BPS</span><strong>{config?.[2]?.toString() ?? "—"} <small>basis points</small></strong></div><div><span>Minimum / currency 0</span><strong>{formatToken(config?.[0])} <small>ETH</small></strong></div><div><span>Minimum / currency 1</span><strong>{formatToken(config?.[1])} <small>WETH</small></strong></div><div><span>Observation window</span><strong>{observationBlocks.toString()} <small>blocks</small></strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} <small>bps of slash</small></strong></div></div><div className="owner-row"><span>OWNER</span><a href={owner ? explorerAddress(owner) : "#"} target="_blank" rel="noreferrer">{formatAddress(owner)} ↗</a></div></article>
+        <article className="neo-card analytics-card"><div className="card-heading"><div><span className="eyebrow">SELECTED POOL</span><h2>ETH / WETH</h2></div><Badge tone={poolConnected ? "green" : "neutral"}><StatusDot live={poolConnected} /> {poolConnected ? "HOOK ACTIVE" : "CHECKING"}</Badge></div><div className="pool-identity-large"><div className="large-pair-icon"><span>Ξ</span><span>W</span></div><div><strong>ETH / WETH</strong><span>Sepolia</span></div></div><div className="pool-stat-grid"><div><span>FEE TIER</span><strong>0.30%</strong></div><div><span>TICK SPACING</span><strong>60</strong></div><div><span>QUEUE</span><strong>{formatInteger(queueLength)}</strong></div><div><span>LAST TICK</span><strong>{accumulator?.[0]?.toString() ?? "—"}</strong></div></div><a className="outline-button full-button button-as-link" href={explorerAddress(deployment.hook)} target="_blank" rel="noreferrer">View hook contract ↗</a></article>
+        <article className="glass-card configuration-card"><div className="card-heading"><div><span className="eyebrow">BOND CONFIGURATION</span><h2>Pool parameters</h2></div><Badge tone={!rpcOnline ? "muted" : config && config[2] > 0n ? "orange" : "muted"}>{!rpcOnline ? "RPC OFFLINE" : config && config[2] > 0n ? "ENABLED" : "DISABLED"}</Badge></div>{!rpcOnline && <div className="pair-warning">RPC offline.</div>}<div className="config-list"><div><span>Bond BPS</span><strong>{config?.[2]?.toString() ?? "—"} <small>basis points</small></strong></div><div><span>Minimum / currency 0</span><strong>{formatToken(config?.[0])} <small>ETH</small></strong></div><div><span>Minimum / currency 1</span><strong>{formatToken(config?.[1])} <small>WETH</small></strong></div><div><span>Observation window</span><strong>{observationBlocks.toString()} <small>blocks</small></strong></div><div><span>Settler reward</span><strong>{settlerFeeBps.toString()} <small>bps of slash</small></strong></div></div><div className="owner-row"><span>OWNER</span><a href={owner ? explorerAddress(owner) : "#"} target="_blank" rel="noreferrer">{formatAddress(owner)} ↗</a></div></article>
       </section>
       <section className="content-grid pool-analytics-grid analytics-lower">
-        <article className="neo-card"><SectionHeading eyebrow="ACCUMULATOR" title="Pool-local reference" copy="Once-per-block, clamped settlement data." /><div className="tick-display"><strong>{accumulator?.[0]?.toString() ?? "—"}</strong><span>LAST RECORDED TICK</span></div><div className="mini-stats"><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CLAMP</span><strong>{clampTicks.toString()} ticks</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 5) : "—"}</strong></div></div></article>
-        <article className="glass-card pot-card"><div className="card-heading"><div><span className="eyebrow">LP COVERAGE</span><h2>Insurance balances</h2></div><Badge tone={pot0 > 0n || pot1 > 0n ? "orange" : "neutral"}>{pot0 > 0n || pot1 > 0n ? "READY TO DISTRIBUTE" : "EMPTY"}</Badge></div><p className="card-copy">Slash value waiting for LP donation.</p><div className="coverage-balance">{pots.map((pot) => <div key={pot.symbol}><span>{pot.symbol} POT</span><strong>{formatToken(pot.amount)} {pot.symbol}</strong><button type="button" className="outline-button" disabled={!isConnected || !networkCorrect || pot.amount === 0n || (donationState === "sending" || donationState === "submitted")} onClick={() => void donate(pot.currency, pot.amount)}>{donationState === "sending" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Confirm…" : donationState === "submitted" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Pending…" : pot.amount > 0n ? `Donate ${pot.symbol} pot` : "No pot yet"}</button></div>)}</div><div className="risk-callout"><span>ⓘ</span><p>Donates to in-range LPs; failed donations keep the pot.</p></div>{!isConnected && <div className="inline-empty"><button type="button" className="text-button" onClick={onConnect}>Connect wallet</button> to distribute a non-zero pot.</div>}{isConnected && !networkCorrect && <div className="inline-empty"><button type="button" className="text-button" onClick={onSwitchNetwork}>Switch to Sepolia</button> to distribute the pot.</div>}{donationState === "error" && <div className="transaction-message transaction-error">{donationError}</div>}{donationState === "success" && donationHash && <div className="transaction-message transaction-success">Pot distributed. <a href={explorerTx(donationHash)} target="_blank" rel="noreferrer">View transaction ↗</a></div>}</article>
+        <article className="neo-card"><SectionHeading eyebrow="ACCUMULATOR" title="Pool-local reference" copy="Clamped settlement data." /><div className="tick-display"><strong>{accumulator?.[0]?.toString() ?? "—"}</strong><span>LAST RECORDED TICK</span></div><div className="mini-stats"><div><span>LAST UPDATE</span><strong>{accumulator?.[1]?.toString() ?? "—"}</strong></div><div><span>CLAMP</span><strong>{clampTicks.toString()} ticks</strong></div><div><span>CUMULATIVE</span><strong>{accumulator ? shortenHash(`0x${accumulator[2].toString(16)}`, 8, 5) : "—"}</strong></div></div></article>
+        <article className="glass-card pot-card"><div className="card-heading"><div><span className="eyebrow">LP COVERAGE</span><h2>Insurance balances</h2></div><Badge tone={pot0 > 0n || pot1 > 0n ? "orange" : "neutral"}>{pot0 > 0n || pot1 > 0n ? "READY TO DISTRIBUTE" : "EMPTY"}</Badge></div><p className="card-copy">Slash value waiting for LP donation.</p><div className="coverage-balance">{pots.map((pot) => <div key={pot.symbol}><span>{pot.symbol} POT</span><strong>{formatToken(pot.amount)} {pot.symbol}</strong><button type="button" className="outline-button" disabled={!isConnected || !networkCorrect || pot.amount === 0n || (donationState === "sending" || donationState === "submitted")} onClick={() => void donate(pot.currency, pot.amount)}>{donationState === "sending" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Confirm…" : donationState === "submitted" && donationCurrency?.toLowerCase() === pot.currency.toLowerCase() ? "Pending…" : pot.amount > 0n ? `Donate ${pot.symbol} pot` : "No pot yet"}</button></div>)}</div><div className="risk-callout"><span>ⓘ</span><p>Donates to in-range LPs; failed donations keep the pot.</p></div>{!isConnected && <div className="inline-empty"><button type="button" className="text-button" onClick={onConnect}>Connect wallet</button> to donate.</div>}{isConnected && !networkCorrect && <div className="inline-empty"><button type="button" className="text-button" onClick={onSwitchNetwork}>Switch to Sepolia</button> to donate.</div>}{donationState === "error" && <div className="transaction-message transaction-error">{donationError}</div>}{donationState === "success" && donationHash && <div className="transaction-message transaction-success">Pot distributed. <a href={explorerTx(donationHash)} target="_blank" rel="noreferrer">View transaction ↗</a></div>}</article>
       </section>
     </>
   );
 }
 
 function ActivityScreen({ activity, activityError, onRefresh }: { activity: Activity[]; activityError: boolean; onRefresh: () => void }) {
-  return <><section className="screen-intro"><div><span className="eyebrow">04 / EVENT STREAM</span><h1>Activity<br /><em>log.</em></h1></div><p>Recent BondMeBro events.</p></section><article className="neo-card full-activity-card"><div className="card-heading"><div><span className="eyebrow">LAST 5,000 BLOCKS</span><h2>Protocol activity</h2></div><div className="activity-heading-actions"><Badge tone={activityError ? "neutral" : "green"}><StatusDot live={!activityError} /> {activityError ? "SAVED VIEW" : "SYNCED"}</Badge><button type="button" className="outline-button activity-refresh" onClick={onRefresh}>Refresh</button></div></div>{activity.length === 0 ? <div className="inline-empty">{activityError ? "Event history is unavailable. Check the server-side RPC configuration." : "No events in this window"}</div> : <>{activityError && <div className="inline-empty activity-cache-note">Live RPC is unavailable. Showing saved recent activity.</div>}<div className="activity-table"><div className="activity-table-head"><span>EVENT</span><span>DETAIL</span><span>BLOCK</span><span>TRANSACTION</span></div>{activity.map((item, index) => <a className="activity-table-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-pill event-${item.kind.toLowerCase()}`}>{item.kind}</span><strong>{item.detail}</strong><span>#{item.block}</span><span>{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div></>}</article></>;
+  return <><section className="screen-intro"><div><span className="eyebrow">04 / EVENT STREAM</span><h1>Activity.<br /><em>Live.</em></h1></div><p>Recent events.</p></section><article className="neo-card full-activity-card"><div className="card-heading"><div><span className="eyebrow">LAST 5,000 BLOCKS</span><h2>Protocol activity</h2></div><div className="activity-heading-actions"><Badge tone={activityError ? "neutral" : "green"}><StatusDot live={!activityError} /> {activityError ? "SAVED VIEW" : "SYNCED"}</Badge><button type="button" className="outline-button activity-refresh" onClick={onRefresh}>Refresh</button></div></div>{activity.length === 0 ? <div className="inline-empty">{activityError ? "RPC unavailable." : "No events in this window"}</div> : <>{activityError && <div className="inline-empty activity-cache-note">Showing saved activity.</div>}<div className="activity-table"><div className="activity-table-head"><span>EVENT</span><span>DETAIL</span><span>BLOCK</span><span>TRANSACTION</span></div>{activity.map((item, index) => <a className="activity-table-row" href={item.hash ? explorerTx(item.hash) : "#"} target="_blank" rel="noreferrer" key={`${item.kind}-${item.block}-${index}`}><span className={`event-pill event-${item.kind.toLowerCase()}`}>{item.kind}</span><strong>{item.detail}</strong><span>#{item.block}</span><span>{item.hash ? shortenHash(item.hash) : "—"} ↗</span></a>)}</div></>}</article></>;
 }
 
 function LearnScreen({ onSwap }: { onSwap: () => void }) {
-  return <><section className="screen-intro"><div><span className="eyebrow">05 / LEARN</span><h1>Accountable<br /><em>liquidity.</em></h1></div><p>BondMeBro is outcome-linked LP insurance. It does not label intent; it waits for the pool&apos;s price outcome and settles temporary collateral accordingly.</p></section><section className="learn-steps"><article className="learn-step"><span>01</span><div><h2>Swap</h2><p>Submit a normal single-hop swap. If the requested input crosses the pool&apos;s threshold, a bond preview appears before confirmation.</p></div><b>→</b></article><article className="learn-step learn-step-active"><span>02</span><div><h2>Bond</h2><p>A small portion of the input is held as temporary collateral. The trader chooses the maximum bond they accept.</p></div><b>→</b></article><article className="learn-step"><span>03</span><div><h2>Settle</h2><p>At maturity, anyone can settle. If the reference tick returns toward the pre-swap tick, the bond is refunded; persistent impact supports the LP insurance pot.</p></div><b>✓</b></article></section><section className="learn-bottom"><article className="glass-card learn-example"><span className="eyebrow">SIMPLE EXAMPLE</span><h2>1,000 units in.<br /><em>999 units to the pool.</em></h2><div className="example-list"><div><span>Gross input</span><strong>1,000</strong></div><div><span>Temporary bond</span><strong>1</strong></div><div><span>Effective pool input</span><strong>999</strong></div></div></article><article className="neo-card faq-card"><span className="eyebrow">FAQ / RISK</span><h2>Not a guarantee.<br />A defined checkpoint.</h2><p>Settlement uses the configured maturity rule and pool-local observation data. Market drift and unrelated flow remain economic limitations.</p><button type="button" className="primary-button" onClick={onSwap}>Preview a swap <span>→</span></button></article></section></>;
+  return <><section className="screen-intro"><div><span className="eyebrow">05 / LEARN</span><h1>Accountable<br /><em>liquidity.</em></h1></div><p>Outcome-linked LP insurance.</p></section><section className="learn-steps"><article className="learn-step"><span>01</span><div><h2>Swap</h2><p>Swap and preview the bond.</p></div><b>→</b></article><article className="learn-step learn-step-active"><span>02</span><div><h2>Bond</h2><p>A small bond is held.</p></div><b>→</b></article><article className="learn-step"><span>03</span><div><h2>Settle</h2><p>At maturity, settle the outcome.</p></div><b>✓</b></article></section><section className="learn-bottom"><article className="glass-card learn-example"><span className="eyebrow">SIMPLE EXAMPLE</span><h2>1,000 units in.<br /><em>999 units to the pool.</em></h2><div className="example-list"><div><span>Gross input</span><strong>1,000</strong></div><div><span>Temporary bond</span><strong>1</strong></div><div><span>Effective pool input</span><strong>999</strong></div></div></article><article className="neo-card faq-card"><span className="eyebrow">FAQ / RISK</span><h2>Not a guarantee.<br />A defined checkpoint.</h2><p>Pool-local data decides refunds.</p><button type="button" className="primary-button" onClick={onSwap}>Preview a swap <span>→</span></button></article></section></>;
 }

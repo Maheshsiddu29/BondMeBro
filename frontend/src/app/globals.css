@@ -4484,3 +4484,27 @@ h2 {
     font-size: 10px;
   }
 }
+
+/* Larger pool parameter values for quick scanning. */
+.configuration-card .config-list div {
+  min-height: 58px;
+}
+
+.configuration-card .config-list span,
+.configuration-card .owner-row span {
+  font-size: 11px;
+}
+
+.configuration-card .config-list strong,
+.configuration-card .owner-row a {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.configuration-card .config-list small {
+  font-size: 11px;
+}
+
+.theme-dark .uniswap-token-picker {
+  box-shadow: 4px 4px 12px rgba(0, 0, 0, 0.28), -3px -3px 9px rgba(255, 255, 255, 0.025);
+}

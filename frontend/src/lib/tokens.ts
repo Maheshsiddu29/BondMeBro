@@ -34,6 +34,22 @@ export const sepoliaTokens = {
     icon: "$",
     kind: "erc20",
   },
+  LINK: {
+    symbol: "LINK",
+    name: "Chainlink Token",
+    address: "0x779877A7B0D9E8603169DdbD7836e478b4624789" as Address,
+    decimals: 18,
+    icon: "L",
+    kind: "erc20",
+  },
+  DAI: {
+    symbol: "DAI",
+    name: "Dai Stablecoin",
+    address: "0x68194a729C2450ad26072b3D33ADaCbcef39D574" as Address,
+    decimals: 18,
+    icon: "D",
+    kind: "erc20",
+  },
 } satisfies Record<string, TokenOption>;
 
 export const tokenOptions = Object.values(sepoliaTokens);
