@@ -5031,3 +5031,50 @@ h2 {
     min-width: 0;
   }
 }
+
+/* Larger active bonds overview table. */
+.active-bonds-card h2 {
+  font-size: 46px;
+  line-height: 1;
+}
+
+.active-bonds-card .eyebrow,
+.active-bonds-card .bond-table-head,
+.active-bonds-card .card-footer {
+  font-size: 13px;
+}
+
+.active-bonds-card .bond-table-row {
+  min-height: 112px;
+  font-size: 16px;
+}
+
+.active-bonds-card .bond-table-row strong {
+  font-size: 18px;
+}
+
+.active-bonds-card .bond-table-row small {
+  font-size: 12px;
+}
+
+.active-bonds-card .orange-text {
+  font-size: 22px !important;
+}
+
+.active-bonds-card .badge {
+  min-height: 38px;
+  padding: 0 18px;
+  font-size: 12px;
+}
+
+.active-bonds-card .card-footer span {
+  font-size: 13px;
+}
+
+.active-bonds-card .empty-card strong {
+  font-size: 24px;
+}
+
+.active-bonds-card .empty-card span {
+  font-size: 16px;
+}
