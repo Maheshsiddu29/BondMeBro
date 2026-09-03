@@ -213,6 +213,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     error SettlementReentrancy();
     error InvalidCurrency();
     error InvalidPoolManager();
+    error InvalidHookAddress();
     // NotPoolManager() is inherited from BaseHook and reused for unlockCallback.
 
     constructor(IPoolManager _poolManager, Config memory cfg) BaseHook(_poolManager) {
@@ -277,6 +278,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         external
     {
         if (msg.sender != owner) revert NotOwner();
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         PoolId id = key.toId();
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
@@ -529,6 +531,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     /// @param maxCount Max bonds to settle this call (capped at MAX_SETTLE_BATCH). 0 = no-op.
     /// @return settled How many bonds were settled.
     function settleBonds(PoolKey calldata key, uint256 maxCount) external returns (uint256 settled) {
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         if (maxCount > MAX_SETTLE_BATCH) maxCount = MAX_SETTLE_BATCH;
         return _settleMaturedPrefix(key.toId(), maxCount, msg.sender);
     }
@@ -656,6 +659,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
     // entire call and cannot strand a partial payout.
     // slither-disable-next-line reentrancy-events
     function donatePot(PoolKey calldata key, Currency currency) external {
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         if (
             Currency.unwrap(currency) != Currency.unwrap(key.currency0)
                 && Currency.unwrap(currency) != Currency.unwrap(key.currency1)
@@ -680,6 +684,7 @@ contract BondMeBro is BaseHook, IUnlockCallback {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
 
         (PoolKey memory key, Currency currency, uint256 amount) = abi.decode(data, (PoolKey, Currency, uint256));
+        if (address(key.hooks) != address(this)) revert InvalidHookAddress();
         if (
             Currency.unwrap(currency) != Currency.unwrap(key.currency0)
                 && Currency.unwrap(currency) != Currency.unwrap(key.currency1)

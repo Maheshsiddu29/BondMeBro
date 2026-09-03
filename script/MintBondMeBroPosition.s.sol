@@ -67,9 +67,14 @@ contract MintBondMeBroPosition is Script {
         uint256 nativeValue = vm.envOr("NATIVE_VALUE", uint256(0));
         uint256 deadline = vm.envOr("DEADLINE", block.timestamp + 1 hours);
 
+        uint256 amount0Max = vm.envUint("AMOUNT0_MAX");
+        uint256 amount1Max = vm.envUint("AMOUNT1_MAX");
+        require(amount0Max <= type(uint128).max, "MintBondMeBroPosition: AMOUNT0_MAX overflows uint128");
+        require(amount1Max <= type(uint128).max, "MintBondMeBroPosition: AMOUNT1_MAX overflows uint128");
+
         vm.startBroadcast();
-        _approveCurrency(key.currency0, permit2, address(positionManager));
-        _approveCurrency(key.currency1, permit2, address(positionManager));
+        _approveCurrency(key.currency0, permit2, address(positionManager), amount0Max);
+        _approveCurrency(key.currency1, permit2, address(positionManager), amount1Max);
 
         uint256 initialPrice = vm.envOr("SQRT_PRICE_X96", uint256(0));
         (uint160 existingSqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
@@ -91,8 +96,8 @@ contract MintBondMeBroPosition is Script {
             int24(vm.envInt("TICK_LOWER")),
             int24(vm.envInt("TICK_UPPER")),
             vm.envUint("LIQUIDITY"),
-            uint128(vm.envUint("AMOUNT0_MAX")),
-            uint128(vm.envUint("AMOUNT1_MAX")),
+            uint128(amount0Max),
+            uint128(amount1Max),
             owner,
             bytes("")
         );
@@ -108,12 +113,13 @@ contract MintBondMeBroPosition is Script {
         console2.log("position token id ", tokenId);
     }
 
-    function _approveCurrency(Currency currency, address permit2, address positionManager) internal {
+    function _approveCurrency(Currency currency, address permit2, address positionManager, uint256 amount) internal {
         if (currency.isAddressZero()) return;
+        require(amount <= type(uint160).max, "MintBondMeBroPosition: approval amount overflows uint160");
 
-        IERC20Minimal(Currency.unwrap(currency)).approve(permit2, type(uint256).max);
+        IERC20Minimal(Currency.unwrap(currency)).approve(permit2, amount);
         IAllowanceTransfer(permit2).approve(
-            Currency.unwrap(currency), positionManager, type(uint160).max, type(uint48).max
+            Currency.unwrap(currency), positionManager, uint160(amount), uint48(block.timestamp + 1 hours)
         );
     }
 
