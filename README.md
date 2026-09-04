@@ -1,421 +1,401 @@
 # BondMeBro
 
-**Refundable, outcome-linked collateral for Uniswap v4 liquidity providers.**
+**Outcome-linked refundable collateral for Uniswap v4.**
 
-BondMeBro takes a **refundable deposit** from eligible swaps and observes the pool for ten blocks.
-If the price stays displaced in the trade's direction, some or all of the deposit goes into an LP
-insurance pot. The rest goes back to the named refund recipient. This shares risk using an observed
-pool outcome; it does not tell us what the trader knew or intended. LP means liquidity provider.
+BondMeBro is a Uniswap v4 hook that asks qualifying price-moving swaps to post **temporary, refundable collateral**. The swap executes immediately; the hook observes the pool's post-trade price path for a fixed **10-block** window and later returns or retains collateral according to the displacement that survives. The mechanism is pool-local and deterministic: it does **not** try to identify a malicious wallet, infer intent, or depend on an external price oracle.
 
-Contract: `BondMeBro` · Built for UHI10 (Atrium Academy) · Solidity 0.8.26 · Foundry
+> **Immediate swap. Temporary collateral. Conditional refund.**
 
----
+## Submission snapshot
 
-## 1. What BondMeBro is
+- Repository: `https://github.com/Maheshsiddu29/BondMeBro`
+- Submission branch: `main`
+- Submission commit: `baf1a4b`
+- Network: **Unichain Sepolia** (`chainId = 1301`)
+- Hook: [`0x2A07B25994FdE4c772f00d6B89e05E8ad62650C4`](https://sepolia.uniscan.xyz/address/0x2A07B25994FdE4c772f00d6B89e05E8ad62650C4)
+- Pool ID: `0xf7c593b94a9389133e5a12e30a199de8947996076d3c97f3080b04dd5fe6f51f`
+- Supported demo scope: **single-hop ERC20 ↔ ERC20, exact-input and exact-output**
 
-A Uniswap v4 hook. It sits on a pool, watches swaps, and for swaps large enough to matter it:
+## Why BondMeBro?
 
-1. takes a small **refundable collateral** out of the swap,
-2. records where the price was before and after,
-3. ten blocks later, measures how much of that price move was still there,
-4. **refunds** the collateral if the move reverted, or moves part of it into an **LP insurance pot**
-   if the move stuck.
+AMM LPs can be adversely selected when a pool is stale relative to new market information. An informed or arbitrage trade can trade against that stale quote, move the pool, and leave passive LPs holding the loss while the arbitrageur captures the repricing opportunity. This is closely related to the **loss-versus-rebalancing (LVR)** view of AMM adverse selection.
 
-No external oracle, off-chain classifier or wallet scoring is used. The hook reads the pool's own
-price history. Anyone can call settlement after maturity; refunds are not sent automatically just
-because ten blocks have passed.
+The hard problem is attribution: after a trade, a hook only sees the pool's realized path. That path can contain surviving trade impact, market drift, unrelated later flow, and noise. BondMeBro therefore avoids the claim that it can "detect toxic traders." Instead, it implements **outcome-linked LP risk sharing**:
 
-## 2. The problem
+1. measure realized impact;
+2. post bounded refundable collateral;
+3. observe a short late window;
+4. refund when displacement reverts;
+5. retain collateral when displacement persists.
 
-After a price-moving trade, the pool price may move back, stay displaced, or move further. LPs face
-different risks along those paths, but a pool's price history alone does not prove who caused a loss
-or why someone traded.
+## Core mechanism
 
-BondMeBro treats persistent same-direction displacement as an **LP-risk proxy** — a measurable
-signal used to split the deposit, not proof of actual LP loss. A reversal does not prove no one was
-harmed, and persistence does not prove the trader had inside information. This is outcome-linked
-risk sharing, not a classifier of trader knowledge, intent or maliciousness.
-
-## 3. Why the collateral is refundable
-
-The late price observations do not exist when the trade executes. The hook therefore holds a
-deposit first and decides its refundable part after the observation window.
-
-If both late windows show no chargeable displacement, the deposit is fully refunded. Otherwise,
-part or all is credited to the insurance pot. Swap fees and gas still apply. Pot funds stay inside
-the hook; this version does not distribute them to LPs.
-
-## 4. Exact-input swaps — where the money comes from
-
-For an exact-input swap you fix what you spend. So the collateral comes out of the **output**:
-
-```
-you spend       1,000 USDC     ← exactly what you asked, untouched
-pool swaps      1,000 USDC     ← the whole amount hits the curve
-pool returns    ~0.30 WETH
-hook holds       0.00045 WETH  ← the collateral, refundable, 15 bps here
-you receive     ~0.29955 WETH  ← output minus the collateral
+```mermaid
+flowchart LR
+    U[Trader] --> R[Universal Router]
+    R --> PM[Uniswap v4 PoolManager]
+    PM --> B[BondMeBro Hook]
+    B --> S[Swap executes immediately]
+    S --> C[Temporary variable-leg collateral]
+    C --> W[10-block observation]
+    W -->|reversion| F[Refund]
+    W -->|persistent displacement| P[Retained in insurance pot accounting]
 ```
 
-**The hook does not change your specified input.** It has no `beforeSwapReturnDelta` permission.
-For exact input, its post-swap collateral adjustment applies only to output. These examples assume
-a fully filled swap; a pool price limit can still cause a partial fill.
+### 1. Variable-leg custody
 
-## 5. Exact-output swaps — the mirror
+BondMeBro does not alter the trader's specified leg.
 
-For an exact-output swap you fix what you receive. So the collateral comes from the **input**, added
-on top:
+| Swap mode | Specified leg | Variable leg | Collateral currency |
+|---|---|---|---|
+| Exact input | Input stays fixed | Output | Output token |
+| Exact output | Output stays fixed | Input | Input token |
 
-```
-you want          0.30 WETH    ← exactly what you asked, untouched
-pool consumes    1,000 USDC
-hook takes           1.5 USDC  ← the collateral, refundable
-you spend        1,001.5 USDC  ← pool input plus the collateral
-```
+`beforeSwap` returns zero custom delta. After the native swap has produced the real execution result, `afterSwap` computes the bond and returns it on the **unspecified/variable leg**.
 
-Either way the **specified** leg of your swap is exact, and the collateral comes from the other one.
+### 2. Block-aware impact
 
-## 6. How much — effective block impact
+For each swap:
 
-The collateral rate scales with how far the price moved, measured in ticks:
-
-```
-ownImpact         = |tick after − tick before|
-blockDisplacement = |tick after − tick at the start of this block|
-
+```text
+ownImpact         = abs(tickAfter - tickBefore)
+blockDisplacement = abs(tickAfter - blockStartTick)
 effectiveImpact   = max(ownImpact, blockDisplacement)
 
-collateralBps     = min(100, ceil(effectiveImpact × 0.25))
-collateral        = variableLeg × collateralBps / 10,000
+collateralBps = min(100, ceil(effectiveImpact * 25 / 100))
 ```
 
-So roughly **0.25 basis points of collateral per tick of price impact, capped at 1%**.
+This is **0.25 bps per effective impact tick**, capped at **100 bps = 1%** of the realized variable leg.
 
-**Why the block term.** If the rate looked only at each swap's own impact, one big price move could
-be split into many small same-block swaps, each posting almost nothing, while the pool ended the
-block at exactly the same price. Measuring each swap against **where the block started** prices a
-trade on where it left the pool, not merely on how far it personally pushed it.
+`blockStartTick` is latched on the first pool touch in a new block. Using the larger of own-swap impact and same-block displacement materially reduces the advantage from splitting a single move into many same-block swaps. It is a mitigation, **not** a claim of split-proofness.
 
-**A swap that is first in its block is unaffected** — the two terms are equal, and it pays exactly
-what the simpler own-impact rule would have charged for the same execution.
+### 3. HookData v2
 
-The rate calculation is **pool-level and identity-free**: it does not use the sender, recipient or
-router as a score. Block-cumulative impact materially mitigates the old per-swap rule's unbounded
-same-block dilution. It does **not** make splitting invariant: splitting can still reduce collateral
-and the amount forfeited. See limitations D and E.
+The refund destination is explicit and router-safe:
 
-## 7. C6 / C8 / C10 — what settlement looks at
+```text
+byte 0      uint8    version = 2
+bytes 1-20  address  refundRecipient
+bytes 21-36 uint128  maxBondAmount
+-----------------------------------
+37 bytes total, packed
+```
 
-The hook keeps a running time-weighted tick accumulator per pool. When a bond opens at block `B`, it
-matures at `B + 10`, and three readings are frozen along the way:
+The hook never derives the refund recipient from `msg.sender`, the router, or `tx.origin`.
 
-| reading | block | what it is |
+### 4. 10-block settlement
+
+A bond opens at block `O` and matures at `M = O + 10`.
+
+```text
+O -------- C6 -------- C8 -------- C10 = M
+           O+6         O+8          O+10
+```
+
+Only two late two-block windows determine the residual:
+
+```text
+late1 = direction-aligned displacement over C6 -> C8
+late2 = direction-aligned displacement over C8 -> C10
+R     = max(max(late1, 0), max(late2, 0))
+```
+
+A 5-tick catch-up dead zone handles very small residual noise without permanently subtracting tolerance from larger displacements:
+
+```text
+R <= 5       => Q = 0
+5 < R < 10   => Q = 2 * (R - 5)
+R >= 10      => Q = R
+
+targetSlashBps = ceil(Q * 25 / 100)
+slashBps       = min(collateralBps, targetSlashBps)
+```
+
+Token accounting is derived from the realized variable leg:
+
+```text
+collateral = floor(variableLegAmount * collateralBps / 10_000)
+slash      = min(collateral,
+                 floor(variableLegAmount * slashBps / 10_000))
+refund     = collateral - slash
+```
+
+Settlement is **permissionless**. The result is tied to frozen/derivable C6/C8/C10 endpoints, so post-maturity swaps and settlement delay cannot change the answer.
+
+### 5. Quiet pools
+
+A quiet pool is **not automatically refunded**. The accumulator extrapolates using the last observed tick when no swap crosses an endpoint. If the last price remains displaced, the bond remains slashable. This avoids making "no activity" an escape hatch.
+
+## Live proof on Unichain Sepolia
+
+### Full-refund case
+
+A live exact-input trade moved the pool **189 ticks**. A reverse trade restored the pool before the first late checkpoint.
+
+| Item | Value |
+|---|---|
+| Bond | `0xe288648eba538c8c1b37efa1f9906b7e44ecaf062cf0388a15c03ac50df424ef` |
+| Forward tx | `0x51e461a7901bddd15ef8b3c4d7a335c9882ca6bdc2e2f3c00215d2dddd14b125` |
+| Open block | `61632823` |
+| Reverse tx | `0xe29f227dda7afe83dbdedb0664225cde7964bdd4cb4514e70136a11c3a5bd448` |
+| Reverse block | `61632828` (`open + 5`) |
+| C6 | `61632829` |
+| Maturity | `61632833` |
+| Variable leg | `3.582082322703465400 bWETH` |
+| Collateral rate | `48 bps` |
+| Collateral | `0.017193995148976633 bWETH` |
+| Settlement tx | `0xdfbf7ca82cfb69c637716aa37b9d607644374a3770f903d2973dadc6453ad58a` |
+| Refund | `0.017193995148976633 bWETH` |
+| Slash | `0` |
+
+**Result: 100% of the posted collateral was refunded.**
+
+### Persistent-displacement cases
+
+Multiple live bonds were also allowed to mature while the test pool remained displaced. Those settled with **0 refund** and retained the posted collateral, demonstrating the opposite branch of the same mechanism.
+
+## Research evolution
+
+BondMeBro's final mechanism is the result of several rejected or superseded designs:
+
+| Research path | Finding | Final decision |
 |---|---|---|
-| **C6** | `B + 6` | accumulator value six blocks in |
-| **C8** | `B + 8` | eight blocks in |
-| **C10** | `B + 10` | at maturity |
+| Wallet/intent classification | Pool-local data cannot identify intent or reconstruct the counterfactual fair price | Do not classify wallets; price realized outcomes |
+| External oracle/reference venue | Improves attribution but introduces dependency and trust assumptions | Excluded from MVP |
+| Dynamic fee / non-refundable premium | Decides cost before outcome and is not refundable | Rejected |
+| Decaying impact accumulator | Catches naive splitting but has a false-positive/evasion trade-off | Not used as final detector |
+| Whole-window residual | Carries opening-block structural floor | Rejected |
+| Single late window | One opposing late block can erase the charge | Rejected |
+| Relative tolerance / denominator-based settlement | Good synthetic cohort fairness, but overshoot-and-unwind can reduce or erase absolute slash | Superseded |
+| Permanent-subtraction dead zone | Never catches up to the base curve | Rejected |
+| **Model L2** | Impact-scaled collateral + residual-linked absolute slash + two late windows + catch-up dead zone | **Final** |
 
-Settlement scores the **late** windows — blocks 6–7 and 8–9 — relative to the bond's **pre-trade
-tick**. It does not directly charge the opening block. However, displacement created by the opening
-trade can still contribute to a slash if it persists into those late windows. The larger of the two
-direction-aligned readings is used, so changing one block cannot directly change both windows.
+The most important research lesson is that **opening impact should determine collateral availability, while surviving late displacement should determine the amount lost**. Increasing the opening impact must not reduce absolute slash for the same surviving residual.
 
-**Before maturity, settlement reverts.** At maturity or any time later, it uses the same C6/C8/C10
-endpoints. Swaps after maturity cannot change the result. Quiet periods are filled using the last
-observed tick; the hook does not refund automatically because no swaps occurred.
+## Synthetic economic evidence
 
-## 8. Refund and slash
+> **Important:** these are deterministic synthetic simulations, **not historical Uniswap evidence**.
 
+The final Model L2 `D = 5` research campaign used **8 regimes × 4 seeds × 80,000 trades per world** (2.56 million distinct generated trades), plus adversarial grids.
+
+Selected results:
+
+- benign full-refund rate: **85.82%**;
+- average benign loss: **0.619 bps of gross**;
+- useful modeled LP compensation: **53.73%**;
+- harmful trades charged nothing: **4.61%**;
+- p99 benign loss: **11.62 bps of gross**;
+- overshoot grid: **0 of 3,150 rows** lowered absolute slash;
+- a single final-block opposing push reduced slash by **0%** in the tested L2 construction.
+
+These results support the *shape* of the mechanism. They do not establish historical LP savings, optimal mainnet parameters, or profitability of every manipulation strategy.
+
+## Same-block splitting: mitigation, not elimination
+
+The original per-trade impact model allowed a 58-tick move split into 32 pieces to reduce posted collateral by about **15×**. The production block-aware model reduced the measured dilution to about **1.88×** in the same fixture. Aggregate slash also improved materially, but a residual advantage remains. The README and paper therefore deliberately avoid the phrase "split-proof."
+
+## Mixed-decimal safety (BMB-01 remediation)
+
+A pre-release security review identified an availability failure: exact-input collateral is in the **output** token, while input-only thresholds cannot guarantee that the variable leg is large enough to produce non-zero collateral on mixed-decimal pairs.
+
+The final config separates the two concerns:
+
+- `minBondedAmount0/1` — minimum actual input, in the input token's raw units;
+- `minVariableLeg0/1` — minimum variable/collateral leg, in that leg's raw units;
+- variable-leg minimums are bounded to at least **10,000 raw units** when bonding is enabled.
+
+This keeps eligibility correct for both directions and both exact-input/exact-output modes.
+
+## Security properties
+
+The implementation and adversarial tests exercise the following properties:
+
+- `refund + slash == collateral`;
+- a bond settles at most once;
+- refund destination is the stored HookData v2 recipient;
+- settlement caller cannot redirect value;
+- post-maturity swaps cannot change the result;
+- quiet settlement and late settlement produce the same endpoints/result;
+- collateral is strictly inside the variable leg (`INV-NOOP-VL`);
+- aggregate shared-currency liabilities remain solvent;
+- malformed HookData is rejected;
+- exact-input and exact-output preserve the specified leg;
+- same-block impact never receives a discount below own-impact collateral;
+- production swap callbacks remain bounded in work with respect to total bond count.
+
+### Known limitations
+
+This is a **Hookathon/testnet implementation, not a mainnet security guarantee**. Known limitations include:
+
+1. **Two-block late-window straddle:** manipulating both adjacent late windows can reduce the residual; it requires sustained movement across two consecutive late blocks, but it is not impossible.
+2. **Temporal grinding under `D = 5`:** movement accumulated in small enough steps can avoid charge; fees, gas, and arbitrage exposure determine real profitability.
+3. **1% collateral cap:** very large displacements can exceed the amount that can be economically covered by the posted collateral.
+4. **Threshold splitting:** swaps below eligibility thresholds remain unbonded by design.
+5. **Same-block split dilution:** materially reduced, not eliminated.
+6. **Insurance-pot distribution:** retained collateral is accounted to an insurance/risk reserve; automatic LP distribution is future work.
+7. **Unsupported assets/routes:** native currency, multi-hop, fee-on-transfer, rebasing, and callback-style nonstandard tokens are outside the current demo scope.
+
+## Hook permissions
+
+The deployed hook uses the low-14-bit permission mask:
+
+```text
+0x10C4
 ```
-R        = the larger of the two late-window displacements, in the trade's own direction, clamped at 0
-Q        = 0 if R ≤ 5 ;  2(R − 5) if R < 10 ;  R otherwise      ← the 5-tick dead zone
-slashBps = min(collateralBps, ceil(Q × 0.25))
 
-slash    = variableLeg × slashBps / 10,000
-refund   = collateral − slash
+Enabled paths:
+
+- `afterInitialize`
+- `beforeSwap`
+- `afterSwap`
+- `afterSwapReturnDelta`
+
+`beforeSwapReturnDelta` is intentionally **not** enabled.
+
+## Live deployment
+
+| Component | Address |
+|---|---|
+| BondMeBro hook | `0x2A07B25994FdE4c772f00d6B89e05E8ad62650C4` |
+| PoolManager | `0x9cB26A7183B2F4515945Dc52CB4195B0d2D06C95` |
+| Universal Router | `0x7F9B8D606E0F35E5073ABf93695814530b28a37b` |
+| V4Quoter | `0xB2b34025a07af3925313b6B46f8046Ee8FfBa30B` |
+| StateView | `0x792d13207744f132943cdde4d37ec89f20ae3b0d` |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
+| bWETH (`currency0`) | `0x38293A5D8A879Af5e2Eb2D3eb80121CA82f6acC1` |
+| bUSDC (`currency1`) | `0x49d5E60035e13b3736e5D26ef7ecEAbA52f9cC39` |
+
+Demo pool:
+
+```text
+Pool ID      0xf7c593b94a9389133e5a12e30a199de8947996076d3c97f3080b04dd5fe6f51f
+Fee          3000 (0.30%)
+Tick spacing 60
+Pool block    61620842
 ```
 
-- Both late-window readings reverted → `R = 0` → **full refund**.
-- Both late-window readings are within 5 ticks → **full refund** (the chosen dead zone).
-- Price partly persisted → **partial slash**, the rest refunded.
-- Price fully persisted → **slash up to the whole collateral**.
+## Run locally
 
-Displacement is measured **in the trade's own direction and clamped at zero**, so a price move the
-*other* way can never manufacture a charge.
+### Prerequisites
 
-## 9. The LP insurance pot
+- Foundry
+- Node.js + npm
+- Git submodules
 
-Slashed collateral is credited to a per-pool, per-currency `insurancePot`. Nothing moves when a bond
-is slashed — the tokens are already inside the hook; the slash just reclassifies them from "owed back
-to a trader" to "retained for LPs".
-
-**There is deliberately no withdrawal path in this version.** Distribution policy is a separate
-design problem, and shipping a withdrawal before that policy exists is the easiest way to get it
-wrong. Nobody — not the owner, not an LP, not a settler — can remove pot funds today.
-
-## 10. Permissionless settlement
-
-`settleBond(bondId)` can be called by **anyone** once the bond has matured. The settler is not paid
-and gains nothing; the result is identical whoever calls it at or after maturity. `settleMany`
-settles up to 32 bonds in one transaction.
-
-There is no privileged settler, no keeper incentive, and no way for a settler to influence the
-outcome.
-
-## 11. Supported modes
-
-- ERC-20 ↔ ERC-20, **single-hop**
-- **exact-input** and **exact-output**
-- both directions (`zeroForOne` and `oneForZero`)
-- multiple pools per hook deployment, including pools sharing a currency
-
-## 12. NOT supported — and not tested
-
-- multi-hop routes
-- native ETH
-- fee-on-transfer tokens
-- rebasing or otherwise non-standard ERC-20s
-- pools whose tokens have very few decimals, where the variable-leg minimum is a meaningful
-  amount of value rather than dust (see limitation F)
-
-Do not assume these work. They have no tests and are outside the design.
-
-## 13. Build and test
-
-Prerequisites: Foundry (`forge`, `cast`, `anvil`), Git, Make, Python 3 with `slither-analyzer`, and
-`jq` for the local deployment commands. Solidity 0.8.26 and Cancun are selected by `foundry.toml`.
-Install Slither locally if needed with `pip3 install slither-analyzer`.
-
-Dependencies are pinned git submodules. **Clone with them**, or the `lib/` folders come down empty
-and the build fails:
+### Clone and contracts
 
 ```bash
 git clone --recurse-submodules https://github.com/Maheshsiddu29/BondMeBro.git
 cd BondMeBro
+
+forge build
+forge test -vv
+forge test --match-path 'test/invariant/*' -vv
 ```
 
-Already cloned without them?
+Optional static analysis:
 
 ```bash
-git submodule update --init --recursive
+slither .
+```
+
+### Frontend
+
+Create `frontend/.env.local` **locally only** (never commit it):
+
+```bash
+RPC_URL=https://sepolia.unichain.org
+RPC_RATE_LIMIT=1200
+NEXT_PUBLIC_CHAIN_ID=1301
+NEXT_PUBLIC_NETWORK_NAME=Unichain Sepolia
+NEXT_PUBLIC_EXPLORER_URL=https://sepolia.uniscan.xyz
+NEXT_PUBLIC_HOOK_ADDRESS=0x2A07B25994FdE4c772f00d6B89e05E8ad62650C4
+NEXT_PUBLIC_POOL_MANAGER=0x9cB26A7183B2F4515945Dc52CB4195B0d2D06C95
+NEXT_PUBLIC_UNIVERSAL_ROUTER=0x7F9B8D606E0F35E5073ABf93695814530b28a37b
+NEXT_PUBLIC_QUOTER=0xB2b34025a07af3925313b6B46f8046Ee8FfBa30B
+NEXT_PUBLIC_PERMIT2=0x000000000022D473030F116dDEE9F6B43aC78BA3
+NEXT_PUBLIC_CURRENCY0=0x38293A5D8A879Af5e2Eb2D3eb80121CA82f6acC1
+NEXT_PUBLIC_CURRENCY1=0x49d5E60035e13b3736e5D26ef7ecEAbA52f9cC39
+NEXT_PUBLIC_POOL_FEE=3000
+NEXT_PUBLIC_TICK_SPACING=60
+NEXT_PUBLIC_DEPLOYMENT_BLOCK=61620842
+NEXT_PUBLIC_POOL_ID=0xf7c593b94a9389133e5a12e30a199de8947996076d3c97f3080b04dd5fe6f51f
 ```
 
 Then:
 
 ```bash
-forge build
-forge test
+cd frontend
+npm ci
+npm run abi:check
+npm run lint
+npm run typecheck
+npm run test
+npm run dev
 ```
 
-Run the local release checks:
+## Live refund rehearsal
+
+The repository includes testnet-only automation under `script/live-refund-demo/` and a deterministic fork rehearsal at `test/fork/LiveRefundRehearsal.t.sol`.
+
+Plan against an explicit live block:
 
 ```bash
-make ci          # fmt-check, slither, build, optimized tests, coverage
-FOUNDRY_PROFILE=ci forge test --match-path 'test/invariant/*' -vv
+export LIVE_FORK_BLOCK=$(cast block-number --rpc-url https://sepolia.unichain.org)
+
+UNICHAIN_SEPOLIA_RPC_URL=https://sepolia.unichain.org \
+LIVE_FORK_BLOCK=$LIVE_FORK_BLOCK \
+forge test --match-path 'test/fork/LiveRefundRehearsal.t.sol' -vv
 ```
 
-`make ci` runs every test normally, including every gas ceiling, and coverage runs the identical
-set — no test is excluded from either. GitHub CI uses the same `make coverage` command, the larger
-`ci` profile, and a separate committed-snapshot check.
+The live script deliberately fails closed if the plan is stale or the wallet is not prepared.
 
-The local P-L2-9.2 checks passed with the figures below. These are local results, not a fresh-clone
-certification; the committed candidate needs that separate check.
+## Validation snapshot
 
-| | |
-|---|---|
-| tests | **480 passing**, 0 failing, 36 suites |
-| stateful invariant campaign | **26 invariant-suite tests: 20 invariant properties + 6 reachability/regression tests**, 512 runs × depth 100 |
-| Slither | **0 findings**, 102 detectors |
-| coverage run | **480 passing**, 0 failing; no test excluded |
-| coverage (`src/BondMeBro.sol`) | 98.76% lines · 85.11% branches · 100% functions |
-| runtime bytecode | **16,446 bytes** (8,130 under the EIP-170 limit) |
-| `beforeSwap` worst case | **107,717 gas** (limit 150,000) |
-| `afterSwap` worst case | **74,298 gas** (limit 100,000) |
+Final submission baseline:
 
-The callback maxima are above the targets of 50,000 (`beforeSwap`) and 30,000 (`afterSwap`), but
-below the hard ceilings shown.
+- **492 contract tests passed**;
+- **26 invariant-suite tests passed**;
+- **Slither: 0 findings**;
+- deployed hook runtime: **16,446 bytes**;
+- production Solidity remained frozen while the final frontend/demo workflow was merged.
 
-Line and branch coverage each fell slightly against the previous release. That is the intended
-consequence of one change rather than a gap: the zero-collateral guard in the custody path is no
-longer reachable, because the variable-leg minimum makes a zero collateral arithmetically
-impossible, so no test can execute its revert. The guard is kept as defence against a later change.
+These are engineering validation results, not a claim of formal verification or a third-party mainnet audit.
 
-A bonded swap now costs about 2,470 gas more and an unbonded one about 2,174 more, for one extra
-storage read: the pool config outgrew a single slot when the variable-leg minimums were added.
+## Project structure
 
-## 14. Demo
-
-Three deterministic scenarios, each printing a narrated trace:
-
-```bash
-make demo                                  # all three
-forge test --match-path test/Demo.t.sol -vv
+```text
+src/                         production hook + libraries
+script/                      deployment scripts
+script/live-refund-demo/     testnet refund automation
+test/                        unit/integration/adversarial/invariant tests
+frontend/                    Next.js demo frontend
+docs/                        integration/research documentation (recommended)
 ```
 
-| scenario | what it shows |
-|---|---|
-| **1 — benign** | collateral posted, price reverts, **full refund** |
-| **2 — persistent** | collateral posted, price sticks, **slash into the insurance pot** |
-| **3 — same-block split** | one move split across many swaps, priced under both rules side by side |
+## Research paper
 
-### Local deployment on fresh Anvil
+See [`docs/BondMeBro_Research_Paper.md`](docs/BondMeBro_Research_Paper.md) for the full research evolution, final mechanism, synthetic evidence, adversarial findings, live deployment case study, and limitations.
 
-This deploys only to a throwaway chain on your own computer. It does not create a pool or supply
-liquidity; `make demo` creates its own complete test fixture for those parts. Do not use these
-unlocked-account commands on a public network. No env file or signing secret is needed.
+## What BondMeBro does not claim
 
-In terminal 1, start a fresh node with no saved state or fork. Keep it running:
+BondMeBro does **not** claim to:
 
-```bash
-anvil --host 127.0.0.1 --port 8545 --chain-id 31337 --hardfork cancun --quiet
-```
+- identify a malicious or "toxic" wallet;
+- reconstruct an external fair price;
+- eliminate all MEV, sandwiches, or frontrunning;
+- be manipulation-proof or split-proof;
+- automatically distribute retained collateral to LP positions;
+- provide historical-mainnet LP savings estimates from the synthetic experiments;
+- be mainnet production-ready without further economic calibration and external security review.
 
-If port 8545 is already in use, stop your own old local node first. Do not use an unknown node.
-In terminal 2, from the repository root, run the following in Bash or Zsh:
+## References
 
-```bash
-set -euo pipefail
-export RPC_URL=http://127.0.0.1:8545
-test "$(cast chain-id --rpc-url "$RPC_URL")" = 31337
-
-HOOK_OWNER=$(cast rpc --rpc-url "$RPC_URL" eth_accounts | jq -er '.[0]')
-export HOOK_OWNER
-
-POOL_MANAGER=$(forge create lib/v4-periphery/lib/v4-core/src/PoolManager.sol:PoolManager \
-  --rpc-url "$RPC_URL" --unlocked --from "$HOOK_OWNER" --broadcast --json \
-  --constructor-args "$HOOK_OWNER" | jq -er '.deployedTo')
-export POOL_MANAGER
-
-forge script script/DeployBondMeBro.s.sol \
-  --rpc-url "$RPC_URL" --sender "$HOOK_OWNER" --unlocked --broadcast
-```
-
-These are all the environment values this flow needs:
-
-- `RPC_URL` is the HTTP connection to this fresh local Anvil, not a mainnet or testnet service.
-- `HOOK_OWNER` is the first funded, unlocked account returned by this Anvil. It owns the hook's
-  pool-eligibility configuration. In this example it also owns the new PoolManager and signs both
-  deployments. `--from` selects it for `forge create`; `--sender` selects it for `forge script`.
-  `--unlocked` asks the local node to sign. The hook owner and deployment signer need not be the same
-  address in other deployment setups.
-- `POOL_MANAGER` is the actual contract address returned by the successful PoolManager deployment,
-  not a guessed or copied address. Its installed constructor takes `address initialOwner`.
-
-The BondMeBro script itself reads only `POOL_MANAGER` and `HOOK_OWNER`. It mines its CREATE2 salt,
-deploys, checks its address and permissions, then prints `deployed` and `addr bits`. Success means
-the broadcast completes and `addr bits` is **4292**, which is **0x10C4** in hexadecimal.
-
-The deployed hook address must have its low 14 permission bits equal to `0x10C4`. The visible
-hexadecimal suffix does not need to be literally `10C4`; addresses ending in `10C4`, `50C4`, `90C4`,
-or `D0C4` can all satisfy the same permission mask. The equivalent Solidity check is:
-
-```solidity
-require((uint160(address(hook)) & 0x3FFF) == 0x10C4);
-```
-
-`BEFORE_SWAP_RETURNS_DELTA` is absent. This is a permission-bit property, not a text suffix check.
-Stop Anvil with Ctrl-C when finished; its throwaway state is discarded.
-
-Uniswap v4 encodes a hook's permissions in its **address**, so this cannot be deployed with a plain
-`forge create`. The script mines a CREATE2 salt until it finds an address carrying the right
-permission bits. Changing the constructor arguments changes the address, so expect to re-mine.
-
-**Integrating a frontend or router?** Read [INTEGRATION.md](./INTEGRATION.md) first — quoting and
-slippage need specific handling.
-
-## 15. Security model
-
-**What is protected, and by what:**
-
-| property | how |
-|---|---|
-| The hook cannot alter your specified amount | It does not hold `beforeSwapReturnDelta`. Enforced by the hook's address bits, not by code discipline. |
-| Collateral is strictly between zero and the leg it comes from | Checked on every bonded swap; a swap that would violate it reverts. |
-| Refund + slash always equals the collateral taken | Exact integer conservation, no rounding dust. |
-| Pushing the price *further* can never reduce what you forfeit | The rate is non-decreasing in harmful displacement. |
-| An opposite-direction move cannot manufacture a charge | Displacement is direction-aligned and clamped at zero. |
-| Settlement is time-independent | Endpoints are frozen when due; post-maturity trading cannot change the answer. |
-| A bond cannot be settled twice | State machine, checked before any transfer. |
-| Per-swap work is bounded | The maturity scan is bounded by a fixed horizon, independent of how many bonds exist. |
-| Multiple pools cannot drain each other | Solvency is tracked per currency across pools; pool state is isolated. |
-
-**What BondMeBro does *not* claim.** It is not manipulation-proof, not MEV-proof, not split-proof,
-and not audited. It does not detect or label traders, and it does not price toxicity. It is a
-**pool-local LP-risk proxy**: measured price displacement over a fixed window, and nothing more.
-Manipulation is demonstrably possible — the limitations below name several ways and price them.
-
-The economic parameters (0.25 bps/tick, the 1% cap, the 5-tick dead zone, the ten-block window) were
-chosen against a **synthetic simulated population**. They are **SYNTHETIC SIMULATION — NOT HISTORICAL
-UNISWAP EVIDENCE.** No historical Uniswap trade was ever fetched or replayed.
-
-## 16. Known limitations
-
-These are real, measured, and **not solved**. They are documented rather than hidden.
-
-**A — Two-block straddle.** The two late windows are disjoint but adjacent. A trader who moves the
-real price across *both* windows for two consecutive blocks can drive the measured residual to zero
-and recover the whole collateral. The cost is holding a real price displacement for two blocks,
-exposed to arbitrage the whole time.
-
-**B — Grinding under the dead zone.** Displacement built at 5 ticks or less per observation window
-costs nothing, without bound. This is inherent to having a noise floor at all. Each step is a
-separate swap paying fees and gas, and leaves the price exposed for a full window.
-
-**C — The 1% cap.** Above roughly 397 ticks of impact the collateral saturates at 1% while the
-harm keeps growing, so the largest persistent moves are systematically under-collateralized. LP
-protection stops scaling there.
-
-**D — Threshold splitting.** Swaps below either of a pool's two minimums never bond. Splitting a
-large trade into many below-threshold pieces avoids collateral entirely. The thresholds are
-raw-amount rations, not classifiers, and this is the direct consequence. The pieces have to be
-genuinely tiny — a pool with real liquidity does not move at all at those sizes — but nothing stops
-the strategy in principle.
-
-**E — Same-block splitting: materially mitigated, NOT eliminated.**
-
-> Under the earlier per-swap rule, splitting one price move into `N` same-block pieces diluted the
-> collateral **without bound** — the advantage grew linearly with `N` (Θ(N)), because pieces moving
-> less than a full tick bonded nothing at all.
->
-> In the representative **58-tick / 32-piece** scenario, collateral dilution fell from about
-> **15×** under the old rule to about **1.88×** under the current rule. The slash retained compared
-> with a single trade rose from about **6%** to about **27%**.
->
-> **A residual advantage remains**: roughly **2× on collateral and 4× on the amount actually
-> forfeited**. Splitting is still cheaper than trading at once. This is a mitigation, not immunity.
-> The figures are **SYNTHETIC SIMULATION — NOT HISTORICAL UNISWAP EVIDENCE**, and are not universal
-> mainnet ratios.
-
-**F — The variable-leg minimum on few-decimal tokens.** A pool must be configured with a minimum
-size for the leg the collateral is taken from, and that minimum can never be set below 10,000 raw
-units. On an 18-decimal token that is a vanishing fraction of one token; on a 6-decimal token it is
-a hundredth of a unit; on a token with two decimals it is 100 whole units, which is a real amount of
-value to exclude from bonding. Check what the floor means in your pool's tokens before enabling
-bonding on one with very few decimals.
-
-Trades under that minimum are not rejected — they execute in full and simply do not bond. The
-collateral they avoid is at most `minimum × 1% ` raw units each, so the exemption scales with the
-threshold the operator chooses rather than being open-ended.
-
-## Repository layout
-
-| path | what |
-|---|---|
-| `src/BondMeBro.sol` | the hook |
-| `src/libraries/TickAccumulatorLib.sol` | per-pool time-weighted tick accumulator (one storage slot) |
-| `src/libraries/ModelL2SettlementLib.sol` | settlement arithmetic — windows, dead zone, refund/slash split |
-| `src/libraries/HookDataCodec.sol` | the versioned per-swap payload (refund recipient + collateral ceiling) |
-| `script/DeployBondMeBro.s.sol` | CREATE2 salt mining and deployment |
-| `test/` | 480 tests, including adversarial, stateful-invariant and demo suites |
-| `frontend/` | Next.js dashboard: quote, swap, watch maturity, settle. Its hook ABI is generated from `out/BondMeBro.sol` |
-| `INTEGRATION.md` | frontend and router integration rules |
-
-## Dependency note
-
-`BaseHook` was **removed from `v4-periphery`** and now lives in `OpenZeppelin/uniswap-hooks` at
-`src/base/BaseHook.sol`. Most tutorials still point at the old path and will not compile. Dependency
-commits are pinned deliberately for that reason.
+1. Adams et al., **Uniswap v4 Core**, Uniswap v4 whitepaper.
+2. Uniswap Developers, **Uniswap v4 Architecture and Hooks**.
+3. Milionis, Moallemi, Roughgarden, Zhang, **Automated Market Making and Loss-Versus-Rebalancing**, arXiv:2208.06046.
+4. Milionis, Moallemi, Roughgarden, **Automated Market Making and Arbitrage Profits in the Presence of Fees**, arXiv:2305.14604.
 
 ## License
 
-See [LICENSE](./LICENSE).
+See the repository's [`LICENSE`](LICENSE) file and the licenses of the pinned Uniswap dependencies.
