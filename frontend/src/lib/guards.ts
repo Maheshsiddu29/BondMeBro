@@ -145,5 +145,7 @@ export type SubmittedSummary = {
   refundRecipient: Address;
   maxBondAmountLabel: string;
   hookData: Hex;
+  /** The gas limit actually signed, present once estimation has run. */
+  gasLimit?: bigint;
   submittedAt: number;
 };

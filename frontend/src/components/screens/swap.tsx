@@ -4,37 +4,33 @@ import { useEffect, useMemo, useState } from "react";
 import type { Address, Hex } from "viem";
 import { usePublicClient, useReadContract, useSwitchChain, useWriteContract } from "wagmi";
 
-import { bondMeBroAbi } from "@/lib/abi/bondMeBro";
 import { erc20Abi, permit2Abi, universalRouterAbi, v4QuoterAbi } from "@/lib/abi/external";
 import type { Activity } from "@/lib/activity";
-import { interpretSwapReceipt, type BondOpenedEvent } from "@/lib/bond";
-import { explorerTx, poolKeyOf, type Deployment } from "@/lib/deployment";
+import { interpretSwapReceipt, type BondOpenedEvent, type BondTakenEvent } from "@/lib/bond";
+import { explorerTx, poolKeyOf } from "@/lib/deployment";
 import { describeError, isLiquidityError } from "@/lib/errors";
-import { formatAmount, formatBps, formatToken, parseUint128Amount, type TokenMeta } from "@/lib/format";
+import { formatAmount, parseUint128Amount, type TokenMeta } from "@/lib/format";
 import {
   assertContext,
   assertReceiptSucceeded,
   type IntendedContext,
   type SubmittedSummary,
 } from "@/lib/guards";
+import { allowanceStatus, sessionAllowanceFor, sessionExpiry } from "@/lib/allowance";
+import { submitWithBoundedGas } from "@/lib/gas";
 import { encodeHookData, EXACT_INPUT_MAX_BOND_AMOUNT } from "@/lib/hookData";
-import {
-  collateralBpsForImpact,
-  collateralFromVariableLeg,
-  effectiveImpactTicks,
-  exactInputLimits,
-  exactOutputLimits,
-  LimitError,
-  toleranceCoversCollateralCap,
-} from "@/lib/limits";
-import { bondEligibility, thresholdsFor, type SwapKind } from "@/lib/poolConfig";
+import { exactInputLimits, exactOutputLimits, LimitError } from "@/lib/limits";
+import { thresholdsFor, type SwapKind } from "@/lib/poolConfig";
 import { buildExactInputPlan, buildExactOutputPlan, spendRequirement } from "@/lib/swapPlan";
 import type { ProtocolState } from "@/lib/useProtocol";
-import { StatusDot, TokenPicker } from "@/components/ui";
 
 type FlowState = "idle" | "approving" | "sending" | "success" | "error";
+type QuotePhase = "idle" | "loading" | "refreshing" | "ready" | "empty" | "failed";
 
 const DEADLINE_SECONDS = 1_200;
+
+/** Bounded backoff for transient quoter / RPC failures. */
+const QUOTE_RETRIES = 3;
 
 export function SwapScreen({
   protocol,
@@ -54,7 +50,7 @@ export function SwapScreen({
   onConnect: () => void;
   onViewBonds: () => void;
   onActivity: (item: Activity) => void;
-  onBondDiscovered: (opened: BondOpenedEvent) => void;
+  onBondDiscovered: (opened: BondOpenedEvent, taken?: BondTakenEvent) => void;
   onSwapConfirmed: () => void;
 }) {
   const { deployment, constants, poolConfig, token0, token1 } = protocol;
@@ -68,7 +64,8 @@ export function SwapScreen({
   const [toleranceText, setToleranceText] = useState("1.50");
   const [flow, setFlow] = useState<FlowState>("idle");
   const [txHash, setTxHash] = useState<Hex | undefined>();
-  const [message, setMessage] = useState("");
+  const [approvalError, setApprovalError] = useState("");
+  const [swapError, setSwapError] = useState("");
   const [submitted, setSubmitted] = useState<SubmittedSummary | undefined>();
   const [outcome, setOutcome] = useState<
     { kind: "bonded"; bondId: Hex; collateral?: bigint; currency?: Address } | { kind: "unbonded" } | undefined
@@ -89,15 +86,10 @@ export function SwapScreen({
   const toleranceBps = parseToleranceBps(toleranceText);
 
   const thresholds = useMemo(
-    () =>
-      poolConfig ? thresholdsFor({ config: poolConfig, deployment, kind, zeroForOne }) : undefined,
+    () => (poolConfig ? thresholdsFor({ config: poolConfig, deployment, kind, zeroForOne }) : undefined),
     [poolConfig, deployment, kind, zeroForOne],
   );
-  const collateralToken = thresholds
-    ? thresholds.collateralIsCurrency0
-      ? token0
-      : token1
-    : undefined;
+  const collateralToken = thresholds ? (thresholds.collateralIsCurrency0 ? token0 : token1) : undefined;
 
   const quoteHookData = useMemo(() => {
     // Quoting needs a valid version-2 payload too: an enabled pool decodes hookData in
@@ -112,13 +104,13 @@ export function SwapScreen({
 
   const quoteEnabled = Boolean(
     protocol.canTrade
-    && protocol.rpcOnline
-    && constants
-    && quoteHookData
-    && specifiedAmount !== undefined
-    && specifiedAmount > 0n
-    && payToken
-    && receiveToken,
+      && protocol.rpcOnline
+      && constants
+      && quoteHookData
+      && specifiedAmount !== undefined
+      && specifiedAmount > 0n
+      && payToken
+      && receiveToken,
   );
 
   const quoteArgs = useMemo(
@@ -140,14 +132,37 @@ export function SwapScreen({
     chainId: deployment.chainId,
     functionName: kind === "exactInput" ? "quoteExactInputSingle" : "quoteExactOutputSingle",
     args: quoteArgs,
-    query: { enabled: quoteEnabled, refetchInterval: 5_000 },
+    query: {
+      enabled: quoteEnabled,
+      refetchInterval: 5_000,
+      // A rate-limited or briefly unreachable RPC is a transient condition, not a failed
+      // quote. Retry with bounded backoff; the figure itself is withheld meanwhile.
+      retry: QUOTE_RETRIES,
+      retryDelay: (attempt: number) => Math.min(1_000 * 2 ** attempt, 8_000),
+    },
   });
 
-  const quoteValue = quoteEnabled ? readQuote(quoteRead.data) : undefined;
-  const quoteLoading = quoteEnabled && (quoteRead.isLoading || quoteRead.isFetching);
-  const quoteFailed = quoteEnabled && quoteRead.isError;
-  const noLiquidity = quoteFailed && isLiquidityError(quoteRead.error);
-  const quoteReady = quoteEnabled && !quoteLoading && !quoteFailed && quoteValue !== undefined && quoteValue > 0n;
+  const quoteErrored = quoteEnabled && quoteRead.isError;
+  const noLiquidity = quoteErrored && isLiquidityError(quoteRead.error);
+
+  // A QUOTE IN DOUBT IS NO QUOTE. While a refetch is failing, the previous figure is
+  // withheld rather than shown: a stale minimum-received is worse than an empty one,
+  // because the user could sign against a bound derived from an older pool state.
+  const quoteValue = quoteEnabled && !quoteErrored ? readQuote(quoteRead.data) : undefined;
+  const quoteReady = quoteEnabled && !quoteErrored && quoteValue !== undefined && quoteValue > 0n;
+  const hadQuote = readQuote(quoteRead.data) !== undefined;
+
+  const quotePhase: QuotePhase = !quoteEnabled
+    ? "idle"
+    : quoteErrored && hadQuote && !noLiquidity
+      ? "refreshing"
+      : noLiquidity
+        ? "empty"
+        : quoteErrored
+          ? "failed"
+          : quoteReady
+            ? "ready"
+            : "loading";
 
   // For exact output the collateral currency IS the input, and the variable leg IS the
   // consumed input, so both BMB-01 gates measure the same quantity. The larger of the two is
@@ -180,7 +195,10 @@ export function SwapScreen({
       });
       return [{ kind, ...result } as const, undefined] as const;
     } catch (error) {
-      return [undefined, error instanceof LimitError ? error.message : "Swap limits could not be prepared."] as const;
+      return [
+        undefined,
+        error instanceof LimitError ? error.message : "Swap limits could not be prepared.",
+      ] as const;
     }
   }, [constants, quoteValue, toleranceBps, kind, poolConfig?.bondingEnabled, exactOutputBondingMinimum]);
 
@@ -228,56 +246,27 @@ export function SwapScreen({
   const permit2Allowance = permit2AllowanceRead.data as readonly [bigint, number, number] | undefined;
   const permit2Amount = permit2Allowance ? BigInt(permit2Allowance[0]) : 0n;
   const permit2Expiry = permit2Allowance ? BigInt(permit2Allowance[1]) : 0n;
-  const permit2Live = permit2Expiry > BigInt(Math.floor(Date.now() / 1000) + 60);
 
-  const spendingReady = Boolean(
-    spend && tokenAllowance >= spend.amount && permit2Amount >= spend.amount && permit2Live,
-  );
+  // Sufficiency is judged against THIS swap; the grant, when one is needed, covers a session.
+  // That asymmetry is what lets the second and later demo swaps skip approval entirely.
+  const allowance = spend
+    ? allowanceStatus({
+        swapRequirement: spend.amount,
+        tokenAllowance,
+        permit2Amount,
+        permit2Expiration: permit2Expiry,
+        nowSeconds: Math.floor(Date.now() / 1000),
+      })
+    : undefined;
+  const spendingReady = Boolean(allowance?.ready);
   const balanceCovers = balance === undefined || (spend ? balance >= spend.amount : true);
 
-  // Pre-trade collateral estimate. It uses quote-time pool state, and the rate depends on
-  // ordering inside the block the transaction lands in, so it is only ever an estimate.
-  const accumulatorRead = useReadContract({
-    address: deployment.hook,
-    abi: bondMeBroAbi,
-    chainId: deployment.chainId,
-    functionName: "accumulator",
-    args: [deployment.poolId],
-    query: { enabled: protocol.rpcOnline, refetchInterval: 10_000 },
-  });
-  const accumulator = accumulatorRead.data as readonly [number, number, number, bigint] | undefined;
-
-  const estimate = useMemo(() => {
-    if (!constants || !quoteReady || quoteValue === undefined || !accumulator) return undefined;
-    // Without a simulation of this exact swap we cannot know tickAfter. Use the pool's
-    // current displacement from the block start as the visible floor of the rate: it is
-    // labelled an estimate and never presented as the amount that will be taken.
-    const lastTick = BigInt(accumulator[0]);
-    const blockStartTick = BigInt(accumulator[2]);
-    const impact = effectiveImpactTicks({ tickBefore: lastTick, tickAfter: lastTick, blockStartTick });
-    const bps = collateralBpsForImpact(impact, constants);
-    // Exact input: the variable leg is the realized output, which the quote already reports
-    // NET of collateral, so this is a lower bound. Exact output: the variable leg is the
-    // pool input, which the quoted total already includes collateral in.
-    const variableLeg = quoteValue;
-    return { bps, amount: collateralFromVariableLeg(variableLeg, bps, constants) };
-  }, [constants, quoteReady, quoteValue, accumulator]);
-
-  const eligibility = useMemo(() => {
-    if (!poolConfig || !thresholds) return undefined;
-    return bondEligibility({
-      config: poolConfig,
-      thresholds,
-      consumedInput: kind === "exactInput" ? specifiedAmount : undefined,
-      variableLeg: kind === "exactInput" ? quoteValue : quoteValue,
-    });
-  }, [poolConfig, thresholds, kind, specifiedAmount, quoteValue]);
-
   useEffect(() => {
-    // Any change to what is being traded invalidates a finished result: a success panel
-    // must never describe a request the form no longer shows.
+    // Any change to what is being traded invalidates a finished result: a success line must
+    // never describe a request the form no longer shows.
     setFlow("idle");
-    setMessage("");
+    setApprovalError("");
+    setSwapError("");
     setTxHash(undefined);
     setSubmitted(undefined);
     setOutcome(undefined);
@@ -287,21 +276,26 @@ export function SwapScreen({
 
   const canSubmit = Boolean(
     isConnected
-    && networkCorrect
-    && protocol.canTrade
-    && protocol.rpcOnline
-    && account
-    && constants
-    && payToken
-    && receiveToken
-    && specifiedAmount !== undefined
-    && specifiedAmount > 0n
-    && quoteReady
-    && limits
-    && spend
-    && spendingReady
-    && balanceCovers
-    && !busy,
+      && networkCorrect
+      && protocol.canTrade
+      && protocol.rpcOnline
+      && account
+      && constants
+      && payToken
+      && receiveToken
+      && specifiedAmount !== undefined
+      && specifiedAmount > 0n
+      && quoteReady
+      && limits
+      && spend
+      && spendingReady
+      && balanceCovers
+      && !busy,
+  );
+
+  // Wallet setup is a small secondary state, never a wizard bolted onto the main button.
+  const needsWalletSetup = Boolean(
+    isConnected && networkCorrect && spend && quoteReady && !spendingReady && !busy,
   );
 
   function intended(): IntendedContext | undefined {
@@ -309,25 +303,38 @@ export function SwapScreen({
     return { address: account, chainId: walletChainId };
   }
 
-  async function approveSpending() {
+  async function prepareWallet() {
     const context = intended();
     if (!context || !publicClient || !payToken || !spend) return;
     setFlow("approving");
-    setMessage("");
+    // A new attempt clears the previous failure; a stale message must never sit under a
+    // subsequently successful action.
+    setApprovalError("");
+    setSwapError("");
     try {
-      // Re-verify before EVERY wallet request, including between the two approvals: the
-      // user can switch account or network while the first receipt is being awaited.
+      // Re-verify before EVERY wallet request, including between the two grants: the user can
+      // switch account or network while the first receipt is being awaited.
       assertContext(context, { address: account, chainId: walletChainId });
 
-      if (tokenAllowance < spend.amount) {
-        const hash = await writeContractAsync({
+      const sessionAmount = sessionAllowanceFor(spend.amount);
+
+      if (!allowance?.tokenReady) {
+        const call = {
           address: payToken.address,
           abi: erc20Abi,
           functionName: "approve",
-          args: [deployment.permit2, spend.amount],
+          args: [deployment.permit2, sessionAmount],
           account: context.address,
+        } as const;
+
+        const { hash } = await submitWithBoundedGas({
+          call,
           chainId: context.chainId,
+          label: `${payToken.symbol} approval`,
+          estimateGas: (c) => publicClient.estimateContractGas(c),
+          write: (c) => writeContractAsync(c),
         });
+
         assertReceiptSucceeded(
           await publicClient.waitForTransactionReceipt({ hash }),
           `${payToken.symbol} approval`,
@@ -336,29 +343,35 @@ export function SwapScreen({
 
       assertContext(context, { address: account, chainId: walletChainId });
 
-      if (permit2Amount < spend.amount || !permit2Live) {
-        // A BOUNDED grant: exactly this swap's requirement, for one hour. The previous
-        // build requested uint160 max for 30 days and called it "approve once".
-        const expiration = Math.floor(Date.now() / 1000) + 3_600;
-        const hash = await writeContractAsync({
+      if (!allowance?.permit2Ready) {
+        // A BOUNDED SESSION grant, expiring in one hour. Not uint160 max, and not exactly one
+        // swap either — the latter made every demo trade re-approve.
+        const expiration = sessionExpiry(Math.floor(Date.now() / 1000));
+        const call = {
           address: deployment.permit2,
           abi: permit2Abi,
           functionName: "approve",
-          args: [payToken.address, deployment.universalRouter, spend.amount, expiration],
+          args: [payToken.address, deployment.universalRouter, sessionAmount, expiration],
           account: context.address,
+        } as const;
+
+        const { hash } = await submitWithBoundedGas({
+          call,
           chainId: context.chainId,
+          label: "Permit2 approval",
+          estimateGas: (c) => publicClient.estimateContractGas(c),
+          write: (c) => writeContractAsync(c),
         });
-        assertReceiptSucceeded(
-          await publicClient.waitForTransactionReceipt({ hash }),
-          "Permit2 approval",
-        );
+
+        assertReceiptSucceeded(await publicClient.waitForTransactionReceipt({ hash }), "Permit2 approval");
       }
 
       await Promise.all([tokenAllowanceRead.refetch(), permit2AllowanceRead.refetch()]);
+      setApprovalError("");
       setFlow("idle");
     } catch (error) {
       setFlow("error");
-      setMessage(describeError(error));
+      setApprovalError(describeError(error));
     }
   }
 
@@ -368,7 +381,8 @@ export function SwapScreen({
     if (specifiedAmount === undefined) return;
 
     setFlow("sending");
-    setMessage("");
+    setApprovalError("");
+    setSwapError("");
     setTxHash(undefined);
     setOutcome(undefined);
 
@@ -423,387 +437,413 @@ export function SwapScreen({
       };
       setSubmitted(frozen);
 
-      const hash = await writeContractAsync({
+      // The deadline is computed ONCE. Estimating one set of arguments and signing another
+      // would make the estimate meaningless.
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + DEADLINE_SECONDS);
+
+      const execute = {
         address: deployment.universalRouter,
         abi: universalRouterAbi,
         functionName: "execute",
-        args: [plan.commands, plan.inputs, BigInt(Math.floor(Date.now() / 1000) + DEADLINE_SECONDS)],
+        args: [plan.commands, plan.inputs, deadline],
         account: context.address,
+      } as const;
+
+      // Estimate the EXACT transaction about to be sent, through this app's own chain-bound
+      // client rather than leaving the limit to the wallet.
+      const { hash, gas } = await submitWithBoundedGas({
+        call: execute,
         chainId: context.chainId,
+        label: "swap",
+        estimateGas: (c) => publicClient.estimateContractGas(c),
+        write: (c) => writeContractAsync(c),
       });
+
+      setSubmitted({ ...frozen, gasLimit: gas });
       setTxHash(hash);
 
-      const receipt = assertReceiptSucceeded(
-        await publicClient.waitForTransactionReceipt({ hash }),
-        "swap",
-      );
+      const receipt = assertReceiptSucceeded(await publicClient.waitForTransactionReceipt({ hash }), "swap");
 
-      const result = interpretSwapReceipt({
-        logs: receipt.logs,
-        hookAddress: deployment.hook,
-        poolId: deployment.poolId,
-        refundRecipient: context.address,
-      });
+      // ---------------------------------------------------------------------------------
+      // THE SWAP HAS SUCCEEDED. Nothing below may present it as a failure.
+      // ---------------------------------------------------------------------------------
+      setFlow("success");
+      setSwapError("");
 
-      if (result.kind === "bonded") {
-        onBondDiscovered(result.opened);
-        setOutcome({
-          kind: "bonded",
-          bondId: result.opened.bondId,
-          collateral: result.taken?.bond,
-          currency: result.taken?.currency,
+      try {
+        const result = interpretSwapReceipt({
+          logs: receipt.logs,
+          hookAddress: deployment.hook,
+          poolId: deployment.poolId,
+          refundRecipient: context.address,
         });
-        onActivity({
-          kind: "OPENED",
-          block: receipt.blockNumber.toString(),
-          hash,
-          logIndex: result.opened.logIndex,
-          detail: `Bond opened · matures at block ${result.opened.maturityBlock}`,
-        });
-      } else {
-        // No BondOpened is a normal outcome, not a missing event to keep waiting for.
-        setOutcome({ kind: "unbonded" });
-        onActivity({
-          kind: "UNBONDED",
-          block: receipt.blockNumber.toString(),
-          hash,
-          detail: "Swap executed with no bond",
-        });
+
+        if (result.kind === "bonded") {
+          // Straight into the store, so the card is on screen before any log scan runs.
+          onBondDiscovered(result.opened, result.taken);
+          setOutcome({
+            kind: "bonded",
+            bondId: result.opened.bondId,
+            collateral: result.taken?.bond,
+            currency: result.taken?.currency,
+          });
+          onActivity({
+            kind: "OPENED",
+            block: receipt.blockNumber.toString(),
+            hash,
+            logIndex: result.opened.logIndex,
+            detail: `Bond opened · matures at block ${result.opened.maturityBlock}`,
+          });
+        } else {
+          // No BondOpened is a normal outcome, not a missing event to keep waiting for.
+          setOutcome({ kind: "unbonded" });
+          onActivity({
+            kind: "UNBONDED",
+            block: receipt.blockNumber.toString(),
+            hash,
+            detail: "Swap executed with no bond",
+          });
+        }
+      } catch {
+        // Decoding failed; the swap still happened. Say so, and keep recovering.
+        setOutcome(undefined);
       }
 
-      setFlow("success");
       onSwapConfirmed();
     } catch (error) {
       setFlow("error");
-      setMessage(describeError(error));
+      setSwapError(describeError(error));
     }
   }
 
-  const status = swapStatus({
-    isConnected,
-    networkCorrect,
-    canTrade: protocol.canTrade,
-    rpcOnline: protocol.rpcOnline,
-    metadataReady: Boolean(payToken && receiveToken),
-    amountProblem,
-    hasAmount: specifiedAmount !== undefined && specifiedAmount > 0n,
-    quoteLoading,
-    quoteFailed,
-    noLiquidity,
-    quoteReady,
-    balanceCovers,
-    spendingReady,
-    flow,
-  });
-
-  const pickerOptions = [token0, token1]
-    .filter((token): token is TokenMeta => Boolean(token))
-    .map((token) => ({ symbol: token.symbol, icon: token.symbol.slice(0, 1) }));
+  const observationBlocks = protocol.observationBlocks ?? 10n;
+  const pickable = [token0, token1].filter((item): item is TokenMeta => Boolean(item));
+  const boundLabel = kind === "exactInput" ? "Minimum received" : "Maximum input";
+  const boundValue =
+    limits?.kind === "exactInput" && receiveToken
+      ? `${formatAmount(limits.amountOutMinimum, receiveToken.decimals, 6)} ${receiveToken.symbol}`
+      : limits?.kind === "exactOutput" && payToken
+        ? `${formatAmount(limits.amountInMaximum, payToken.decimals, 6)} ${payToken.symbol}`
+        : "—";
 
   return (
-    <div className="swap-screen-uniswap swap-screen-minimal">
-      <section className="swap-layout swap-layout-uniswap swap-layout-solo">
-        <article className="neo-card swap-card">
-          <div className="swap-mode-switch" role="group" aria-label="Swap kind">
+    <div className="page">
+      <span className="eyebrow">Refundable collateral</span>
+      <h1 className="page-title">Swap normally. Bond automatically.</h1>
+      <p className="page-sub">
+        Temporary collateral for high-impact swaps. Settles after {observationBlocks.toString()} blocks.
+      </p>
+
+      <section className="swap-card">
+        <div className="swap-head">
+          <h2>Swap</h2>
+          <div className="segmented" role="group" aria-label="Swap kind">
             <button
               type="button"
-              className={kind === "exactInput" ? "outline-button swap-mode-active" : "outline-button"}
+              className={kind === "exactInput" ? "active" : undefined}
               onClick={() => setKind("exactInput")}
             >
-              Exact input
+              Exact Input
             </button>
             <button
               type="button"
-              className={kind === "exactOutput" ? "outline-button swap-mode-active" : "outline-button"}
+              className={kind === "exactOutput" ? "active" : undefined}
               onClick={() => setKind("exactOutput")}
             >
-              Exact output
+              Exact Output
             </button>
           </div>
+        </div>
 
-          <div className="swap-token-panel swap-sell-panel">
-            <div className="field-label uniswap-field-label">
-              <span>{kind === "exactInput" ? "Sell exactly" : "Sell at most"}</span>
-              <span>
-                Balance {payToken ? formatToken(balance, payToken) : "—"}
-              </span>
-            </div>
-            <div className="amount-line uniswap-amount-line">
-              {kind === "exactInput" ? (
-                <input
-                  aria-label="Input amount"
-                  value={amountText}
-                  onChange={(event) => setAmountText(event.target.value)}
-                  inputMode="decimal"
-                  placeholder="0.00"
-                />
-              ) : (
-                <strong className="quoted-output-value" aria-live="polite">
-                  {limits?.kind === "exactOutput" && payToken
-                    ? formatAmount(limits.amountInMaximum, payToken.decimals)
-                    : quoteLoading
-                      ? "…"
-                      : "—"}
-                </strong>
-              )}
-              {payToken && (
-                <TokenPicker
-                  label="Pay token"
-                  token={{ symbol: payToken.symbol, icon: payToken.symbol.slice(0, 1) }}
-                  options={pickerOptions}
-                  onChange={(symbol) => setPayIsCurrency0(symbol === token0?.symbol)}
-                />
-              )}
-            </div>
+        <div className="token-box">
+          <div className="token-box-label">
+            <span>{kind === "exactInput" ? "Pay" : "Pay at most"}</span>
+            <span>
+              {payToken && balance !== undefined ? `Balance ${formatAmount(balance, payToken.decimals, 4)}` : ""}
+            </span>
           </div>
-
-          <button
-            type="button"
-            className="direction-button swap-direction-button"
-            aria-label="Switch swap direction"
-            onClick={() => setPayIsCurrency0((value) => !value)}
-          >
-            ↕
-          </button>
-
-          <div className="swap-token-panel swap-buy-panel">
-            <div className="field-label uniswap-field-label">
-              <span>{kind === "exactInput" ? "Buy at least" : "Buy exactly"}</span>
-              <span>{quoteLoading ? "Quoting…" : kind === "exactInput" ? "Net of collateral" : "Exact"}</span>
-            </div>
-            <div className="amount-line uniswap-amount-line">
-              {kind === "exactOutput" ? (
-                <input
-                  aria-label="Output amount"
-                  value={amountText}
-                  onChange={(event) => setAmountText(event.target.value)}
-                  inputMode="decimal"
-                  placeholder="0.00"
-                />
-              ) : (
-                <strong className="quoted-output-value" aria-live="polite">
-                  {quoteReady && receiveToken ? formatAmount(quoteValue, receiveToken.decimals) : quoteLoading ? "…" : "—"}
-                </strong>
-              )}
-              {receiveToken && (
-                <TokenPicker
-                  label="Receive token"
-                  token={{ symbol: receiveToken.symbol, icon: receiveToken.symbol.slice(0, 1) }}
-                  options={pickerOptions}
-                  onChange={(symbol) => setPayIsCurrency0(symbol !== token0?.symbol)}
-                />
-              )}
-            </div>
-            <div className="minimum-output-control">
-              <div>
-                <span>Slippage tolerance</span>
-                <small>
-                  {constants && toleranceBps !== undefined && toleranceCoversCollateralCap(toleranceBps, constants)
-                    ? "covers the collateral cap"
-                    : "below the 1% collateral cap"}
-                </small>
-              </div>
+          <div className="token-row">
+            {kind === "exactInput" ? (
               <input
-                aria-label="Slippage tolerance in percent"
-                value={toleranceText}
-                onChange={(event) => setToleranceText(event.target.value)}
+                className="amount"
+                aria-label="Amount to pay"
+                value={amountText}
+                onChange={(event) => setAmountText(event.target.value)}
                 inputMode="decimal"
-                placeholder="1.50"
+                placeholder="0"
               />
+            ) : (
+              <span className={`amount readonly${limits ? "" : " dim"}`} aria-live="polite">
+                {limits?.kind === "exactOutput" && payToken
+                  ? formatAmount(limits.amountInMaximum, payToken.decimals, 6)
+                  : "0"}
+              </span>
+            )}
+            <TokenPill token={payToken} options={pickable} onPick={(s) => setPayIsCurrency0(s === token0?.symbol)} />
+          </div>
+        </div>
+
+        <button
+          type="button"
+          className="switch-btn"
+          aria-label="Switch direction"
+          onClick={() => setPayIsCurrency0((value) => !value)}
+        >
+          ↓
+        </button>
+
+        <div className="token-box">
+          <div className="token-box-label">
+            <span>{kind === "exactInput" ? "Receive" : "Receive exactly"}</span>
+            <span>{quotePhase === "refreshing" ? "Refreshing…" : ""}</span>
+          </div>
+          <div className="token-row">
+            {kind === "exactOutput" ? (
+              <input
+                className="amount"
+                aria-label="Amount to receive"
+                value={amountText}
+                onChange={(event) => setAmountText(event.target.value)}
+                inputMode="decimal"
+                placeholder="0"
+              />
+            ) : (
+              <span className={`amount readonly${quoteReady ? "" : " dim"}`} aria-live="polite">
+                {quoteReady && receiveToken ? formatAmount(quoteValue, receiveToken.decimals, 6) : "0"}
+              </span>
+            )}
+            <TokenPill
+              token={receiveToken}
+              options={pickable}
+              onPick={(s) => setPayIsCurrency0(s !== token0?.symbol)}
+            />
+          </div>
+        </div>
+
+        <div className="detail-list">
+          <div className="detail-row">
+            <span>{boundLabel}</span>
+            <strong>{boundValue}</strong>
+          </div>
+          <div className="detail-row">
+            <span>Pool fee</span>
+            <strong>{(deployment.fee / 10_000).toFixed(2)}%</strong>
+          </div>
+          <div className="detail-row">
+            <span>Maturity</span>
+            <strong>{observationBlocks.toString()} blocks</strong>
+          </div>
+        </div>
+
+        <div className="collateral-note">
+          Collateral determined at execution. <strong>Maximum protocol collateral: 1%.</strong>
+        </div>
+
+        {needsWalletSetup && (
+          <>
+            <div className="setup-line">
+              <span>Wallet setup required.</span>
             </div>
-          </div>
-
-          <div className="swap-detail-list">
-            {kind === "exactInput" && limits?.kind === "exactInput" && receiveToken && (
-              <div>
-                <span>Minimum received</span>
-                <strong>{formatAmount(limits.amountOutMinimum, receiveToken.decimals)} {receiveToken.symbol}</strong>
-              </div>
-            )}
-            {kind === "exactOutput" && limits?.kind === "exactOutput" && payToken && (
-              <>
-                <div>
-                  <span>Quoted total input</span>
-                  <strong>
-                    {formatAmount(limits.quotedTotalInput, payToken.decimals)} {payToken.symbol}
-                  </strong>
-                </div>
-                <div>
-                  <span>Maximum total input</span>
-                  <strong>{formatAmount(limits.amountInMaximum, payToken.decimals)} {payToken.symbol}</strong>
-                </div>
-                <div>
-                  <span>Maximum refundable collateral</span>
-                  <strong>
-                    {limits.ceilingIsProvenUnbonded
-                      ? "none — this trade cannot bond"
-                      : `${formatAmount(limits.maxBondAmount, payToken.decimals)} ${payToken.symbol}`}
-                  </strong>
-                </div>
-              </>
-            )}
-            {estimate && collateralToken && (
-              <div>
-                <span>Estimated collateral</span>
-                <strong>
-                  {formatAmount(estimate.amount, collateralToken.decimals)} {collateralToken.symbol}
-                  {" · "}
-                  {formatBps(estimate.bps)}
-                </strong>
-              </div>
-            )}
-            {collateralToken && (
-              <div>
-                <span>Collateral currency</span>
-                <strong>{collateralToken.symbol}</strong>
-              </div>
-            )}
-            {protocol.observationBlocks !== undefined && protocol.blockNumber !== undefined && (
-              <div>
-                <span>Estimated maturity</span>
-                <strong>Block {(protocol.blockNumber + protocol.observationBlocks).toString()}</strong>
-              </div>
-            )}
-          </div>
-
-          <div className="risk-callout">
-            <span>ⓘ</span>
-            <p>
-              {kind === "exactInput"
-                ? "You choose how much input to swap. BondMeBro may temporarily withhold a small part of the output as refundable collateral."
-                : "You choose the exact output. BondMeBro may temporarily require additional input as refundable collateral."}{" "}
-              How much depends on how far this pool&apos;s price has already moved in the block your transaction lands
-              in, which depends on transaction ordering and cannot be known in advance. It never exceeds 1% of the
-              realized variable side. The figure above is an estimate, not a maximum.
-            </p>
-          </div>
-
-          {!protocol.canTrade && (
-            <div className="pair-warning">Configuration error: {protocol.configurationProblems[0]}</div>
-          )}
-          {protocol.tokenMetadataError && <div className="pair-warning">{protocol.tokenMetadataError}</div>}
-          {!protocol.rpcOnline && <div className="pair-warning">RPC unavailable.</div>}
-          {amountProblem && <div className="pair-warning">{amountProblem}</div>}
-          {noLiquidity && <div className="pair-warning">This pool has no usable liquidity for that size.</div>}
-          {limitProblem && quoteReady && <div className="pair-warning">{limitProblem}</div>}
-          {quoteFailed && !noLiquidity && <div className="pair-warning">Quote unavailable.</div>}
-          {eligibility && !eligibility.eligible && quoteReady && (
-            <div className="pair-warning">{eligibility.reason} The swap itself is unaffected.</div>
-          )}
-          {spend && !spendingReady && isConnected && networkCorrect && payToken && (
-            <div className="pair-warning">
-              Approve {formatAmount(spend.amount, payToken.decimals)} {payToken.symbol} for this swap.
-            </div>
-          )}
-
-          <div className={`swap-status swap-status-${status.tone}`}>
-            <StatusDot live={status.tone === "ready" || status.tone === "success"} />
-            <div>
-              <strong>{status.title}</strong>
-              <span>{status.detail}</span>
-            </div>
-          </div>
-
-          {spend && !spendingReady && isConnected && networkCorrect && payToken && quoteReady && (
-            <button
-              type="button"
-              className="outline-button full-button prepare-token-button"
-              disabled={busy}
-              onClick={() => void approveSpending()}
-            >
-              {flow === "approving"
-                ? `Approving ${payToken.symbol}…`
-                : `Approve ${formatAmount(spend.amount, payToken.decimals)} ${payToken.symbol}`}
+            <button type="button" className="cta-ghost" disabled={busy} onClick={() => void prepareWallet()}>
+              {flow === "approving" ? "Preparing wallet…" : "Prepare wallet"}
             </button>
-          )}
-          {spend && !spendingReady && payToken && (
-            <p className="approval-disclosure">
-              Two approvals, both bounded to this swap: {payToken.symbol} to Permit2 for{" "}
-              {formatAmount(spend.amount, payToken.decimals)} {payToken.symbol}, then Permit2 to the Universal Router at{" "}
-              {deployment.universalRouter} for the same amount, expiring in one hour.
-            </p>
-          )}
+          </>
+        )}
 
-          <button
-            type="button"
-            className="primary-button large-button full-button swap-submit-button"
-            disabled={busy || (isConnected && networkCorrect && !canSubmit)}
-            onClick={() => {
-              if (!isConnected) onConnect();
-              else if (!networkCorrect) switchChain({ chainId: deployment.chainId });
-              else void submitSwap();
-            }}
-          >
-            {submitLabel({
-              flow,
-              isConnected,
-              networkCorrect,
-              networkName: deployment.networkName,
-              canTrade: protocol.canTrade,
-              quoteReady,
-              spendingReady,
-              balanceCovers,
-              kind,
-            })}{" "}
-            <span>→</span>
-          </button>
+        <button
+          type="button"
+          className="cta"
+          disabled={busy || (isConnected && networkCorrect && !canSubmit)}
+          onClick={() => {
+            if (!isConnected) onConnect();
+            else if (!networkCorrect) switchChain({ chainId: deployment.chainId });
+            else void submitSwap();
+          }}
+        >
+          {ctaLabel({
+            flow,
+            isConnected,
+            networkCorrect,
+            networkName: deployment.networkName,
+            canTrade: protocol.canTrade,
+            hasAmount: specifiedAmount !== undefined && specifiedAmount > 0n,
+            quotePhase,
+            balanceCovers,
+            spendingReady,
+          })}
+        </button>
 
-          {flow === "error" && <div className="transaction-message transaction-error">{message}</div>}
+        <StatusLine
+          flow={flow}
+          quotePhase={quotePhase}
+          outcome={outcome}
+          collateralToken={collateralToken}
+          explorer={txHash ? explorerTx(deployment, txHash) : undefined}
+          error={approvalError || swapError || amountProblem || limitProblem}
+          onViewBonds={onViewBonds}
+          onRetryQuote={() => void quoteRead.refetch()}
+        />
 
-          {submitted && (flow === "sending" || flow === "success") && (
-            <div className="submitted-summary">
-              <span className="eyebrow">SUBMITTED REQUEST</span>
-              <div>
-                <span>Kind</span>
-                <strong>{submitted.kind === "exactInput" ? "Exact input" : "Exact output"}</strong>
-              </div>
-              <div>
-                <span>Pay</span>
-                <strong>{submitted.primaryAmount}</strong>
-              </div>
-              <div>
-                <span>Receive</span>
-                <strong>{submitted.secondaryAmount}</strong>
-              </div>
-              <div>
-                <span>Refund recipient</span>
-                <strong>{submitted.refundRecipient}</strong>
-              </div>
-              <div>
-                <span>Collateral ceiling</span>
-                <strong>{submitted.maxBondAmountLabel}</strong>
-              </div>
+        <details className="advanced">
+          <summary>Advanced details</summary>
+          <div className="detail-list">
+            <div className="detail-row">
+              <span>Slippage tolerance</span>
+              <strong>
+                <input
+                  className="inline-input"
+                  aria-label="Slippage tolerance in percent"
+                  value={toleranceText}
+                  onChange={(event) => setToleranceText(event.target.value)}
+                  inputMode="decimal"
+                />
+                %
+              </strong>
             </div>
-          )}
-
-          {flow === "success" && txHash && (
-            <div className="transaction-message transaction-success">
-              {outcome?.kind === "bonded" ? (
-                <>
-                  Swap succeeded and opened a bond.
-                  {outcome.collateral !== undefined && collateralToken && (
-                    <> Actual collateral {formatAmount(outcome.collateral, collateralToken.decimals)} {collateralToken.symbol}.</>
-                  )}{" "}
-                  <a href={explorerTx(deployment, txHash)} target="_blank" rel="noreferrer">
-                    View ↗
-                  </a>
-                  <button type="button" className="text-button success-next-button" onClick={onViewBonds}>
-                    Track →
-                  </button>
-                </>
-              ) : (
-                <>
-                  Unbonded swap. This trade executed in full and created no bond, which is a normal outcome.{" "}
-                  <a href={explorerTx(deployment, txHash)} target="_blank" rel="noreferrer">
-                    View ↗
-                  </a>
-                </>
-              )}
+            <div className="detail-row">
+              <span>Collateral currency</span>
+              <strong>{collateralToken?.symbol ?? "—"}</strong>
             </div>
-          )}
-        </article>
+            <div className="detail-row">
+              <span>Pool</span>
+              <strong>{deployment.poolId.slice(0, 14)}…</strong>
+            </div>
+            {submitted?.gasLimit !== undefined && (
+              <div className="detail-row">
+                <span>Gas limit signed</span>
+                <strong>{submitted.gasLimit.toString()}</strong>
+              </div>
+            )}
+            {submitted && (
+              <div className="detail-row">
+                <span>hookData</span>
+                <strong>{submitted.hookData}</strong>
+              </div>
+            )}
+          </div>
+        </details>
       </section>
     </div>
+  );
+}
+
+/** Compact inline status. Never a separate full-width card per stage. */
+function StatusLine({
+  flow,
+  quotePhase,
+  outcome,
+  collateralToken,
+  explorer,
+  error,
+  onViewBonds,
+  onRetryQuote,
+}: {
+  flow: FlowState;
+  quotePhase: QuotePhase;
+  outcome?: { kind: "bonded"; collateral?: bigint } | { kind: "unbonded" };
+  collateralToken?: TokenMeta;
+  explorer?: string;
+  error?: string;
+  onViewBonds: () => void;
+  onRetryQuote: () => void;
+}) {
+  if (flow === "approving") {
+    return (
+      <div className="status-line">
+        <span className="spinner" /> Preparing wallet…
+      </div>
+    );
+  }
+
+  if (flow === "sending") {
+    return (
+      <div className="status-line">
+        <span className="spinner" /> Swapping…
+      </div>
+    );
+  }
+
+  if (flow === "success") {
+    const bonded = outcome?.kind === "bonded";
+    const held =
+      bonded && outcome.collateral !== undefined && collateralToken
+        ? ` · ${formatAmount(outcome.collateral, collateralToken.decimals, 6)} ${collateralToken.symbol} held`
+        : "";
+    return (
+      <div className="status-line ok">
+        {bonded
+          ? `Bond created ✓${held}`
+          : outcome
+            ? "Swap confirmed ✓ · no bond"
+            : "Swap confirmed. Recovering bond details…"}
+        {explorer && (
+          <a href={explorer} target="_blank" rel="noreferrer">
+            View ↗
+          </a>
+        )}
+        {bonded && (
+          <button type="button" className="link-btn" onClick={onViewBonds}>
+            Bonds →
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (flow === "error" && error) return <div className="status-line bad">{error}</div>;
+  if (error) return <div className="status-line warn">{error}</div>;
+
+  if (quotePhase === "loading") {
+    return (
+      <div className="status-line">
+        <span className="spinner" /> Getting quote…
+      </div>
+    );
+  }
+  if (quotePhase === "refreshing") {
+    return (
+      <div className="status-line">
+        <span className="spinner" /> Refreshing quote…
+      </div>
+    );
+  }
+  if (quotePhase === "empty") return <div className="status-line warn">No liquidity for that size.</div>;
+  if (quotePhase === "failed") {
+    return (
+      <div className="status-line bad">
+        Unable to fetch quote.
+        <button type="button" className="link-btn" onClick={onRetryQuote}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  return <div className="status-line" />;
+}
+
+function TokenPill({
+  token,
+  options,
+  onPick,
+}: {
+  token?: TokenMeta;
+  options: TokenMeta[];
+  onPick: (symbol: string) => void;
+}) {
+  if (!token) return <span className="token-pill">—</span>;
+  return (
+    <span className="token-pill">
+      <span className="token-mark">{token.symbol.slice(0, 1)}</span>
+      {token.symbol}
+      <select aria-label="Token" value={token.symbol} onChange={(event) => onPick(event.target.value)}>
+        {options.map((option) => (
+          <option key={option.symbol} value={option.symbol}>
+            {option.symbol}
+          </option>
+        ))}
+      </select>
+    </span>
   );
 }
 
@@ -821,86 +861,37 @@ export function parseToleranceBps(text: string): bigint | undefined {
   return bps <= 10_000n ? bps : undefined;
 }
 
-function swapStatus({
-  isConnected,
-  networkCorrect,
-  canTrade,
-  rpcOnline,
-  metadataReady,
-  amountProblem,
-  hasAmount,
-  quoteLoading,
-  quoteFailed,
-  noLiquidity,
-  quoteReady,
-  balanceCovers,
-  spendingReady,
-  flow,
-}: {
-  isConnected: boolean;
-  networkCorrect: boolean;
-  canTrade: boolean;
-  rpcOnline: boolean;
-  metadataReady: boolean;
-  amountProblem?: string;
-  hasAmount: boolean;
-  quoteLoading: boolean;
-  quoteFailed: boolean;
-  noLiquidity: boolean;
-  quoteReady: boolean;
-  balanceCovers: boolean;
-  spendingReady: boolean;
-  flow: FlowState;
-}) {
-  if (flow === "approving") return { tone: "pending", title: "Approving", detail: "Confirm the bounded approval." };
-  if (flow === "sending") return { tone: "pending", title: "Confirming swap", detail: "Waiting for a successful receipt." };
-  if (flow === "success") return { tone: "success", title: "Swap succeeded", detail: "Receipt confirmed and parsed." };
-  if (flow === "error") return { tone: "error", title: "Swap not completed", detail: "Read the message and retry." };
-  if (!canTrade) return { tone: "error", title: "Configuration error", detail: "Trading is disabled." };
-  if (!isConnected) return { tone: "warning", title: "Connect your wallet", detail: "The wallet pays and receives." };
-  if (!networkCorrect) return { tone: "warning", title: "Wrong network", detail: "Switch to the configured chain." };
-  if (!rpcOnline) return { tone: "warning", title: "RPC unavailable", detail: "Reads are failing." };
-  if (!metadataReady) return { tone: "pending", title: "Reading token metadata", detail: "Decimals and symbols." };
-  if (amountProblem) return { tone: "warning", title: "Check the amount", detail: amountProblem };
-  if (!hasAmount) return { tone: "warning", title: "Enter an amount", detail: "Nothing to quote yet." };
-  if (quoteLoading) return { tone: "pending", title: "Getting a quote", detail: "Simulating against the pool." };
-  if (noLiquidity) return { tone: "warning", title: "No liquidity", detail: "Try a smaller size." };
-  if (quoteFailed) return { tone: "error", title: "Quote unavailable", detail: "The quoter reverted." };
-  if (!quoteReady) return { tone: "pending", title: "Waiting for a quote", detail: "No usable quote yet." };
-  if (!balanceCovers) return { tone: "warning", title: "Insufficient balance", detail: "The wallet cannot cover this." };
-  if (!spendingReady) return { tone: "warning", title: "Approval needed", detail: "Approve the exact amount below." };
-  return { tone: "ready", title: "Ready", detail: "One confirmation submits the swap." };
-}
-
-function submitLabel({
+function ctaLabel({
   flow,
   isConnected,
   networkCorrect,
   networkName,
   canTrade,
-  quoteReady,
-  spendingReady,
+  hasAmount,
+  quotePhase,
   balanceCovers,
-  kind,
+  spendingReady,
 }: {
   flow: FlowState;
   isConnected: boolean;
   networkCorrect: boolean;
   networkName: string;
   canTrade: boolean;
-  quoteReady: boolean;
-  spendingReady: boolean;
+  hasAmount: boolean;
+  quotePhase: QuotePhase;
   balanceCovers: boolean;
-  kind: SwapKind;
+  spendingReady: boolean;
 }) {
-  if (flow === "approving") return "Approving…";
-  if (flow === "sending") return "Confirming…";
-  if (flow === "success") return "Done";
-  if (!canTrade) return "Trading disabled";
+  if (flow === "sending") return "Swapping…";
+  if (flow === "success") return "Swap confirmed ✓";
+  if (flow === "approving") return "Preparing wallet…";
+  if (!canTrade) return "Unavailable";
   if (!isConnected) return "Connect wallet";
   if (!networkCorrect) return `Switch to ${networkName}`;
-  if (!quoteReady) return "Quote unavailable";
+  if (!hasAmount) return "Enter an amount";
+  if (quotePhase === "loading") return "Getting quote…";
+  if (quotePhase === "empty" || quotePhase === "failed") return "Quote unavailable";
   if (!balanceCovers) return "Insufficient balance";
-  if (!spendingReady) return "Approve first";
-  return kind === "exactInput" ? "Swap exact input" : "Swap exact output";
+  if (!spendingReady) return "Prepare wallet first";
+  return "Swap";
 }

@@ -1,3 +1,6 @@
+import { BaseError, ContractFunctionRevertedError } from "viem";
+
+import { GasEstimateError } from "@/lib/gas";
 import { ContextChangedError, TransactionFailedError } from "@/lib/guards";
 import { HookDataError } from "@/lib/hookData";
 import { LimitError } from "@/lib/limits";
@@ -64,6 +67,7 @@ const CONTRACT_ERRORS: { match: string; message: string }[] = [
 export function describeError(error: unknown): string {
   if (error instanceof ContextChangedError) return error.message;
   if (error instanceof TransactionFailedError) return error.message;
+  if (error instanceof GasEstimateError) return error.message;
   if (error instanceof HookDataError) return `Swap data could not be prepared: ${error.message}`;
   if (error instanceof LimitError) return `Swap limits could not be prepared: ${error.message}`;
 
@@ -104,4 +108,44 @@ export function isLiquidityError(error: unknown): boolean {
     || message.includes("insufficient liquidity")
     || message.includes("no liquidity")
   );
+}
+
+/**
+ * Decodes a revert from a preflight simulation into something a person can act on.
+ *
+ * viem reports an undecodable revert as `reverted with the following reason:` followed by
+ * nothing, which tells the user precisely as much as silence. Because the generated ABI
+ * carries every current custom error, a known revert decodes to its real name and arguments;
+ * an unknown one is reported by selector so it can at least be looked up.
+ *
+ * @param error Thrown by `estimateContractGas` or `simulateContract`.
+ * @param what Short noun for the operation, e.g. "Settlement".
+ */
+export function describePreflightError(error: unknown, what: string): string {
+  if (error instanceof BaseError) {
+    const reverted = error.walk((e) => e instanceof ContractFunctionRevertedError);
+
+    if (reverted instanceof ContractFunctionRevertedError) {
+      // A custom error the generated ABI knows about.
+      if (reverted.data?.errorName) {
+        const args = reverted.data.args ?? [];
+        const rendered = args.length > 0 ? ` (${args.map((a) => String(a)).join(", ")})` : "";
+        const known = CONTRACT_ERRORS.find((entry) =>
+          reverted.data?.errorName?.toLowerCase().includes(entry.match),
+        );
+        return known
+          ? `${known.message} [${reverted.data.errorName}${rendered}]`
+          : `${what} failed: ${reverted.data.errorName}${rendered}`;
+      }
+
+      // A plain string revert.
+      if (reverted.reason) return `${what} failed: ${reverted.reason}`;
+
+      // Unknown selector: report it rather than an empty reason.
+      const raw = reverted.signature ?? reverted.raw;
+      if (raw) return `${what} preflight failed: ${raw}`;
+    }
+  }
+
+  return describeError(error);
 }
