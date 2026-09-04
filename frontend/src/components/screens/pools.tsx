@@ -8,6 +8,7 @@ import { bondMeBroAbi } from "@/lib/abi/bondMeBro";
 import type { Activity } from "@/lib/activity";
 import { explorerAddress, hookPermissionMask } from "@/lib/deployment";
 import { describeError } from "@/lib/errors";
+import { submitWithBoundedGas } from "@/lib/gas";
 import { formatAddress, formatAmount, formatRawUnits } from "@/lib/format";
 import { assertContext, assertReceiptSucceeded, type IntendedContext } from "@/lib/guards";
 import { poolConfigSetterArgs, validatePoolConfig, type PoolConfig } from "@/lib/poolConfig";
@@ -135,7 +136,7 @@ export function PoolsScreen({
               <span className="eyebrow">BOND CONFIGURATION</span>
               <h2>Pool parameters</h2>
             </div>
-            <Badge tone={poolConfig?.bondingEnabled ? "orange" : "muted"}>
+            <Badge tone={poolConfig?.bondingEnabled ? "pink" : "muted"}>
               {protocol.poolConfigError ? "READ FAILED" : poolConfig?.bondingEnabled ? "BONDING ENABLED" : "BONDING DISABLED"}
             </Badge>
           </div>
@@ -304,14 +305,23 @@ function AdminCard({
     setHash(undefined);
     try {
       assertContext(intended, { address: account, chainId: walletChainId });
-      const submitted = await writeContractAsync({
+      const call = {
         address: deployment.hook,
         abi: bondMeBroAbi,
         functionName: "setPoolConfig",
         // Setter order puts bondingEnabled LAST, unlike the getter which puts it third.
         args: poolConfigSetterArgs(deployment, draft),
         account: intended.address,
+      } as const;
+
+      // The same bounded-gas pipeline every other write uses: estimate this exact call,
+      // add a 20% margin, refuse rather than let the wallet pick its own limit.
+      const { hash: submitted } = await submitWithBoundedGas({
+        call,
         chainId: intended.chainId,
+        label: "setPoolConfig",
+        estimateGas: (c) => publicClient.estimateContractGas(c),
+        write: (c) => writeContractAsync(c),
       });
       setHash(submitted);
       const receipt = assertReceiptSucceeded(
@@ -341,7 +351,7 @@ function AdminCard({
           <span className="eyebrow">OWNER CONTROLS</span>
           <h2>BMB-01 participation</h2>
         </div>
-        <Badge tone={isOwner ? "orange" : "muted"}>{isOwner ? "OWNER" : "READ ONLY"}</Badge>
+        <Badge tone={isOwner ? "pink" : "muted"}>{isOwner ? "OWNER" : "READ ONLY"}</Badge>
       </div>
       <p className="card-copy">
         All four minimums are raw units of their own currency. Enabling requires both input minimums above zero and both

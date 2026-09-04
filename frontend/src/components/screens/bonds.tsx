@@ -8,23 +8,27 @@ import { bondMeBroAbi } from "@/lib/abi/bondMeBro";
 import type { Activity } from "@/lib/activity";
 import {
   blocksUntilMaturity,
-  bondStateLabel,
-  canSettle,
   collectBondEvents,
-  maturityProgress,
   normalizeBond,
   BondState,
+  type BondSettledEvent,
 } from "@/lib/bond";
+import { canOfferSettlement, type BondRecord } from "@/lib/bondStore";
 import { explorerTx } from "@/lib/deployment";
-import { describeError } from "@/lib/errors";
-import { formatAddress, formatAmount, formatBps, formatBlock } from "@/lib/format";
-import { assertContext, assertReceiptSucceeded, type IntendedContext } from "@/lib/guards";
+import { describeError, describePreflightError } from "@/lib/errors";
+import { formatAmount, formatBps } from "@/lib/format";
+import { submitWithBoundedGas } from "@/lib/gas";
+import {
+  assertContext,
+  assertReceiptSucceeded,
+  TransactionFailedError,
+  type IntendedContext,
+} from "@/lib/guards";
+import { resolveSettlementOutcome, settlementPreflight } from "@/lib/settlement";
 import { metaForCurrency } from "@/lib/tokenMetadata";
-import type { BondRecord } from "@/lib/useBonds";
 import type { ProtocolState } from "@/lib/useProtocol";
-import { Badge, MetricCard, StatusDot } from "@/components/ui";
 
-type SettleState = "idle" | "sending" | "success" | "error";
+type SettleState = "idle" | "preflight" | "submitted" | "success" | "error";
 
 export function BondsScreen({
   protocol,
@@ -32,8 +36,7 @@ export function BondsScreen({
   unsettled,
   settled,
   loading,
-  error,
-  scanNote,
+  historyStatus,
   account,
   walletChainId,
   isConnected,
@@ -41,14 +44,14 @@ export function BondsScreen({
   onSwap,
   onActivity,
   onRefresh,
+  onSettledFromReceipt,
 }: {
   protocol: ProtocolState;
   records: BondRecord[];
   unsettled: BondRecord[];
   settled: BondRecord[];
   loading: boolean;
-  error?: string;
-  scanNote?: string;
+  historyStatus: "ok" | "syncing" | "unavailable";
   account?: Address;
   walletChainId?: number;
   isConnected: boolean;
@@ -56,6 +59,7 @@ export function BondsScreen({
   onSwap: () => void;
   onActivity: (item: Activity) => void;
   onRefresh: () => void;
+  onSettledFromReceipt: (bondId: Hex, settlement?: BondSettledEvent, txHash?: Hex) => void;
 }) {
   const { deployment, blockNumber, token0, token1 } = protocol;
   const publicClient = usePublicClient({ chainId: deployment.chainId });
@@ -65,375 +69,378 @@ export function BondsScreen({
   const [state, setState] = useState<SettleState>("idle");
   const [activeBondId, setActiveBondId] = useState<Hex | undefined>();
   const [hash, setHash] = useState<Hex | undefined>();
-  const [message, setMessage] = useState("");
+  const [settlementError, setSettlementError] = useState("");
+  const [settlementNote, setSettlementNote] = useState("");
 
   const networkCorrect = walletChainId === deployment.chainId;
-  const busy = state === "sending";
+  const busy = state === "preflight" || state === "submitted";
 
   async function settle(bondId: Hex) {
     if (!account || walletChainId === undefined || !publicClient) return;
     const intended: IntendedContext = { address: account, chainId: walletChainId };
-    setState("sending");
+
+    // A new attempt clears the previous failure. A stale "reverted" message must never sit
+    // underneath a bond that has since settled.
+    setState("preflight");
     setActiveBondId(bondId);
-    setMessage("");
+    setSettlementError("");
+    setSettlementNote("");
     setHash(undefined);
+
+    let submitted: Hex | undefined;
+
     try {
       assertContext(intended, { address: account, chainId: walletChainId });
 
+      // READ-ONLY PREFLIGHT. An immature, absent or already-settled bond must not reach the
+      // wallet at all.
+      const [fresh, currentBlock] = await Promise.all([
+        publicClient.readContract({
+          address: deployment.hook,
+          abi: bondMeBroAbi,
+          functionName: "getBond",
+          args: [bondId],
+        }),
+        publicClient.getBlockNumber(),
+      ]);
+
+      const check = settlementPreflight(normalizeBond(fresh as never), currentBlock);
+      if (!check.ok) {
+        // Storage is the authority: if it says settled, show settled rather than an error.
+        setState(check.alreadySettled ? "success" : "error");
+        if (check.alreadySettled) setSettlementNote(check.reason);
+        else setSettlementError(check.reason);
+        onRefresh();
+        protocol.refresh();
+        return;
+      }
+
       // Settlement is permissionless. The caller does not have to be the refund recipient,
       // and cannot change where the refund goes: it is the bond's stored recipient.
-      const submitted = await writeContractAsync({
+      const call = {
         address: deployment.hook,
         abi: bondMeBroAbi,
         functionName: "settleBond",
         args: [bondId],
         account: intended.address,
-        chainId: intended.chainId,
-      });
+      } as const;
+
+      let gasResult;
+      try {
+        gasResult = await submitWithBoundedGas({
+          call,
+          chainId: intended.chainId,
+          label: "settleBond",
+          estimateGas: (c) => publicClient.estimateContractGas(c),
+          write: (c) => writeContractAsync(c),
+        });
+      } catch (preflightError) {
+        // Decode the REAL revert rather than surfacing an empty reason.
+        setState("error");
+        setSettlementError(describePreflightError(preflightError, "Settlement"));
+        return;
+      }
+
+      submitted = gasResult.hash;
       setHash(submitted);
+      setState("submitted");
 
       const receipt = assertReceiptSucceeded(
         await publicClient.waitForTransactionReceipt({ hash: submitted }),
         "settlement",
       );
 
-      const { settled: settledEvents } = collectBondEvents(receipt.logs, deployment.hook, deployment.poolId);
-      const event = settledEvents.find((item) => item.bondId.toLowerCase() === bondId.toLowerCase());
+      // ---------------------------------------------------------------------------------
+      // FROM HERE THE SETTLEMENT HAS SUCCEEDED. Nothing below may mark it failed.
+      // ---------------------------------------------------------------------------------
+      setState("success");
+      setSettlementError("");
 
-      // Confirm the stored state actually moved to SETTLED before saying so.
-      const after = normalizeBond(
-        (await publicClient.readContract({
-          address: deployment.hook,
-          abi: bondMeBroAbi,
-          functionName: "getBond",
-          args: [bondId],
-        })) as never,
-      );
-      if (after.state !== BondState.Settled) {
-        throw new Error("The settlement transaction succeeded but the bond is not marked settled.");
+      // Highest-priority observation, applied BEFORE any read-back. The settle button
+      // disappears now and no later read may bring it back.
+      onSettledFromReceipt(bondId, undefined, submitted);
+
+      let storageState: BondState | undefined;
+      let postReceiptFailed = false;
+
+      try {
+        const { settled: settledEvents } = collectBondEvents(
+          receipt.logs,
+          deployment.hook,
+          deployment.poolId,
+        );
+        const event = settledEvents.find((item) => item.bondId.toLowerCase() === bondId.toLowerCase());
+
+        const after = normalizeBond(
+          (await publicClient.readContract({
+            address: deployment.hook,
+            abi: bondMeBroAbi,
+            functionName: "getBond",
+            args: [bondId],
+          })) as never,
+        );
+        storageState = after.state;
+
+        if (event) onSettledFromReceipt(bondId, event, submitted);
+
+        const currencyMeta = metaForCurrency(event?.currency, { currency0: token0, currency1: token1 });
+        onActivity({
+          kind: "SETTLED",
+          block: receipt.blockNumber.toString(),
+          hash: submitted,
+          logIndex: event?.logIndex,
+          detail:
+            event && currencyMeta
+              ? `Bond settled · refund ${formatAmount(event.refund, currencyMeta.decimals)} ${currencyMeta.symbol} · retained ${formatAmount(event.slash, currencyMeta.decimals)} ${currencyMeta.symbol}`
+              : "Bond settled",
+        });
+      } catch {
+        // Parsing or reading back failed. The settlement still happened.
+        postReceiptFailed = true;
       }
 
-      const currencyMeta = metaForCurrency(event?.currency, { currency0: token0, currency1: token1 });
-      onActivity({
-        kind: "SETTLED",
-        block: receipt.blockNumber.toString(),
-        hash: submitted,
-        logIndex: event?.logIndex,
-        detail: event && currencyMeta
-          ? `Bond settled · refund ${formatAmount(event.refund, currencyMeta.decimals)} ${currencyMeta.symbol} · retained ${formatAmount(event.slash, currencyMeta.decimals)} ${currencyMeta.symbol}`
-          : "Bond settled",
+      const outcome = resolveSettlementOutcome({
+        receiptSucceeded: true,
+        storageState,
+        postReceiptFailed,
       });
+      setSettlementNote(outcome.note);
 
-      setState("success");
       onRefresh();
       protocol.refresh();
     } catch (settleError) {
-      setState("error");
-      setMessage(describeError(settleError));
+      if (submitted && !(settleError instanceof TransactionFailedError)) {
+        // A hash exists but confirmation could not be obtained. Do not claim failure.
+        setState("submitted");
+        setSettlementNote("Submitted. The receipt could not be read yet; check the transaction.");
+      } else {
+        setState("error");
+        setSettlementError(describeError(settleError));
+      }
     }
   }
 
-  const readyCount = unsettled.filter(
-    (record) => record.bond && blockNumber !== undefined && canSettle(record.bond, blockNumber),
-  ).length;
+  const pair = `${token0?.symbol ?? "TOKEN0"} / ${token1?.symbol ?? "TOKEN1"}`;
 
   return (
-    <>
-      <section className="screen-intro">
-        <div>
-          <span className="eyebrow">02 / PORTFOLIO</span>
-          <h1>
-            My bonds.
-            <br />
-            <em>Track.</em>
-          </h1>
+    <div className="page page-wide">
+      <span className="eyebrow">Portfolio</span>
+      <h1 className="page-title">Your Bonds</h1>
+      <p className="page-sub">
+        {unsettled.length} active · {settled.length} settled. Updates automatically.
+      </p>
+
+      {!isConnected ? (
+        <div className="empty">
+          <strong>Wallet not connected</strong>
+          <button type="button" className="cta-ghost" style={{ maxWidth: 220, margin: "14px auto 0" }} onClick={onConnect}>
+            Connect wallet
+          </button>
         </div>
-        <p>Every figure below comes from the hook&apos;s stored bond record, not from a local guess.</p>
-      </section>
-
-      <section className="bond-summary-grid">
-        <MetricCard label="UNSETTLED BONDS" value={String(unsettled.length)} detail="state FINALIZED" icon="◈" accent />
-        <MetricCard label="READY TO SETTLE" value={String(readyCount)} detail="at or past maturity" icon="✓" />
-        <MetricCard label="SETTLED BONDS" value={String(settled.length)} detail="state SETTLED" icon="↗" />
-      </section>
-
-      <article className="neo-card user-bonds-card">
-        <div className="card-heading">
-          <div>
-            <span className="eyebrow">YOUR BONDS</span>
-            <h2>Bond records</h2>
-          </div>
-          <div className="activity-heading-actions">
-            <Badge tone={isConnected ? "green" : "muted"}>
-              {isConnected ? "WALLET FILTERED" : "CONNECT TO FILTER"}
-            </Badge>
-            <button type="button" className="outline-button activity-refresh" onClick={onRefresh}>
-              Refresh
-            </button>
-          </div>
+      ) : loading && records.length === 0 ? (
+        <div className="empty">Reading bonds…</div>
+      ) : records.length === 0 ? (
+        <div className="empty">
+          <strong>No bonds yet</strong>
+          Not every swap creates one. Small trades execute unbonded.
+          <button type="button" className="cta-ghost" style={{ maxWidth: 220, margin: "14px auto 0" }} onClick={onSwap}>
+            Make a swap
+          </button>
         </div>
-
-        {scanNote && <div className="inline-empty activity-cache-note">{scanNote}</div>}
-        {error && <div className="pair-warning">{error}</div>}
-
-        {!isConnected ? (
-          <div className="inline-empty">
-            <button type="button" className="text-button" onClick={onConnect}>
-              Connect wallet
-            </button>{" "}
-            to load bonds.
-          </div>
-        ) : loading && records.length === 0 ? (
-          <div className="inline-empty">Reading bonds…</div>
-        ) : records.length === 0 ? (
-          <div className="empty-card large-empty">
-            <div className="empty-icon">◈</div>
-            <strong>No bonds for this wallet</strong>
-            <span>Not every swap creates one; a trade below either minimum executes unbonded.</span>
-            <button type="button" className="primary-button" onClick={onSwap}>
-              Make a swap →
-            </button>
-          </div>
-        ) : (
-          <div className="user-bond-list">
-            {records.map((record) => {
-              const bond = record.bond;
-              const currencyMeta = metaForCurrency(record.collateralCurrency, {
-                currency0: token0,
-                currency1: token1,
-              });
-              const ready = bond && blockNumber !== undefined && canSettle(bond, blockNumber);
-              const progress = bond ? maturityProgress(bond, blockNumber) : 0;
-              const remaining =
-                bond && blockNumber !== undefined ? blocksUntilMaturity(bond.maturityBlock, blockNumber) : undefined;
-
-              return (
-                <div
-                  className={`user-bond-record ${bond?.state === BondState.Settled ? "user-bond-settled" : ""}`}
-                  key={record.bondId}
-                >
-                  <div className="user-bond-record-top">
-                    <div>
-                      <span className="bond-record-pair">
-                        {token0?.symbol ?? "TOKEN0"} / {token1?.symbol ?? "TOKEN1"}
-                      </span>
-                      <strong>{record.bondId}</strong>
-                    </div>
-                    <Badge
-                      tone={
-                        bond?.state === BondState.Settled ? "green" : ready ? "orange" : bond ? "neutral" : "muted"
-                      }
-                    >
-                      {bond ? bondStateLabel(bond.state) : "UNAVAILABLE"}
-                    </Badge>
-                  </div>
-
-                  {record.readError && <div className="pair-warning">{record.readError}</div>}
-
-                  {bond && (
-                    <>
-                      <div className="user-bond-record-grid">
-                        <div>
-                          <span>ORIGINAL COLLATERAL</span>
-                          <strong>
-                            {currencyMeta
-                              ? `${formatAmount(record.collateral, currencyMeta.decimals)} ${currencyMeta.symbol}`
-                              : "—"}
-                          </strong>
-                        </div>
-                        <div>
-                          <span>COLLATERAL CURRENCY</span>
-                          <strong>{currencyMeta?.symbol ?? "—"}</strong>
-                        </div>
-                        <div>
-                          <span>OPENED</span>
-                          <strong>Block {formatBlock(bond.openBlock)}</strong>
-                        </div>
-                        <div>
-                          <span>MATURITY (STORED)</span>
-                          <strong>Block {formatBlock(bond.maturityBlock)}</strong>
-                        </div>
-                        <div>
-                          <span>COLLATERAL RATE</span>
-                          <strong>{formatBps(bond.collateralBps)}</strong>
-                        </div>
-                        <div>
-                          <span>REFUND RECIPIENT</span>
-                          <strong>{formatAddress(bond.refundRecipient)}</strong>
-                        </div>
-                        <div>
-                          <span>SWAP TX</span>
-                          {record.openedTxHash ? (
-                            <a href={explorerTx(deployment, record.openedTxHash)} target="_blank" rel="noreferrer">
-                              View ↗
-                            </a>
-                          ) : (
-                            <strong>—</strong>
-                          )}
-                        </div>
-                        <div>
-                          <span>CURRENT BLOCK</span>
-                          <strong>{formatBlock(blockNumber)}</strong>
-                        </div>
-                      </div>
-
-                      {bond.state === BondState.Finalized && (
-                        <>
-                          <div className="bond-progress">
-                            <span>
-                              <i style={{ width: `${progress}%` }} />
-                            </span>
-                            <b>
-                              {remaining === undefined
-                                ? "Current block unavailable"
-                                : remaining === 0n
-                                  ? "Matured — settle now"
-                                  : `${remaining} block${remaining === 1n ? "" : "s"} until maturity`}
-                            </b>
-                          </div>
-                          <div className="detail-actions">
-                            {!isConnected ? (
-                              <button type="button" className="primary-button large-button" onClick={onConnect}>
-                                Connect wallet <span>→</span>
-                              </button>
-                            ) : !networkCorrect ? (
-                              <button
-                                type="button"
-                                className="primary-button large-button"
-                                onClick={() => switchChain({ chainId: deployment.chainId })}
-                              >
-                                Switch to {deployment.networkName} <span>→</span>
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                className="primary-button large-button"
-                                disabled={!ready || busy}
-                                onClick={() => void settle(record.bondId)}
-                              >
-                                {busy && activeBondId === record.bondId
-                                  ? "Confirming…"
-                                  : ready
-                                    ? "Settle this bond"
-                                    : "Not yet mature"}{" "}
-                                <span>→</span>
-                              </button>
-                            )}
-                            <span>
-                              Anyone may settle a matured bond. The refund always goes to the stored recipient, not the
-                              caller, and settling later gives the identical result.
-                            </span>
-                          </div>
-                        </>
-                      )}
-
-                      {bond.state === BondState.Settled && (
-                        <div
-                          className={`settlement-result ${
-                            record.settlement && record.settlement.slash > 0n
-                              ? "settlement-result-slash"
-                              : "settlement-result-refund"
-                          }`}
-                        >
-                          {record.settlement && currencyMeta ? (
-                            <>
-                              <div>
-                                <span>ORIGINAL COLLATERAL</span>
-                                <strong>
-                                  {formatAmount(record.settlement.collateral, currencyMeta.decimals)}{" "}
-                                  {currencyMeta.symbol}
-                                </strong>
-                              </div>
-                              <div>
-                                <span>REFUNDED</span>
-                                <strong>
-                                  {formatAmount(record.settlement.refund, currencyMeta.decimals)} {currencyMeta.symbol}
-                                </strong>
-                              </div>
-                              <div>
-                                <span>RETAINED (SLASH)</span>
-                                <strong>
-                                  {formatAmount(record.settlement.slash, currencyMeta.decimals)} {currencyMeta.symbol}
-                                </strong>
-                              </div>
-                              <div>
-                                <span>SLASH RATE</span>
-                                <strong>{formatBps(record.settlement.slashBps)}</strong>
-                              </div>
-                              {record.settlement.transactionHash && (
-                                <a
-                                  href={explorerTx(deployment, record.settlement.transactionHash)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  Settlement tx ↗
-                                </a>
-                              )}
-                              <p className="refund-delivery-note">
-                                Refund sent to {formatAddress(bond.refundRecipient)}. The retained amount is held in the
-                                pool&apos;s insurance reserve.
-                              </p>
-                            </>
-                          ) : (
-                            <p className="refund-delivery-note">
-                              This bond is settled. Its BondSettled event is outside the scanned log window, so the
-                              refund and retained split are not shown here.
-                            </p>
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {state === "error" && <div className="transaction-message transaction-error">{message}</div>}
-        {state === "success" && hash && (
-          <div className="transaction-message transaction-success">
-            Settlement succeeded and the bond now reads SETTLED.{" "}
-            <a href={explorerTx(deployment, hash)} target="_blank" rel="noreferrer">
-              View ↗
-            </a>
-          </div>
-        )}
-      </article>
-
-      <article className="glass-card claims-card">
-        <div className="card-heading">
-          <div>
-            <span className="eyebrow">RESERVE</span>
-            <h2>Insurance reserve</h2>
-          </div>
-          <Badge tone="neutral">
-            <StatusDot live={protocol.rpcOnline} /> ACCOUNTING ONLY
-          </Badge>
+      ) : (
+        <div className="bond-list">
+          {records.map((record) => (
+            <BondCard
+              key={record.bondId}
+              record={record}
+              pair={pair}
+              currentBlock={blockNumber}
+              token0={token0}
+              token1={token1}
+              deployment={deployment}
+              isConnected={isConnected}
+              networkCorrect={networkCorrect}
+              busy={busy}
+              isActive={activeBondId === record.bondId}
+              state={state}
+              onConnect={onConnect}
+              onSwitchNetwork={() => switchChain({ chainId: deployment.chainId })}
+              onSettle={() => void settle(record.bondId)}
+            />
+          ))}
         </div>
-        <p className="card-copy">
-          Retained collateral accumulates in a per-pool, per-currency LP-risk compensation reserve. This version has no
-          payout, donation or claim function, and no settler reward.
+      )}
+
+      {state === "error" && settlementError && <div className="transaction-message transaction-error">{settlementError}</div>}
+
+      {historyStatus !== "ok" && (
+        <p className="note">
+          {historyStatus === "syncing" ? "Syncing bond history…" : "Bond history temporarily unavailable."}{" "}
+          Bonds already known stay listed and can still be settled.
         </p>
-        <div className="claim-list">
-          <div className="claim-row">
-            <div>
-              <span>{token0?.symbol ?? "CURRENCY0"} RESERVE</span>
-              <strong>
-                {token0 ? `${formatAmount(protocol.insurancePot0, token0.decimals)} ${token0.symbol}` : "—"}
-              </strong>
-            </div>
-          </div>
-          <div className="claim-row">
-            <div>
-              <span>{token1?.symbol ?? "CURRENCY1"} RESERVE</span>
-              <strong>
-                {token1 ? `${formatAmount(protocol.insurancePot1, token1.decimals)} ${token1.symbol}` : "—"}
-              </strong>
-            </div>
-          </div>
+      )}
+      <p className="note">
+        Settlement is permissionless — anyone may settle a matured bond, and the refund always goes to the recipient
+        stored in the bond.{" "}
+        <button type="button" className="link-btn" onClick={onRefresh}>
+          Refresh
+        </button>
+      </p>
+    </div>
+  );
+}
+
+function BondCard({
+  record,
+  pair,
+  currentBlock,
+  token0,
+  token1,
+  deployment,
+  isConnected,
+  networkCorrect,
+  busy,
+  isActive,
+  state,
+  onConnect,
+  onSwitchNetwork,
+  onSettle,
+}: {
+  record: BondRecord;
+  pair: string;
+  currentBlock?: bigint;
+  token0?: ReturnType<typeof metaForCurrency>;
+  token1?: ReturnType<typeof metaForCurrency>;
+  deployment: ProtocolState["deployment"];
+  isConnected: boolean;
+  networkCorrect: boolean;
+  busy: boolean;
+  isActive: boolean;
+  state: SettleState;
+  onConnect: () => void;
+  onSwitchNetwork: () => void;
+  onSettle: () => void;
+}) {
+  const bond = record.bond;
+  const meta = metaForCurrency(record.collateralCurrency, { currency0: token0, currency1: token1 });
+  const isSettled = bond?.state === BondState.Settled;
+  const ready = canOfferSettlement(record, currentBlock);
+  const remaining =
+    bond && currentBlock !== undefined ? blocksUntilMaturity(bond.maturityBlock, currentBlock) : undefined;
+
+  const badge = isSettled
+    ? { className: "badge badge-settled", text: "SETTLED" }
+    : ready
+      ? { className: "badge badge-ready", text: "READY" }
+      : bond
+        ? { className: "badge badge-active", text: "ACTIVE" }
+        : { className: "badge badge-muted", text: "UNAVAILABLE" };
+
+  return (
+    <article className="bond-card">
+      <div className="bond-card-head">
+        <div>
+          <div className="bond-pair">{pair}</div>
+          <code className="bond-id">
+            {record.bondId.slice(0, 10)}…{record.bondId.slice(-6)}
+          </code>
         </div>
-      </article>
-    </>
+        <span className={badge.className}>{badge.text}</span>
+      </div>
+
+      {record.readError && <div className="pair-warning">{record.readError}</div>}
+
+      {bond && !isSettled && (
+        <>
+          <div className="bond-grid">
+            <div className="bond-metric">
+              <span>Collateral</span>
+              <strong className="pink">{meta ? formatAmount(record.collateral, meta.decimals, 6) : "—"}</strong>
+            </div>
+            <div className="bond-metric">
+              <span>Rate</span>
+              <strong>{formatBps(bond.collateralBps)}</strong>
+            </div>
+            <div className="bond-metric">
+              <span>Opened</span>
+              <strong>{bond.openBlock.toString()}</strong>
+            </div>
+            <div className="bond-metric">
+              <span>Maturity</span>
+              <strong>{bond.maturityBlock.toString()}</strong>
+            </div>
+          </div>
+
+          <div className="bond-foot">
+            <span className="countdown">
+              {remaining === undefined
+                ? "Syncing…"
+                : remaining === 0n
+                  ? "Matured"
+                  : `${remaining} block${remaining === 1n ? "" : "s"} left`}
+            </span>
+            {!isConnected ? (
+              <button type="button" className="settle-btn" onClick={onConnect}>
+                CONNECT
+              </button>
+            ) : !networkCorrect ? (
+              <button type="button" className="settle-btn" onClick={onSwitchNetwork}>
+                SWITCH NETWORK
+              </button>
+            ) : (
+              <button type="button" className="settle-btn" disabled={!ready || busy} onClick={onSettle}>
+                {isActive && state === "preflight"
+                  ? "CHECKING…"
+                  : isActive && state === "submitted"
+                    ? "SETTLING…"
+                    : ready
+                      ? "SETTLE BOND"
+                      : "NOT MATURE"}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+
+      {bond && isSettled && (
+        <>
+          <div className="bond-grid">
+            <div className="bond-metric">
+              <span>Refunded</span>
+              <strong className="good">
+                {record.settlement && meta ? formatAmount(record.settlement.refund, meta.decimals, 6) : "—"}
+              </strong>
+            </div>
+            <div className="bond-metric">
+              <span>Retained</span>
+              <strong>
+                {record.settlement && meta ? formatAmount(record.settlement.slash, meta.decimals, 6) : "—"}
+              </strong>
+            </div>
+            <div className="bond-metric">
+              <span>Slash rate</span>
+              <strong>{record.settlement ? formatBps(record.settlement.slashBps) : "—"}</strong>
+            </div>
+            <div className="bond-metric">
+              <span>Collateral</span>
+              <strong>{meta ? formatAmount(record.collateral, meta.decimals, 6) : "—"}</strong>
+            </div>
+          </div>
+          <div className="bond-foot">
+            <span className="countdown">Settled at block {bond.maturityBlock.toString()} or later</span>
+            {(record.settlementTxHash ?? record.settlement?.transactionHash) && (
+              <a
+                className="tx-link"
+                href={explorerTx(deployment, (record.settlementTxHash ?? record.settlement?.transactionHash) as Hex)}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Settlement tx ↗
+              </a>
+            )}
+          </div>
+        </>
+      )}
+    </article>
   );
 }

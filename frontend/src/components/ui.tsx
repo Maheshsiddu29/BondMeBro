@@ -15,34 +15,9 @@ export function Badge({
   tone = "neutral",
 }: {
   children: React.ReactNode;
-  tone?: "neutral" | "orange" | "green" | "muted";
+  tone?: "neutral" | "pink" | "green" | "muted";
 }) {
-  return <span className={`badge badge-${tone}`}>{children}</span>;
-}
-
-export function MetricCard({
-  label,
-  value,
-  detail,
-  icon,
-  accent = false,
-}: {
-  label: string;
-  value: string;
-  detail: string;
-  icon?: string;
-  accent?: boolean;
-}) {
-  return (
-    <article className={`metric-card ${accent ? "metric-card-accent" : ""}`}>
-      <div className="metric-card-top">
-        <span>{label}</span>
-        {icon && <span className="metric-icon">{icon}</span>}
-      </div>
-      <strong>{value}</strong>
-      <span className="metric-detail">{detail}</span>
-    </article>
-  );
+  return <span className={`badge badge-${tone === "pink" ? "ready" : tone === "green" ? "settled" : "muted"}`}>{children}</span>;
 }
 
 export function SectionHeading({ eyebrow, title, copy }: { eyebrow: string; title: string; copy?: string }) {
@@ -52,34 +27,5 @@ export function SectionHeading({ eyebrow, title, copy }: { eyebrow: string; titl
       <h2>{title}</h2>
       {copy && <p>{copy}</p>}
     </div>
-  );
-}
-
-export type PickerToken = { symbol: string; icon: string };
-
-export function TokenPicker({
-  label,
-  token,
-  options,
-  onChange,
-}: {
-  label: string;
-  token: PickerToken;
-  options: PickerToken[];
-  onChange: (symbol: string) => void;
-}) {
-  return (
-    <label className="uniswap-token-picker" aria-label={label}>
-      <span className="token-bubble token-purple">{token.icon}</span>
-      <strong>{token.symbol}</strong>
-      <span className="token-picker-chevron">⌄</span>
-      <select value={token.symbol} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => (
-          <option value={option.symbol} key={option.symbol}>
-            {option.symbol}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }

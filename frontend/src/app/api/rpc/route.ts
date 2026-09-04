@@ -1,70 +1,65 @@
 import { NextResponse } from "next/server";
 
+import {
+  JSON_RPC,
+  normalizeRpcBody,
+  rpcErrorFor,
+  type NormalizedRpcRequest,
+} from "@/lib/rpcProxy";
+
 /**
  * Read-only JSON-RPC proxy.
  *
- * Two properties matter for correctness, beyond keeping provider keys off the client:
+ * Three properties matter here, beyond keeping provider keys off the client:
  *
- *  1. The upstream endpoint is VERIFIED to be the configured chain before any response is
- *     returned. A generic `RPC_URL` pointing at another chain used to be forwarded happily,
- *     which meant wrong-chain data could be rendered under this network's label.
- *  2. `eth_getLogs` is bounded and restricted to the configured hook address, which comes
- *     from the deployment manifest rather than a shipped default.
+ *  1. THE ERROR CODE MUST BE TRUE. This proxy previously answered every rejection —
+ *     including its own rate limit — with JSON-RPC code -32600. viem renders -32600 as
+ *     "JSON is not a valid request object.", so a throttled bond-history scan surfaced in
+ *     the product as a nonsense parse error. Each condition now returns its own code.
+ *
+ *  2. IDS MUST SURVIVE. viem matches concurrent responses by id, so a request-scoped error
+ *     carries that request's id rather than null.
+ *
+ *  3. BATCHES ARE FANNED OUT. Incoming arrays are normalized and forwarded as individual
+ *     upstream POSTs, then recombined in order. The proxy therefore does not depend on the
+ *     upstream supporting batch payloads at all.
+ *
+ * The upstream endpoint is also verified to be the configured chain before anything is
+ * returned, so wrong-chain data can never be rendered under this network's label.
  */
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MAX_RPC_BODY_BYTES = 64 * 1024;
-const MAX_BATCH_REQUESTS = 20;
-const MAX_LOG_RANGE = 10_000n;
+const MAX_RPC_BODY_BYTES = 512 * 1024;
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 120;
 const CHAIN_VERIFY_TTL_MS = 5 * 60_000;
+
+/** How many upstream requests one fanned-out batch may have in flight. */
+const FANOUT_CONCURRENCY = 8;
+
+/**
+ * Requests per minute per client.
+ *
+ * The demo UI legitimately makes well over a hundred reads a minute: a two-second block
+ * poll, a two-second reconciliation of each visible bond, a five-second quote, and balance
+ * and allowance reads. The old ceiling of 120 was below that floor, so the app throttled
+ * itself. Override with RPC_RATE_LIMIT.
+ */
+const RATE_LIMIT = Number(process.env.RPC_RATE_LIMIT ?? 1_200);
 
 const HOOK_ADDRESS = process.env.NEXT_PUBLIC_HOOK_ADDRESS?.toLowerCase();
 const EXPECTED_CHAIN_ID = process.env.NEXT_PUBLIC_CHAIN_ID ? Number(process.env.NEXT_PUBLIC_CHAIN_ID) : undefined;
 
+const DEV = process.env.NODE_ENV !== "production";
+
 const rateBuckets = new Map<string, { startedAt: number; count: number }>();
 const verifiedChains = new Map<string, { chainId: number; checkedAt: number }>();
 
-const READ_ONLY_METHODS = new Set([
-  "eth_blockNumber",
-  "eth_chainId",
-  "eth_call",
-  "eth_estimateGas",
-  "eth_feeHistory",
-  "eth_gasPrice",
-  "eth_maxPriorityFeePerGas",
-  "eth_getBalance",
-  "eth_getBlockByHash",
-  "eth_getBlockByNumber",
-  "eth_getBlockTransactionCountByHash",
-  "eth_getBlockTransactionCountByNumber",
-  "eth_getCode",
-  "eth_getLogs",
-  "eth_getProof",
-  "eth_getStorageAt",
-  "eth_getTransactionByBlockHashAndIndex",
-  "eth_getTransactionByBlockNumberAndIndex",
-  "eth_getTransactionByHash",
-  "eth_getTransactionCount",
-  "eth_getTransactionReceipt",
-  "net_version",
-  "web3_clientVersion",
-]);
-
 function rpcCandidates() {
-  // No public fallback list is shipped: a hardcoded Sepolia endpoint would silently
-  // resurrect the stale network assumption this remediation removed.
-  return Array.from(new Set([process.env.RPC_URL, process.env.NEXT_PUBLIC_RPC_URL].filter(
-    (value): value is string => Boolean(value),
-  )));
-}
-
-function errorResponse(message: string, status = 400) {
-  return NextResponse.json(
-    { jsonrpc: "2.0", error: { code: -32600, message }, id: null },
-    { status, headers: { "cache-control": "no-store" } },
+  // No public fallback list is shipped: a hardcoded endpoint would silently resurrect a
+  // stale network assumption.
+  return Array.from(
+    new Set([process.env.RPC_URL, process.env.NEXT_PUBLIC_RPC_URL].filter((value): value is string => Boolean(value))),
   );
 }
 
@@ -76,10 +71,17 @@ function clientIdentity(request: Request) {
   );
 }
 
+/**
+ * One INCOMING HTTP request counts as one unit, whatever it fans out to.
+ *
+ * Counting per fanned-out call would make a single legitimate batch consume a client's whole
+ * budget and reintroduce the throttling this change exists to remove.
+ */
 function isRateLimited(request: Request) {
   const now = Date.now();
   const identity = clientIdentity(request);
   const bucket = rateBuckets.get(identity);
+
   if (!bucket || now - bucket.startedAt >= RATE_WINDOW_MS) {
     if (rateBuckets.size >= 1_000) {
       for (const [key, value] of rateBuckets) {
@@ -93,50 +95,9 @@ function isRateLimited(request: Request) {
     rateBuckets.set(identity, { startedAt: now, count: 1 });
     return false;
   }
+
   bucket.count += 1;
   return bucket.count > RATE_LIMIT;
-}
-
-function isHexQuantity(value: unknown): value is string {
-  return typeof value === "string" && /^0x[0-9a-f]+$/i.test(value);
-}
-
-function isAllowedLogFilter(params: unknown) {
-  if (!HOOK_ADDRESS) return false;
-  if (!Array.isArray(params) || params.length < 1 || params[0] === null || typeof params[0] !== "object") return false;
-  const filter = params[0] as { address?: unknown; fromBlock?: unknown; toBlock?: unknown; blockHash?: unknown };
-  const addresses = Array.isArray(filter.address) ? filter.address : [filter.address];
-  if (addresses.some((address) => typeof address !== "string" || address.toLowerCase() !== HOOK_ADDRESS)) return false;
-  if (filter.blockHash !== undefined) return true;
-  if (
-    filter.fromBlock === undefined
-    || filter.toBlock === undefined
-    || !isHexQuantity(filter.fromBlock)
-    || !isHexQuantity(filter.toBlock)
-  ) {
-    return false;
-  }
-  try {
-    return (
-      BigInt(filter.toBlock) >= BigInt(filter.fromBlock)
-      && BigInt(filter.toBlock) - BigInt(filter.fromBlock) <= MAX_LOG_RANGE
-    );
-  } catch {
-    return false;
-  }
-}
-
-function isAllowedRpcPayload(payload: unknown): boolean {
-  const requests = Array.isArray(payload) ? payload : [payload];
-  if (requests.length === 0 || requests.length > MAX_BATCH_REQUESTS) return false;
-  return requests.every((item) => {
-    if (item === null || typeof item !== "object") return false;
-    const request = item as { jsonrpc?: unknown; method?: unknown; params?: unknown };
-    if (request.jsonrpc !== "2.0" || typeof request.method !== "string" || !READ_ONLY_METHODS.has(request.method)) {
-      return false;
-    }
-    return request.method !== "eth_getLogs" || isAllowedLogFilter(request.params);
-  });
 }
 
 /** Confirms an upstream really is the configured chain, cached briefly per endpoint. */
@@ -161,82 +122,154 @@ async function upstreamChainMatches(rpcUrl: string, signal: AbortSignal): Promis
   return chainId === EXPECTED_CHAIN_ID;
 }
 
-export async function POST(request: Request) {
-  if (!HOOK_ADDRESS || EXPECTED_CHAIN_ID === undefined) {
-    return errorResponse(
-      "DEPLOYMENT REQUIRED: NEXT_PUBLIC_CHAIN_ID and NEXT_PUBLIC_HOOK_ADDRESS must be configured before this proxy will forward anything.",
-      503,
-    );
-  }
-
-  if (isRateLimited(request)) return errorResponse("RPC rate limit exceeded. Try again shortly.", 429);
-
-  const declaredLength = Number(request.headers.get("content-length") ?? 0);
-  if (declaredLength > MAX_RPC_BODY_BYTES) return errorResponse("RPC request body is too large.", 413);
-
-  const body = await request.text();
-  if (new TextEncoder().encode(body).byteLength > MAX_RPC_BODY_BYTES) {
-    return errorResponse("RPC request body is too large.", 413);
-  }
-
-  let payload: unknown;
+/** Forwards ONE normalized request upstream and returns its JSON-RPC response object. */
+async function forwardOne(rpcUrl: string, req: NormalizedRpcRequest): Promise<unknown> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
-    payload = JSON.parse(body);
+    const upstream = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: req.id, method: req.method, params: req.params }),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    if (!upstream.ok) {
+      if (DEV) console.warn(`[rpc] ${req.method} upstream HTTP ${upstream.status}`);
+      return rpcErrorFor(req.id, JSON_RPC.INTERNAL, `Upstream returned HTTP ${upstream.status}.`);
+    }
+
+    const body = (await upstream.json()) as unknown;
+
+    // A single-request POST may still be answered with a one-element array.
+    const item = Array.isArray(body) ? body[0] : body;
+    if (item === undefined || item === null) {
+      return rpcErrorFor(req.id, JSON_RPC.INTERNAL, "Upstream returned an empty response.");
+    }
+
+    if (DEV) {
+      const err = (item as { error?: { code?: number; message?: string } }).error;
+      if (err) console.warn(`[rpc] ${req.method} -> error ${err.code}: ${err.message}`);
+    }
+
+    // Force the id back to the one the caller used. An upstream that echoes a different id
+    // would otherwise break viem's response matching.
+    return { ...(item as Record<string, unknown>), id: req.id };
   } catch {
-    return errorResponse("RPC request must contain valid JSON.");
+    if (DEV) console.warn(`[rpc] ${req.method} upstream unreachable`);
+    return rpcErrorFor(req.id, JSON_RPC.INTERNAL, "Upstream timed out or is unavailable.");
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!isAllowedRpcPayload(payload)) {
-    return errorResponse("Only bounded, read-only JSON-RPC methods for the configured hook are available here.", 403);
-  }
+}
 
-  const candidates = rpcCandidates();
-  if (candidates.length === 0) {
-    return errorResponse(
-      "DEPLOYMENT REQUIRED: set RPC_URL on the server to an endpoint for the configured chain.",
-      503,
-    );
-  }
+/** Fans a normalized batch out to individual upstream calls, bounded in flight. */
+async function forwardAll(rpcUrl: string, requests: NormalizedRpcRequest[]): Promise<unknown[]> {
+  const results: unknown[] = new Array(requests.length);
+  let cursor = 0;
 
-  let lastError = "RPC provider is unavailable";
-  for (const rpcUrl of candidates) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-    try {
-      if (!(await upstreamChainMatches(rpcUrl, controller.signal))) {
-        lastError = `RPC provider is not chain ${EXPECTED_CHAIN_ID}`;
-        continue;
-      }
-      const upstream = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-        cache: "no-store",
-        signal: controller.signal,
-      });
-      const responseBody = await upstream.text();
-      if (upstream.ok) {
-        return new NextResponse(responseBody, {
-          status: upstream.status,
-          headers: { "content-type": "application/json", "cache-control": "no-store" },
-        });
-      }
-      lastError = `RPC provider returned HTTP ${upstream.status}`;
-    } catch {
-      lastError = "RPC provider timed out or is unavailable";
-    } finally {
-      clearTimeout(timeout);
+  async function worker() {
+    while (cursor < requests.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await forwardOne(rpcUrl, requests[index]);
     }
   }
 
-  return NextResponse.json(
-    {
-      jsonrpc: "2.0",
-      error: {
-        code: -32000,
-        message: `${lastError}. Configure RPC_URL on the server with an endpoint for chain ${EXPECTED_CHAIN_ID}.`,
-      },
-      id: null,
-    },
-    { status: 502, headers: { "cache-control": "no-store" } },
+  await Promise.all(
+    Array.from({ length: Math.min(FANOUT_CONCURRENCY, requests.length) }, () => worker()),
   );
+
+  return results;
+}
+
+function json(body: unknown, status = 200) {
+  return NextResponse.json(body, { status, headers: { "cache-control": "no-store" } });
+}
+
+export async function POST(request: Request) {
+  if (!HOOK_ADDRESS || EXPECTED_CHAIN_ID === undefined) {
+    return json(
+      rpcErrorFor(
+        null,
+        JSON_RPC.INTERNAL,
+        "DEPLOYMENT REQUIRED: NEXT_PUBLIC_CHAIN_ID and NEXT_PUBLIC_HOOK_ADDRESS must be configured.",
+      ),
+      503,
+    );
+  }
+
+  if (isRateLimited(request)) {
+    // -32005 is "limit exceeded". Reporting this as -32600 is what made a throttled scan
+    // read as "JSON is not a valid request object" in the product.
+    return json(rpcErrorFor(null, JSON_RPC.LIMIT_EXCEEDED, "RPC rate limit exceeded. Try again shortly."), 429);
+  }
+
+  const declaredLength = Number(request.headers.get("content-length") ?? 0);
+  if (declaredLength > MAX_RPC_BODY_BYTES) {
+    return json(rpcErrorFor(null, JSON_RPC.INVALID_REQUEST, "RPC request body is too large."), 413);
+  }
+
+  const raw = await request.text();
+  if (new TextEncoder().encode(raw).byteLength > MAX_RPC_BODY_BYTES) {
+    return json(rpcErrorFor(null, JSON_RPC.INVALID_REQUEST, "RPC request body is too large."), 413);
+  }
+
+  const normalized = normalizeRpcBody(raw, HOOK_ADDRESS);
+
+  if (DEV) {
+    console.info(
+      `[rpc] ${normalized.isBatch ? "batch" : "single"} n=${normalized.entries.length} `
+        + `methods=[${normalized.entries.map((e) => ("request" in e ? e.request.method : "invalid")).join(",")}] `
+        + `ids=[${normalized.entries.map((e) => String("request" in e ? e.request.id : e.error.id)).join(",")}]`,
+    );
+  }
+
+  if (normalized.fatal) return json(normalized.fatal, 200);
+
+  const candidates = rpcCandidates();
+  if (candidates.length === 0) {
+    return json(
+      rpcErrorFor(null, JSON_RPC.INTERNAL, `DEPLOYMENT REQUIRED: set RPC_URL for chain ${EXPECTED_CHAIN_ID}.`),
+      503,
+    );
+  }
+
+  // Requests rejected locally never reach the network; the rest are forwarded one by one.
+  const forwardable = normalized.entries.flatMap((entry) => ("request" in entry ? [entry.request] : []));
+
+  let answers: unknown[] = [];
+  if (forwardable.length > 0) {
+    let chosen: string | undefined;
+    for (const rpcUrl of candidates) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8_000);
+      try {
+        if (await upstreamChainMatches(rpcUrl, controller.signal)) {
+          chosen = rpcUrl;
+          break;
+        }
+      } catch {
+        // Try the next candidate.
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    if (!chosen) {
+      const message = `No configured RPC endpoint is serving chain ${EXPECTED_CHAIN_ID}.`;
+      answers = forwardable.map((req) => rpcErrorFor(req.id, JSON_RPC.INTERNAL, message));
+    } else {
+      answers = await forwardAll(chosen, forwardable);
+    }
+  }
+
+  // Recombine in the caller's original order, interleaving locally rejected entries.
+  let answerIndex = 0;
+  const responses = normalized.entries.map((entry) =>
+    "request" in entry ? answers[answerIndex++] : entry.error,
+  );
+
+  return json(normalized.isBatch ? responses : responses[0], 200);
 }

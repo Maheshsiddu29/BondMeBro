@@ -4,6 +4,8 @@
 // These are transcribed from the versions installed under lib/ at the current contract
 // baseline (v4-periphery dce236d4, its v4-core 59d3ecf5), not from memory:
 //   - IV4Router.ExactInputSingleParams / ExactOutputSingleParams: lib/v4-periphery/src/interfaces/IV4Router.sol
+//     (MINUS `minHopPriceX36`, which the deployed router predates — see the note on the
+//      tuple definitions below; the deployed shape wins over the pinned one)
 //   - IV4Quoter.QuoteExactSingleParams:                            lib/v4-periphery/src/interfaces/IV4Quoter.sol
 //   - Action bytes:                                                lib/v4-periphery/src/libraries/Actions.sol
 import type { Abi } from "viem";
@@ -145,7 +147,24 @@ export const v4QuoterAbi = [
   },
 ] as const satisfies Abi;
 
-/** IV4Router.ExactInputSingleParams, in declaration order. */
+/**
+ * THE DEPLOYED ROUTER'S SWAP PARAMETERS, WHICH ARE NOT THE PINNED ONES.
+ *
+ * `IV4Router.ExactInputSingleParams` in the v4-periphery pinned in this repository carries a
+ * `minHopPriceX36` field between `amountOutMinimum` and `hookData`. The Universal Router
+ * deployed on Unichain Sepolia at 0x7f9b8d606e0f35e5073abf93695814530b28a37b was built
+ * against an EARLIER v4-periphery that has no such field.
+ *
+ * Its calldata decoder is strict. An extra word shifts the `hookData` offset, and the call
+ * reverts inside `unlockCallback` before any swap happens — with no revert reason, which
+ * makes it an expensive thing to debug from the browser.
+ *
+ * This was established empirically against a Unichain Sepolia fork in
+ * `test/fork/DemoPoolForkRehearsal.t.sol`: encoding the pinned struct reverts, encoding this
+ * one swaps successfully. Do NOT "restore" the field to match the pinned interface without
+ * first proving the deployed router accepts it; `abi/external.test.ts` fails if it comes
+ * back.
+ */
 export const exactInputSingleParamsType = {
   type: "tuple",
   components: [
@@ -153,12 +172,11 @@ export const exactInputSingleParamsType = {
     { name: "zeroForOne", type: "bool" },
     { name: "amountIn", type: "uint128" },
     { name: "amountOutMinimum", type: "uint128" },
-    { name: "minHopPriceX36", type: "uint256" },
     { name: "hookData", type: "bytes" },
   ],
 } as const;
 
-/** IV4Router.ExactOutputSingleParams, in declaration order. */
+/** The deployed router's ExactOutputSingleParams. See the note above on `minHopPriceX36`. */
 export const exactOutputSingleParamsType = {
   type: "tuple",
   components: [
@@ -166,7 +184,6 @@ export const exactOutputSingleParamsType = {
     { name: "zeroForOne", type: "bool" },
     { name: "amountOut", type: "uint128" },
     { name: "amountInMaximum", type: "uint128" },
-    { name: "minHopPriceX36", type: "uint256" },
     { name: "hookData", type: "bytes" },
   ],
 } as const;
