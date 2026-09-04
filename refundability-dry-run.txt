@@ -1,0 +1,47 @@
+No files changed, compilation skipped
+
+Ran 1 test for test/fork/LiveRefundRehearsal.t.sol:LiveRefundRehearsal
+[PASS] test_liveRefundScenario() (gas: 4424179)
+Logs:
+  == fork preflight ==
+  FORK BLOCK:
+     61645641
+  COMPUTED POOL ID:
+  0xf7c593b94a9389133e5a12e30a199de8947996076d3c97f3080b04dd5fe6f51f
+  EXPECTED POOL ID:
+  0xf7c593b94a9389133e5a12e30a199de8947996076d3c97f3080b04dd5fe6f51f
+  LIQUIDITY:
+     20000000000000000
+  START TICK:
+     -197101
+  == plan ==
+    start block             61645641
+    T0 (start tick)         -197101
+    forward post tick       -196912
+    forward impact ticks    189
+    planned reverse (raw)   3579101562500000000
+    simulated recovered     -197101
+    residual ticks          0
+  == bond A ==
+    open block              61645641
+    maturity block          61645651
+    collateral (raw bWETH)  17194424760064227
+    collateral bps          48
+    tickBefore              -197101
+    tickAfter               -196912
+  == reverse ==
+    reverse block           61645643
+    blocks after open       2
+    post-reverse tick       -197101
+    residual from T0        0
+  == settlement ==
+    original collateral     17194424760064227
+    refund                  17194424760064227
+    slash                   0
+    slash bps               0
+  == result ==
+    FULL REFUND on bond A. Reverse landed this many blocks after open: 2
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 280.49ms (6.78ms CPU time)
+
+Ran 1 test suite in 290.20ms (280.49ms CPU time): 1 tests passed, 0 failed, 0 skipped (1 total tests)
